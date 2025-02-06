@@ -28,17 +28,6 @@ run() {
    "$@"
 }
 
-# runv PROGRAM [ARGS...]
-#
-# Like run, but prints a more verbose informational message to stderr of the
-# form "🚀$ PROGRAM ARGS...".
-runv() {
-    printf "🚀>$ " >&2
-    printf "%q " "$@" >&2
-    printf "\n" >&2
-    "$@"
-}
-
 # command_exists PROGRAM
 #
 # Returns successfully if PROGRAM exists in $PATH, or unsuccessfully otherwise.
@@ -81,15 +70,27 @@ git_files() {
 # try COMMAND [ARGS...]
 #
 # Runs COMMAND with the specified ARGS without aborting the script if the
-# command fails. See also try_last_failed and try_finish.
+# command fails. See also try_last_failed and try_status_report.
 try() {
-    try_last_failed=false
-    if ! run "$@"; then
-        try_failed=true
+    ci_collapsed_heading "$@"
+
+    # Try the command.
+    if "$@"; then
+        result=$?
+        try_last_failed=false
+        ((++ci_try_passed))
+    else
+        result=$?
         try_last_failed=true
+        # The command failed. Tell Buildkite to uncollapse this log section, so
+        # that the errors are immediately visible.
+        in_ci && ci_uncollapse_current_section
+        echo "^^^ 🚨 Failed: $*"
     fi
+    ((++ci_try_total))
+    return $result
 }
-try_failed=false
+try_last_failed=false
 
 # try_last_failed
 #
@@ -98,56 +99,61 @@ try_last_failed() {
     $try_last_failed
 }
 
-# try_finish
+# try_status_report
 #
 # Exits the script with a code that reflects whether all commands executed with
 # `try` were successful.
-try_finish() {
-    if $try_failed; then
-        exit 1
-    fi
-    exit 0
-}
-
-ci_init() {
-    export RUST_BACKTRACE=full
-}
-
-ci_collapsed_heading() {
-    echo "---" "$@"
-}
-
-ci_uncollapsed_heading() {
-    echo "+++" "$@"
-}
-
-ci_uncollapse_current_section() {
-    echo "^^^ +++"
-}
-
-ci_try_passed=0
-ci_try_total=0
-
-ci_try() {
-    ci_collapsed_heading "$@"
-
-    # Try the command.
-    if "$@"; then
-        ((++ci_try_passed))
-    else
-        # The command failed. Tell Buildkite to uncollapse this log section, so
-        # that the errors are immediately visible.
-        [[ "${SHLIB_NOT_IN_CI-}" ]] || ci_uncollapse_current_section
-    fi
-    ((++ci_try_total))
-}
-
-ci_status_report() {
+try_status_report() {
     ci_uncollapsed_heading "Status report"
     echo "$ci_try_passed/$ci_try_total commands passed"
     if ((ci_try_passed != ci_try_total)); then
         exit 1
     fi
+}
+
+ci_unimportant_heading() {
+    echo "~~~" "$@" >&2
+}
+
+ci_collapsed_heading() {
+    echo "---" "$@" >&2
+}
+
+ci_uncollapsed_heading() {
+    echo "+++" "$@" >&2
+}
+
+ci_uncollapse_current_section() {
+    if in_ci; then
+        echo "^^^ +++" >&2
+    fi
+}
+
+ci_try_passed=0
+ci_try_total=0
+
+# read_list PREFIX
+#
+# Appends the environment variables `PREFIX_0`, `PREFIX_1`, ... `PREFIX_N` to
+# the `result` global variable, stopping when `PREFIX_N` is an empty string.
+read_list() {
+    result=()
+
+    local i=0
+    local param="${1}_${i}"
+
+    if [[ "${!1:-}" ]]; then
+        echo "error: mzcompose command must be an array, not a string" >&2
+        exit 1
+    fi
+
+    while [[ "${!param:-}" ]]; do
+        result+=("${!param}")
+        i=$((i+1))
+        param="${1}_${i}"
+    done
+
+    [[ ${#result[@]} -gt 0 ]] || return 1
 }
 
 # mapfile_shim [array]
@@ -192,50 +198,41 @@ arch_go() {
     esac
 }
 
-########################################
-# Text-Coloring commands
-
-# [m]essage-[s]uccess: message to the user that something went well
-ms() {
-    green "$@"
-}
-
-# [u]sage-[s]ubcommand: Paint the argument as a subcmd
+# red [ARGS...]
 #
-# In usage text, write: "usage: $0 `us CMD`"
-us() {
-    blue "$@"
-}
-
-# [u]sage-[f]lag: Paint the argument as a flag
-#
-# In usage text, write: "usage: $0 `uf --FLAG`"
-uf() {
-    green "$@"
-}
-
-# [u]sage-[o]ption: Paint the argument as an option
-#
-# In usage text, write: "usage: $0 `uf --FLAG` `uo OPT`"
-uo() {
-    green "$@"
-}
-
-# [u]sage-[w]arn: Paint the argument as a warning
-#
-# In usage text, write: "usage: $0 `uw WILL DELETE EVERYTHING`"
-uw() {
-    red "$@"
-}
-
+# Prints the provided text in red.
 red() {
     echo -ne "\e[31m$*\e[0m"
 }
 
-blue() {
-    echo -ne "\e[34m$*\e[0m"
-}
-
+# green [ARGS...]
+#
+# Prints the provided text in green.
 green() {
     echo -ne "\e[32m$*\e[0m"
+}
+
+# white [ARGS...]
+#
+# Prints the provided text in white.
+white() {
+    echo -ne "\e[97m$*\e[0m"
+}
+
+# in_ci
+#
+# Returns 0 if in CI and 1 otherwise
+in_ci() {
+    [ -z "${BUILDKITE-}" ] && return 1
+    return 0
+}
+
+# is_truthy VAR
+#
+# Returns 0 if the parameter is not one of: 0, '', no, false; and 1 otherwise
+is_truthy() {
+    if [[ "$1" == "0" || "$1" == "" || "$1" == "no" || "$1" == "false" ]]; then
+        return 1
+    fi
+    return 0
 }

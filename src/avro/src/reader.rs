@@ -23,24 +23,21 @@
 
 //! Logic handling reading from Avro format at user level.
 
+use std::collections::BTreeMap;
 use std::str::{from_utf8, FromStr};
 
 use serde_json::from_slice;
+use sha2::Sha256;
 
 use crate::decode::{decode, AvroRead};
 use crate::error::{DecodeError, Error as AvroError};
 use crate::schema::{
     resolve_schemas, FullName, NamedSchemaPiece, ParseSchemaError, RecordField,
-    ResolvedDefaultValueField, SchemaNodeOrNamed, SchemaPiece, SchemaPieceOrNamed,
-    SchemaPieceRefOrNamed,
+    ResolvedDefaultValueField, ResolvedRecordField, Schema, SchemaNodeOrNamed, SchemaPiece,
+    SchemaPieceOrNamed, SchemaPieceRefOrNamed,
 };
-use crate::schema::{ResolvedRecordField, Schema};
-use crate::types::{AvroMap, Value};
-use crate::util::{self};
-use crate::{Codec, SchemaResolutionError};
-
-use sha2::Sha256;
-use std::collections::HashMap;
+use crate::types::Value;
+use crate::{util, Codec, SchemaResolutionError};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Header {
@@ -64,7 +61,7 @@ impl Header {
             return Err(AvroError::Decode(DecodeError::WrongHeaderMagic(buf)));
         }
 
-        if let Value::Map(AvroMap(meta)) = decode(meta_schema.top_node(), reader)? {
+        if let Value::Map(meta) = decode(meta_schema.top_node(), reader)? {
             // TODO: surface original parse schema errors instead of coalescing them here
             let json = meta
                 .get("avro.schema")
@@ -201,7 +198,7 @@ impl<R: AvroRead> Reader<R> {
         let resolved_schema = if reader_schema.fingerprint::<Sha256>().bytes
             != writer_schema.fingerprint::<Sha256>().bytes
         {
-            Some(resolve_schemas(&writer_schema, reader_schema)?)
+            Some(resolve_schemas(writer_schema, reader_schema)?)
         } else {
             None
         };
@@ -257,14 +254,10 @@ impl<R: AvroRead> Reader<R> {
 
     fn fill_buf(&mut self, n: usize) -> Result<(), AvroError> {
         // We don't have enough space in the buffer, need to grow it.
-        if n >= self.buf.capacity() {
-            self.buf.reserve(n);
+        if n >= self.buf.len() {
+            self.buf.resize(n, 0);
         }
 
-        unsafe {
-            self.buf.set_len(n);
-        }
-        // TODO[btv] This is UB if `self.inner` looks at the contents of the buf before writing them.
         self.inner.read_exact(&mut self.buf[..n])?;
         self.buf_idx = 0;
         Ok(())
@@ -330,11 +323,14 @@ impl<R: AvroRead> Iterator for Reader<R> {
 
 pub struct SchemaResolver<'a> {
     pub named: Vec<Option<NamedSchemaPiece>>,
-    pub indices: HashMap<FullName, usize>,
-    pub writer_to_reader_names: HashMap<usize, usize>,
-    pub reader_to_writer_names: HashMap<usize, usize>,
-    pub reader_to_resolved_names: HashMap<usize, usize>,
-    pub reader_fullnames: HashMap<usize, &'a FullName>,
+    pub indices: BTreeMap<FullName, usize>,
+    pub human_readable_field_path: Vec<String>,
+    pub current_human_readable_path_start: usize,
+    pub writer_to_reader_names: BTreeMap<usize, usize>,
+    pub reader_to_writer_names: BTreeMap<usize, usize>,
+    pub reader_to_resolved_names: BTreeMap<usize, usize>,
+    #[allow(dead_code)]
+    pub reader_fullnames: BTreeMap<usize, &'a FullName>,
     pub reader_schema: &'a Schema,
 }
 
@@ -380,9 +376,10 @@ impl<'a> SchemaResolver<'a> {
                                 },
                                 None => {
                                     return Err(SchemaResolutionError::new(format!(
-                                        "Reader field `{}` not found in writer, and has no default",
-                                        rf.name
-                                    ))
+                                    "Reader field `{}.{}` not found in writer, and has no default",
+                                    self.get_current_human_readable_path(),
+                                    rf.name
+                                ))
                                     .into())
                                 }
                             };
@@ -391,7 +388,8 @@ impl<'a> SchemaResolver<'a> {
                         Some(w_index) => {
                             if fields.len() > *w_index && fields[*w_index].is_some() {
                                 return Err(SchemaResolutionError::new(format!(
-                                    "Duplicate field {} in schema",
+                                    "Duplicate field `{}.{}` in schema",
+                                    self.get_current_human_readable_path(),
                                     rf.name
                                 ))
                                 .into());
@@ -405,7 +403,11 @@ impl<'a> SchemaResolver<'a> {
                                 root: reader,
                                 inner: rf.schema.as_ref(),
                             };
+
+                            self.human_readable_field_path.push(rf.name.clone());
                             let new_inner = self.resolve(w_node, r_node)?;
+                            self.human_readable_field_path.pop();
+
                             let field = RecordField {
                                 name: rf.name.clone(),
                                 doc: rf.doc.clone(),
@@ -475,7 +477,7 @@ impl<'a> SchemaResolver<'a> {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| (s, i))
-                    .collect::<HashMap<_, _>>();
+                    .collect::<BTreeMap<_, _>>();
                 let symbols = w_symbols
                     .iter()
                     .map(|s| {
@@ -496,8 +498,11 @@ impl<'a> SchemaResolver<'a> {
                     SchemaPiece::Fixed { size: *wsz }
                 } else {
                     return Err(SchemaResolutionError::new(format!(
-                        "Fixed schema {:?}: sizes don't match ({}, {})",
-                        &rs.name, wsz, rsz
+                        "Fixed schema {:?}: sizes don't match ({}, {}) for field `{}`",
+                        &rs.name,
+                        wsz,
+                        rsz,
+                        self.get_current_human_readable_path(),
                     ))
                     .into());
                 }
@@ -516,22 +521,31 @@ impl<'a> SchemaResolver<'a> {
             ) => {
                 if wp != rp {
                     return Err(SchemaResolutionError::new(format!(
-                        "Decimal schema {:?}: precisions don't match: {}, {}",
-                        &rs.name, wp, rp
+                        "Decimal schema {:?}: precisions don't match: {}, {} for field `{}`",
+                        &rs.name,
+                        wp,
+                        rp,
+                        self.get_current_human_readable_path(),
                     ))
                     .into());
                 }
                 if wscale != rscale {
                     return Err(SchemaResolutionError::new(format!(
-                        "Decimal schema {:?}: sizes don't match: {}, {}",
-                        &rs.name, wscale, rscale
+                        "Decimal schema {:?}: sizes don't match: {}, {} for field `{}`",
+                        &rs.name,
+                        wscale,
+                        rscale,
+                        self.get_current_human_readable_path(),
                     ))
                     .into());
                 }
                 if wsz != rsz {
                     return Err(SchemaResolutionError::new(format!(
-                        "Decimal schema {:?}: sizes don't match: {:?}, {:?}",
-                        &rs.name, wsz, rsz
+                        "Decimal schema {:?}: sizes don't match: {:?}, {:?} for field `{}`",
+                        &rs.name,
+                        wsz,
+                        rsz,
+                        self.get_current_human_readable_path(),
                     ))
                     .into());
                 }
@@ -585,6 +599,13 @@ impl<'a> SchemaResolver<'a> {
         writer: SchemaNodeOrNamed,
         reader: SchemaNodeOrNamed,
     ) -> Result<SchemaPieceOrNamed, AvroError> {
+        let previous_human_readable_path_start = self.current_human_readable_path_start;
+        let (_, named_node) = reader.inner.get_piece_and_name(reader.root);
+        if let Some(full_name) = named_node {
+            self.current_human_readable_path_start = self.human_readable_field_path.len();
+            self.human_readable_field_path.push(full_name.human_name());
+        }
+
         let inner = match (writer.inner, reader.inner) {
             // Both schemas are unions - the most complicated case, but simpler than it looks.
             // For each variant in the writer, we attempt to find a matching variant in the reader,
@@ -604,10 +625,10 @@ impl<'a> SchemaResolver<'a> {
                 SchemaPieceRefOrNamed::Piece(SchemaPiece::Union(r_inner)),
             ) => {
                 let w2r = self.writer_to_reader_names.clone();
-                // permuation[1] is Some((j, val)) iff the i'th writer variant
+                // permutation[1] is Some((j, val)) iff the i'th writer variant
                 // _matches_ the j'th reader variant
                 // (i.e., it is the same primitive type, or the same kind of named type and has the same name, or a decimal with the same parameters)
-                // and succuessfully _resolves_ against it,
+                // and successfully _resolves_ against it,
                 // and None otherwise.
                 //
                 // An example of types that match but don't resolve would be two records with the same name but incompatible fields.
@@ -618,8 +639,9 @@ impl<'a> SchemaResolver<'a> {
                         let (r_idx, r_variant) =
                             r_inner.match_(w_variant, &w2r).ok_or_else(|| {
                                 SchemaResolutionError::new(format!(
-                                    "Failed to match {} against any variant in the reader",
-                                    w_variant.get_human_name(writer.root)
+                                    "Failed to match writer union variant `{}` against any variant in the reader for field `{}`",
+                                    w_variant.get_human_name(writer.root),
+                                    self.get_current_human_readable_path()
                                 ))
                             })?;
                         let resolved =
@@ -648,7 +670,10 @@ impl<'a> SchemaResolver<'a> {
                 let (index, r_inner) = r_inner
                     .match_ref(other, &self.writer_to_reader_names)
                     .ok_or_else(|| {
-                        SchemaResolutionError::new("No matching schema in union".to_string())
+                        SchemaResolutionError::new(
+                            format!("No matching schema in reader union for writer type `{}` for field `{}`",
+                                    other.get_human_name(writer.root),
+                                    self.get_current_human_readable_path()))
                     })?;
                 let inner = Box::new(self.resolve(writer.step_ref(other), reader.step(r_inner))?);
                 SchemaPieceOrNamed::Piece(SchemaPiece::ResolveConcreteUnion {
@@ -663,7 +688,10 @@ impl<'a> SchemaResolver<'a> {
                 let (index, w_inner) = w_inner
                     .match_ref(other, &self.reader_to_writer_names)
                     .ok_or_else(|| {
-                        SchemaResolutionError::new("No matching schema in union".to_string())
+                        SchemaResolutionError::new(
+                            format!("No matching schema in writer union for reader type `{}` for field `{}`",
+                                    other.get_human_name(writer.root),
+                                    self.get_current_human_readable_path()))
                     })?;
                 let inner = Box::new(self.resolve(writer.step(w_inner), reader.step_ref(other))?);
                 SchemaPieceOrNamed::Piece(SchemaPiece::ResolveUnionConcrete { index, inner })
@@ -769,7 +797,18 @@ impl<'a> SchemaResolver<'a> {
                                 fixed_size: *wf,
                             })
                         } else {
-                            return Err(SchemaResolutionError::new(format!("Decimal types must match in precision, scale, and fixed size. Got ({:?}, {:?}, {:?}); ({:?}, {:?}. {:?})", wp, ws, wf, rp, rs, rf)).into());
+                            return Err(SchemaResolutionError::new(format!(
+                                "Decimal types must match in precision, scale, and fixed size. \
+                                Got ({:?}, {:?}, {:?}); ({:?}, {:?}. {:?}) for field `{}`",
+                                wp,
+                                ws,
+                                wf,
+                                rp,
+                                rs,
+                                rf,
+                                self.get_current_human_readable_path(),
+                            ))
+                            .into());
                         }
                     }
                     (SchemaPiece::Decimal { fixed_size, .. }, SchemaPiece::Bytes)
@@ -800,10 +839,12 @@ impl<'a> SchemaResolver<'a> {
                     }),
                     (ws, rs) => {
                         return Err(SchemaResolutionError::new(format!(
-                            "Schemas don't match: {:?}, {:?}",
-                            ws, rs
+                            "Writer schema has type `{:?}`, but reader schema has type `{:?}` for field `{}`",
+                            ws,
+                            rs,
+                            self.get_current_human_readable_path(),
                         ))
-                        .into())
+                        .into());
                     }
                 }
             }
@@ -815,7 +856,7 @@ impl<'a> SchemaResolver<'a> {
                         &writer.root.lookup(w_index).name,
                         &reader.root.lookup(r_index).name,
                     );
-                    return Err(SchemaResolutionError::new(format!("Attempted to resolve writer schema node named {} against reader schema node named {}", w_name, r_name)).into());
+                    return Err(SchemaResolutionError::new(format!("Attempted to resolve writer schema node named {:?} against reader schema node named {:?}", w_name, r_name)).into());
                 }
                 // Check if we have already resolved the name previously, and if so, return a reference to
                 // it (in the new schema's namespace).
@@ -855,14 +896,23 @@ impl<'a> SchemaResolver<'a> {
             }
             (ws, rs) => {
                 return Err(SchemaResolutionError::new(format!(
-                    "Schemas don't match: {:?}, {:?}",
-                    ws.get_piece_and_name(&writer.root).0,
-                    rs.get_piece_and_name(&reader.root).0
+                    "Schemas don't match: {:?}, {:?} for field `{}`",
+                    ws.get_piece_and_name(writer.root).0,
+                    rs.get_piece_and_name(reader.root).0,
+                    self.get_current_human_readable_path(),
                 ))
                 .into())
             }
         };
+        if named_node.is_some() {
+            self.human_readable_field_path.pop();
+            self.current_human_readable_path_start = previous_human_readable_path_start;
+        }
         Ok(inner)
+    }
+
+    fn get_current_human_readable_path(&self) -> String {
+        self.human_readable_field_path[self.current_human_readable_path_start..].join(".")
     }
 }
 
@@ -881,11 +931,14 @@ pub fn from_avro_datum<R: AvroRead>(schema: &Schema, reader: &mut R) -> Result<V
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Cursor;
+
+    use mz_ore::assert_err;
+
     use crate::types::{Record, ToAvro};
     use crate::Reader;
 
-    use std::io::Cursor;
+    use super::*;
 
     static SCHEMA: &str = r#"
             {
@@ -917,7 +970,7 @@ mod tests {
         207u8, 108u8, 180u8, 158u8, 57u8, 114u8, 40u8, 173u8, 199u8, 228u8, 239u8,
     ];
 
-    #[test]
+    #[mz_ore::test]
     fn test_from_avro_datum() {
         let schema: Schema = SCHEMA.parse().unwrap();
         let mut encoded: &'static [u8] = &[54, 6, 102, 111, 111];
@@ -930,7 +983,7 @@ mod tests {
         assert_eq!(from_avro_datum(&schema, &mut encoded).unwrap(), expected);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_null_union() {
         let schema: Schema = UNION_SCHEMA.parse().unwrap();
         let mut encoded: &'static [u8] = &[2, 0];
@@ -946,7 +999,8 @@ mod tests {
         );
     }
 
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: inline assembly is not supported
     fn test_reader_stream() {
         let schema: Schema = SCHEMA.parse().unwrap();
         let reader = Reader::with_schema(&schema, ENCODED).unwrap();
@@ -959,54 +1013,193 @@ mod tests {
         record2.put("a", 42i64);
         record2.put("b", "bar");
 
-        let expected = vec![record1.avro(), record2.avro()];
+        let expected = [record1.avro(), record2.avro()];
 
         for (i, value) in reader.enumerate() {
             assert_eq!(value.unwrap(), expected[i]);
         }
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_reader_invalid_header() {
         let schema: Schema = SCHEMA.parse().unwrap();
-        let invalid = ENCODED.to_owned().into_iter().skip(1).collect::<Vec<u8>>();
+        let invalid = ENCODED.iter().skip(1).copied().collect::<Vec<u8>>();
         assert!(Reader::with_schema(&schema, &invalid[..]).is_err());
     }
 
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: inline assembly is not supported
     fn test_reader_invalid_block() {
         let schema: Schema = SCHEMA.parse().unwrap();
         let invalid = ENCODED
-            .to_owned()
-            .into_iter()
+            .iter()
             .rev()
             .skip(19)
+            .copied()
             .collect::<Vec<u8>>()
             .into_iter()
             .rev()
             .collect::<Vec<u8>>();
         let reader = Reader::with_schema(&schema, &invalid[..]).unwrap();
         for value in reader {
-            assert!(value.is_err());
+            assert_err!(value);
         }
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_reader_empty_buffer() {
         let empty = Cursor::new(Vec::new());
         assert!(Reader::new(empty).is_err());
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_reader_only_header() {
-        let invalid = ENCODED
-            .to_owned()
-            .into_iter()
-            .take(165)
-            .collect::<Vec<u8>>();
+        let invalid = ENCODED.iter().copied().take(165).collect::<Vec<u8>>();
         let reader = Reader::new(&invalid[..]).unwrap();
         for value in reader {
-            assert!(value.is_err());
+            assert_err!(value);
         }
+    }
+
+    #[mz_ore::test]
+    fn test_resolution_nested_types_error() {
+        let r = r#"
+{
+    "type": "record",
+    "name": "com.materialize.foo",
+    "fields": [
+        {"name": "f1", "type": {"type": "record", "name": "com.materialize.bar", "fields": [{"name": "f1_1", "type": "int"}]}}
+    ]
+}
+"#;
+        let w = r#"
+{
+    "type": "record",
+    "name": "com.materialize.foo",
+    "fields": [
+        {"name": "f1", "type": {"type": "record", "name": "com.materialize.bar", "fields": [{"name": "f1_1", "type": "double"}]}}
+    ]
+}
+"#;
+        let r: Schema = r.parse().unwrap();
+        let w: Schema = w.parse().unwrap();
+        let err_str = if let Result::Err(AvroError::ResolveSchema(SchemaResolutionError(s))) =
+            resolve_schemas(&w, &r)
+        {
+            s
+        } else {
+            panic!("Expected schema resolution failure");
+        };
+        // The field name here must NOT contain `com.materialize.foo`,
+        // because explicitly named types are all relative to a global
+        // namespace (i.e., they don't nest).
+        assert_eq!(&err_str, "Writer schema has type `Double`, but reader schema has type `Int` for field `com.materialize.bar.f1_1`");
+    }
+
+    #[mz_ore::test]
+    fn test_extra_fields_without_default_error() {
+        let r = r#"
+{
+    "type": "record",
+    "name": "com.materialize.foo",
+    "fields": [
+        {"name": "f1", "type": "int"},
+        {"name": "f2", "type": "int"}
+    ]
+}
+"#;
+        let w = r#"
+{
+    "type": "record",
+    "name": "com.materialize.foo",
+    "fields": [
+        {"name": "f1", "type": "int"}
+    ]
+}
+"#;
+        let r: Schema = r.parse().unwrap();
+        let w: Schema = w.parse().unwrap();
+        let err_str = if let Result::Err(AvroError::ResolveSchema(SchemaResolutionError(s))) =
+            resolve_schemas(&w, &r)
+        {
+            s
+        } else {
+            panic!("Expected schema resolution failure");
+        };
+        assert_eq!(
+            &err_str,
+            "Reader field `com.materialize.foo.f2` not found in writer, and has no default"
+        );
+    }
+
+    #[mz_ore::test]
+    fn test_duplicate_field_error() {
+        let r = r#"
+{
+    "type": "record",
+    "name": "com.materialize.bar",
+    "fields": [
+        {"name": "f1", "type": "int"},
+        {"name": "f1", "type": "int"}
+    ]
+}
+"#;
+        let w = r#"
+{
+    "type": "record",
+    "name": "com.materialize.bar",
+    "fields": [
+        {"name": "f1", "type": "int"}
+    ]
+}
+"#;
+        let r: Schema = r.parse().unwrap();
+        let w: Schema = w.parse().unwrap();
+        let err_str = if let Result::Err(AvroError::ResolveSchema(SchemaResolutionError(s))) =
+            resolve_schemas(&w, &r)
+        {
+            s
+        } else {
+            panic!("Expected schema resolution failure");
+        };
+        assert_eq!(
+            &err_str,
+            "Duplicate field `com.materialize.bar.f1` in schema"
+        );
+    }
+
+    #[mz_ore::test]
+    fn test_decimal_field_mismatch_error() {
+        let r = r#"
+{
+    "type": "record",
+    "name": "com.materialize.foo",
+    "fields": [
+        {"name": "f1", "type": {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}}
+    ]
+}
+"#;
+        let w = r#"
+{
+    "type": "record",
+    "name": "com.materialize.foo",
+    "fields": [
+        {"name": "f1", "type": {"type": "bytes", "logicalType": "decimal", "precision": 5, "scale": 1}}
+    ]
+}
+"#;
+        let r: Schema = r.parse().unwrap();
+        let w: Schema = w.parse().unwrap();
+        let err_str = if let Result::Err(AvroError::ResolveSchema(SchemaResolutionError(s))) =
+            resolve_schemas(&w, &r)
+        {
+            s
+        } else {
+            panic!("Expected schema resolution failure");
+        };
+        assert_eq!(
+            &err_str,
+            "Decimal types must match in precision, scale, and fixed size. Got (5, 1, None); (4, 2. None) for field `com.materialize.foo.f1`"
+        );
     }
 }

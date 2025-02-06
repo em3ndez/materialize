@@ -7,20 +7,27 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
+$ set-regex match=cluster1|quickstart replacement=<CLUSTER_NAME>
+
 ! INSERT INTO t VALUES (1, 'a');
-unknown catalog item 't'
+contains:unknown catalog item 't'
 
 ! SHOW CREATE TABLE t;
-unknown catalog item 't'
+contains:unknown catalog item 't'
 
 > CREATE TABLE t (a int, b text NOT NULL)
 
 > SHOW CREATE TABLE t;
-Table   "Create Table"
+name   create_sql
 ------------------------
 materialize.public.t  "CREATE TABLE \"materialize\".\"public\".\"t\" (\"a\" \"pg_catalog\".\"int4\", \"b\" \"pg_catalog\".\"text\" NOT NULL)"
 
 > CREATE TABLE s (a int DEFAULT 1)
+> DROP TABLE s;
+
+> CREATE TABLE s (a int DEFAULT (1))
 > DROP TABLE s;
 
 > CREATE TABLE s (a date DEFAULT now())
@@ -33,45 +40,47 @@ materialize.public.t  "CREATE TABLE \"materialize\".\"public\".\"t\" (\"a\" \"pg
 > DROP TABLE s;
 
 ! CREATE TABLE s (a date DEFAULT 42)
-DEFAULT expression does not support casting from integer to date
+contains:DEFAULT expression does not support casting from integer to date
 
 ! CREATE TABLE s (a int, b int DEFAULT a + 3)
-column "a" does not exist
+contains:column "a" does not exist
 
 ! CREATE TABLE t (a int, b int, a int);
-column "a" specified more than once
+contains:column "a" specified more than once
 
 > SELECT * FROM t;
 
 > SHOW TABLES;
-name
-----
-t
+name  comment
+-------------
+t     ""
 
 > SHOW SOURCES;
-name
-----
+name    type  cluster  comment
+------------------------------
 
-> SHOW INDEXES FROM t;
-on_name  key_name       seq_in_index  column_name  expression  nullable enabled
--------------------------------------------------------------------------------
-t        t_primary_idx  1             a            <null>      true     true
-t        t_primary_idx  2             b            <null>      false    true
+> SHOW INDEXES ON t;
 
-! DROP INDEX t_primary_idx
-cannot drop 'materialize.public.t_primary_idx' as it is the default index for a table
+> CREATE DEFAULT INDEX on t
+
+> SHOW INDEXES ON t
+name            on          cluster         key    comment
+-----------------------------------------------------------------------------------
+t_primary_idx   t           <CLUSTER_NAME>  {a,b}  ""
+
+> DROP INDEX t_primary_idx
 
 > SHOW COLUMNS in t;
-name       nullable  type
--------------------------
-a          true       integer
-b          false      text
+name       nullable  type      comment
+--------------------------------------
+a          true       integer  ""
+b          false      text     ""
 
 > SHOW COLUMNS in t WHERE name = 'a'
-a  true  integer
+a  true  integer ""
 
 > SHOW COLUMNS in t LIKE 'b%'
-b  false  text
+b  false  text ""
 
 > INSERT INTO t VALUES (1, 'a');
 
@@ -81,48 +90,44 @@ a    b
 1    "a"
 
 $ set schema={
+    "name": "row",
     "type": "record",
-    "name": "envelope",
     "fields": [
-      {
-        "name": "before",
-        "type": [
-          {
-            "name": "row",
-            "type": "record",
-            "fields": [
-              {"name": "id", "type": "string"},
-              {"name": "a", "type": "long"},
-              {"name": "b", "type": "long"}
-            ]
-          },
-          "null"
-        ]
-      },
-      { "name": "after", "type": ["row", "null"] }
+      {"name": "id", "type": "string"},
+      {"name": "a", "type": "long"},
+      {"name": "b", "type": "long"}
     ]
   }
 
 $ kafka-create-topic topic=data
 
 $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"row":{"id": "valid1", "a": 2, "b": 1}}}
+{"id": "valid1", "a": 2, "b": 1}
 
-> CREATE MATERIALIZED SOURCE data
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE data
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+
+> CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
-  ENVELOPE DEBEZIUM
 
-> SELECT * FROM t CROSS JOIN data
+> SELECT * FROM t CROSS JOIN data_tbl
 1  a  valid1  2  1
 
 # We don't actually care about these results. We just want to ensure that
 # joining a table with a logging source selects some reasonable timestamp,
 # rather than e.g. blocking forever, or producing an error about being
 # unable to select a timestamp.
-> SELECT * FROM t CROSS JOIN mz_dataflow_operators LIMIT 0
 
-> DROP SOURCE data
+# In case the environment has other replicas
+> SET cluster_replica = r1
+
+> SELECT * FROM t CROSS JOIN mz_introspection.mz_dataflow_operators LIMIT 0
+
+> DROP SOURCE data CASCADE
 
 # Ensure that tables work after creating a custom index, and that the custom
 # index is not subject to the same no-drop restriction as the default index.
@@ -145,13 +150,13 @@ a      b
 > INSERT INTO t SELECT * FROM t WHERE a IS NULL;
 
 ! INSERT INTO t VALUES (1);
-null value in column "b" violates not-null constraint
+contains:null value in column "b" violates not-null constraint
 
 ! INSERT INTO t VALUES (1, NULL);
-null value in column "b" violates not-null constraint
+contains:null value in column "b" violates not-null constraint
 
 ! INSERT INTO t VALUES ('d', 4);
-invalid input syntax for type integer: invalid digit found in string: "d"
+contains:invalid input syntax for type integer: invalid digit found in string: "d"
 
 # Test that the INSERT body can be a SELECT query.
 > INSERT INTO t SELECT 3, 'd'
@@ -161,7 +166,7 @@ invalid input syntax for type integer: invalid digit found in string: "d"
 
 # ...but not in complicated VALUES clauses, per PostgreSQL.
 ! INSERT INTO t VALUES ('5', 'f') LIMIT 0
-column "a" is of type integer but expression is of type text
+contains:column "a" is of type integer but expression is of type text
 
 # Test that assignment casts occur when possible...
 > INSERT INTO t VALUES (5.0, 'f');
@@ -169,14 +174,16 @@ column "a" is of type integer but expression is of type text
 
 # ...but not when impossible.
 ! INSERT INTO t VALUES (DATE '2020-01-01', 'bad')
-column "a" is of type integer but expression is of type date
+contains:column "a" is of type integer but expression is of type date
+! INSERT INTO t (b, a) VALUES ('bad', DATE '2020-01-01')
+contains:column "a" is of type integer but expression is of type date
 
 # Attempting to insert JSON into an int column is particularly interesting.
 # While there is an "explicit" cast from `jsonb` to `int`, there is no
 # "assignment" cast, and INSERT is only allowed to use assignment/implicit
 # casts.
 ! INSERT INTO t VALUES (JSON '1', 'bad')
-column "a" is of type integer but expression is of type jsonb
+contains:column "a" is of type integer but expression is of type jsonb
 
 > SELECT * FROM t;
 a       b
@@ -193,16 +200,34 @@ a       b
 > CREATE TABLE s (a int NOT NULL);
 
 ! INSERT INTO s VALUES (1 + NULL);
-null value in column "a" violates not-null constraint
+contains:null value in column "a" violates not-null constraint
+
+! INSERT INTO s VALUES (case when now() = now() then NULL else 2 end);
+contains:null value in column "a" violates not-null constraint
+
+! INSERT INTO s SELECT (case when now() = now() then NULL else 2 end);
+contains:null value in column "a" violates not-null constraint
+
+> CREATE TABLE n (a int);
+
+> INSERT INTO n VALUES (NULL);
+
+! INSERT INTO s SELECT * FROM n;
+contains:null value in column "a" violates not-null constraint
+
+> DROP TABLE n
 
 > CREATE TABLE v (a timestamptz);
 > INSERT INTO v VALUES (now());
 
 ! CREATE INDEX ON v (now())
-now cannot be used in static queries
+contains:cannot materialize call to current_timestamp
 
-! CREATE INDEX ON v (mz_logical_timestamp())
-calls to mz_logical_timestamp in in static or write queries are not supported
+! CREATE INDEX ON v (mz_now())
+contains:cannot materialize call to mz_now
+
+! CREATE INDEX ON v (mz_version())
+contains:cannot materialize call to mz_version
 
 > DROP TABLE IF EXISTS s;
 
@@ -211,25 +236,25 @@ calls to mz_logical_timestamp in in static or write queries are not supported
 > DROP TABLE IF EXISTS t;
 
 ! SELECT * from t;
-unknown catalog item 't'
+contains:unknown catalog item 't'
 
-! SHOW INDEXES FROM t;
-unknown catalog item 't'
+! SHOW INDEXES ON t;
+contains:unknown catalog item 't'
 
 > SHOW TABLES;
-name
-----
-v
+name  comment
+-------------
+v     ""
 
 > SHOW TABLES LIKE 'foo'
 > SHOW TABLES LIKE 'v%'
-v
+v ""
 > SHOW TABLES WHERE name = 'v'
-v
+v ""
 
 > SHOW SOURCES;
-name
-----
+name    type   cluster   comment
+--------------------------------
 
 > CREATE TABLE t (a int, b text NOT NULL)
 
@@ -237,10 +262,10 @@ name
 
 > CREATE VIEW view AS SELECT 1
 ! INSERT INTO view VALUES (1)
-cannot insert into view 'materialize.public.view'
+contains:cannot insert into view 'materialize.public.view'
 
 ! INSERT INTO mz_kafka_sinks VALUES ('bad', 'bad')
-cannot insert into system table 'mz_catalog.mz_kafka_sinks'
+contains:cannot insert into system table 'mz_catalog.mz_kafka_sinks'
 
 > CREATE TABLE j (time TIMESTAMP NOT NULL);
 
@@ -301,33 +326,33 @@ a      b    c
 <null> "c"  <null>
 
 ! INSERT INTO t (notpresent, a, c) VALUES ('str', 1, 2);
-column "notpresent" of relation "materialize.public.t" does not exist
+contains:column "notpresent" of relation "materialize.public.t" does not exist
 
 ! INSERT INTO t (a, b, c) VALUES ('str', 1, 2);
-invalid input syntax for type integer: invalid digit found in string: "str"
+contains:invalid input syntax for type integer: invalid digit found in string: "str"
 
 ! INSERT INTO t (b, a, c) VALUES (1, 'str', 2);
-invalid input syntax for type integer: invalid digit found in string: "str"
+contains:invalid input syntax for type integer: invalid digit found in string: "str"
 
 ! INSERT INTO t (d, c, b, a) VALUES (1, 1, 1, 'str');
-column "d" of relation "materialize.public.t" does not exist
+contains:column "d" of relation "materialize.public.t" does not exist
 
 ! INSERT INTO t (a) VALUES (1);
-null value in column "b" violates not-null constraint
+contains:null value in column "b" violates not-null constraint
 
 ! INSERT INTO t (a) VALUES (1, 'str');
-INSERT has more expressions than target columns
+contains:INSERT has more expressions than target columns
 
 ! INSERT INTO t (a, b, c) VALUES (1);
-INSERT has more target columns than expressions
+contains:INSERT has more target columns than expressions
 
 ! INSERT INTO t (a, a) VALUES (1, 'str')
-column "a" specified more than once
+contains:column "a" specified more than once
 
 # Test pg_table_is_visible.
 > CREATE SCHEMA non_default
 > CREATE TABLE non_default.hidden (dummy int)
-> SELECT name, pg_table_is_visible(oid) AS visible FROM mz_tables WHERE schema_id != 1
+> SELECT name, pg_table_is_visible(oid) AS visible FROM mz_tables WHERE schema_id != 'u1' AND id LIKE 'u%'
 name    visible
 ---------------
 hidden  false
@@ -340,20 +365,54 @@ v       true
 # pretty useless.
 > CREATE TABLE nocols ();
 ! INSERT INTO nocols VALUES (1)
-INSERT has more expressions than target columns
+contains:INSERT has more expressions than target columns
 > SELECT count(*) FROM nocols
 0
 > INSERT INTO nocols SELECT UNION ALL SELECT
 > SELECT count(*) FROM nocols
 2
 ! SELECT DISTINCT * FROM nocols
-SELECT DISTINCT must have at least one column
+contains:SELECT DISTINCT must have at least one column
 
 
 # Test that show columns preserves the column order
 > CREATE TABLE column_order (b int, a int);
 > SHOW COLUMNS FROM column_order
-name nullable type
------------------------
-b    true     integer
-a    true     integer
+name nullable type     comment
+------------------------------
+b    true     integer  ""
+a    true     integer  ""
+
+
+# Test that the underlying Persist shard gets cleaned up on DROP.
+> CREATE TABLE shard_drop_test (a int, b text);
+> INSERT INTO shard_drop_test VALUES (1, 'hello');
+
+> CREATE TABLE shard_drop_test_empty (a int, b text);
+
+$ set-from-sql var=shard-drop-test-id
+SELECT id FROM mz_tables WHERE name = 'shard_drop_test';
+
+$ set-from-sql var=shard-drop-test-empty-id
+SELECT id FROM mz_tables WHERE name = 'shard_drop_test_empty';
+
+# Wait for the mz_storage_shards table to get updated.
+> SELECT COUNT(shard_id) FROM mz_internal.mz_storage_shards WHERE object_id IN ('${shard-drop-test-id}', '${shard-drop-test-empty-id}');
+2
+
+$ set-from-sql var=shard-drop-test-shard-id
+SELECT shard_id FROM mz_internal.mz_storage_shards WHERE object_id = '${shard-drop-test-id}';
+
+$ set-from-sql var=shard-drop-test-empty-shard-id
+SELECT shard_id FROM mz_internal.mz_storage_shards WHERE object_id = '${shard-drop-test-empty-id}';
+
+> DROP TABLE shard_drop_test;
+> DROP TABLE shard_drop_test_empty;
+
+> SELECT COUNT(*) FROM mz_internal.mz_storage_shards WHERE object_id IN ('${shard-drop-test-id}', '${shard-drop-test-empty-id}');
+0
+
+$ check-shard-tombstone shard-id=${shard-drop-test-shard-id}
+
+# TODO(parkmycar): The since and upper of the shard are empty, but the controller still has it's handle registered.
+# $ check-shard-tombstone shard-id=${shard-drop-test-empty-shard-id}

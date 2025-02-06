@@ -10,13 +10,18 @@
 //! A parser for sqllogictest.
 
 use std::borrow::ToOwned;
+use std::sync::LazyLock;
 
 use anyhow::{anyhow, bail};
-use lazy_static::lazy_static;
+use mz_repr::ColumnName;
 use regex::Regex;
-use repr::ColumnName;
 
 use crate::ast::{Location, Mode, Output, QueryOutput, Record, Sort, Type};
+
+static QUERY_OUTPUT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\r?\n----").unwrap());
+static DOUBLE_LINE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\n|\r\n|$)(\n|\r\n|$)").unwrap());
+static EOF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\n|\r\n)EOF(\n|\r\n)").unwrap());
 
 #[derive(Debug, Clone)]
 pub struct Parser<'a> {
@@ -72,9 +77,10 @@ impl<'a> Parser<'a> {
             return Ok(Record::Halt);
         }
 
-        lazy_static! {
-            static ref COMMENT_AND_LINE_REGEX: Regex = Regex::new("(#[^\n]*)?\r?(\n|$)").unwrap();
-        }
+        let line_number = self.curline;
+
+        static COMMENT_AND_LINE_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new("(#[^\n]*)?\r?(\n|$)").unwrap());
         let first_line = self.split_at(&COMMENT_AND_LINE_REGEX)?.trim();
 
         if first_line.is_empty() {
@@ -135,7 +141,22 @@ impl<'a> Parser<'a> {
                 self.parse_record()
             }
 
-            other => bail!("Unexpected start of record: {}", other),
+            "copy" => Ok(Record::Copy {
+                table_name: words
+                    .next()
+                    .ok_or_else(|| anyhow!("load directive missing table name"))?,
+                tsv_path: words
+                    .next()
+                    .ok_or_else(|| anyhow!("load directive missing TSV path"))?,
+            }),
+
+            "reset-server" => Ok(Record::ResetServer),
+
+            other => bail!(
+                "Unexpected start of record on line {}: {}",
+                line_number,
+                other
+            ),
         }
     }
 
@@ -172,9 +193,6 @@ impl<'a> Parser<'a> {
             Some("error") => expected_error = Some(parse_expected_error(first_line)),
             _ => bail!("invalid statement disposition: {}", first_line),
         };
-        lazy_static! {
-            static ref DOUBLE_LINE_REGEX: Regex = Regex::new(r"(\n|\r\n|$)(\n|\r\n|$)").unwrap();
-        }
         let sql = self.split_at(&DOUBLE_LINE_REGEX)?;
         Ok(Record::Statement {
             expected_error,
@@ -192,10 +210,6 @@ impl<'a> Parser<'a> {
         let location = self.location();
         if words.peek() == Some(&"error") {
             let error = parse_expected_error(first_line);
-            lazy_static! {
-                static ref DOUBLE_LINE_REGEX: Regex =
-                    Regex::new(r"(\n|\r\n|$)(\n|\r\n|$)").unwrap();
-            }
             let sql = self.split_at(&DOUBLE_LINE_REGEX)?;
             return Ok(Record::Query {
                 sql,
@@ -234,29 +248,41 @@ impl<'a> Parser<'a> {
             bail!("multiline option is incompatible with all other options");
         }
         let label = words.next();
-        lazy_static! {
-            static ref LINE_REGEX: Regex = Regex::new("\r?(\n|$)").unwrap();
-            static ref HASH_REGEX: Regex = Regex::new(r"(\S+) values hashing to (\S+)").unwrap();
-            static ref QUERY_OUTPUT_REGEX: Regex = Regex::new(r"\r?\n----").unwrap();
-        }
+        static LINE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new("\r?(\n|$)").unwrap());
+        static HASH_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(\S+) values hashing to (\S+)").unwrap());
         let sql = self.split_at(&QUERY_OUTPUT_REGEX)?;
-        lazy_static! {
-            static ref EOF_REGEX: Regex = Regex::new(r"(\n|\r\n)EOF(\n|\r\n)").unwrap();
-            static ref DOUBLE_LINE_REGEX: Regex = Regex::new(r"(\n|\r\n|$)(\n|\r\n|$)").unwrap();
-        }
-        let mut output_str = self
-            .split_at(if multiline {
-                &EOF_REGEX
-            } else {
-                &DOUBLE_LINE_REGEX
-            })?
-            .trim_start();
+        let mut output_str = self.split_at(if multiline {
+            &EOF_REGEX
+        } else {
+            &DOUBLE_LINE_REGEX
+        })?;
+
+        // The `split_at(&QUERY_OUTPUT_REGEX)` stopped at the end of `----`, so `output_str` usually
+        // starts with a newline, which is not actually part of the expected output. Strip off this
+        // newline.
+        output_str = if let Some(output_str_stripped) = regexp_strip_prefix(output_str, &LINE_REGEX)
+        {
+            output_str_stripped
+        } else {
+            // There should always be a newline after `----`, because we have a lint that there is
+            // always a newline at the end of a file. However, we can still get here, when
+            // the expected output is empty, in which case the EOF_REGEX or DOUBLE_LINE_REGEX eats
+            // the newline at the end of the `----`.
+            assert!(output_str.is_empty());
+            output_str
+        };
+
+        // We don't want to advance the expected output past the column names so rewriting works,
+        // but need to be able to parse past them, so remember the position before possible column
+        // names.
+        let query_output_str = output_str;
         let column_names = if check_column_names {
             Some(
                 split_at(&mut output_str, &LINE_REGEX)?
                     .split(' ')
                     .filter(|s| !s.is_empty())
-                    .map(|s| ColumnName::from(s.replace("␠", " ")))
+                    .map(|s| ColumnName::from(s.replace('␠', " ")))
                     .collect(),
             )
         } else {
@@ -290,7 +316,7 @@ impl<'a> Parser<'a> {
                                     types.len()
                                 );
                             }
-                            rows.push(cols.into_iter().map(|col| col.replace("␠", " ")).collect());
+                            rows.push(cols.into_iter().map(|col| col.replace('␠', " ")).collect());
                         }
                         if sort == Sort::Row {
                             rows.sort();
@@ -313,7 +339,7 @@ impl<'a> Parser<'a> {
                 column_names,
                 mode: self.mode,
                 output,
-                output_str,
+                output_str: query_output_str,
             }),
             location,
         })
@@ -325,25 +351,47 @@ impl<'a> Parser<'a> {
     ) -> Result<Record<'a>, anyhow::Error> {
         let location = self.location();
         let mut conn = None;
+        let mut user = None;
+        let mut multiline = false;
         if let Some(options) = words.next() {
             for option in options.split(',') {
                 if let Some(value) = option.strip_prefix("conn=") {
                     conn = Some(value);
+                } else if let Some(value) = option.strip_prefix("user=") {
+                    user = Some(value);
+                } else if option == "multiline" {
+                    multiline = true;
                 } else {
                     bail!("Unrecognized option {:?} in {:?}", option, options);
                 }
             }
         }
-        lazy_static! {
-            static ref QUERY_OUTPUT_REGEX: Regex = Regex::new(r"\r?\n----").unwrap();
-            static ref DOUBLE_LINE_REGEX: Regex = Regex::new(r"(\n|\r\n|$)(\n|\r\n|$)").unwrap();
+        if user.is_some() && conn.is_none() {
+            bail!("cannot set user without also setting conn");
         }
         let sql = self.split_at(&QUERY_OUTPUT_REGEX)?;
-        let output_str = self.split_at(&DOUBLE_LINE_REGEX)?.trim_start();
-        let output = Output::Values(output_str.lines().map(String::from).collect());
+        let output_str = self
+            .split_at(if multiline {
+                &EOF_REGEX
+            } else {
+                &DOUBLE_LINE_REGEX
+            })?
+            .trim_start();
+        let output = if multiline {
+            Output::Values({
+                let mut v = vec![output_str.to_owned()];
+                // for simple queries we still have to pass the COMPLETE string after the EOF
+                let complete_str = self.split_at(&DOUBLE_LINE_REGEX)?.trim_start();
+                v.extend(complete_str.lines().map(String::from));
+                v
+            })
+        } else {
+            Output::Values(output_str.lines().map(String::from).collect())
+        };
         Ok(Record::Simple {
             location,
             conn,
+            user,
             sql,
             output,
             output_str,
@@ -379,15 +427,9 @@ fn parse_types(input: &str) -> Result<Vec<Type>, anyhow::Error> {
         .collect()
 }
 
-lazy_static! {
-    static ref WHITESPACE_REGEX: Regex = Regex::new(r"\s+").unwrap();
-}
-
 fn parse_expected_error(line: &str) -> &str {
-    lazy_static! {
-        static ref PGCODE_RE: Regex =
-            Regex::new("(statement|query) error( pgcode [a-zA-Z0-9]{5})? ?").unwrap();
-    }
+    static PGCODE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("(statement|query) error( pgcode [a-zA-Z0-9]{5})? ?").unwrap());
     // TODO(benesch): one day this should record the expected pgcode, if
     // specified.
     let pos = PGCODE_RE.find(line).unwrap().end();
@@ -404,5 +446,18 @@ pub(crate) fn split_cols(line: &str, expected_columns: usize) -> Vec<&str> {
         vec![line.trim()]
     } else {
         line.split_whitespace().collect()
+    }
+}
+
+pub fn regexp_strip_prefix<'a>(text: &'a str, regexp: &Regex) -> Option<&'a str> {
+    match regexp.find(text) {
+        Some(found) => {
+            if found.start() == 0 {
+                Some(&text[found.end()..])
+            } else {
+                None
+            }
+        }
+        None => None,
     }
 }

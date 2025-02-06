@@ -12,23 +12,13 @@
 //! These test utilities are relied by crates other than `repr`.
 
 use chrono::NaiveDateTime;
-use lazy_static::lazy_static;
+use mz_lowertest::deserialize_optional_generic;
+use mz_ore::str::StrExt;
+use mz_repr::adt::numeric::Numeric;
+use mz_repr::adt::timestamp::CheckedTimestamp;
+use mz_repr::strconv::parse_jsonb;
+use mz_repr::{Datum, Row, RowArena, ScalarType};
 use proc_macro2::TokenTree;
-
-use lowertest::{
-    deserialize_optional, gen_reflect_info_func, GenericTestDeserializeContext, MzEnumReflect,
-    MzStructReflect, ReflectedTypeInfo,
-};
-use ore::str::StrExt;
-use repr::adt::numeric::Numeric;
-use repr::{ColumnType, Datum, Row, RowArena, ScalarType};
-
-/* #region Generate information required to construct arbitrary `ScalarType`*/
-gen_reflect_info_func!(produce_rti, [ScalarType], [ColumnType]);
-
-lazy_static! {
-    pub static ref RTI: ReflectedTypeInfo = produce_rti();
-}
 
 /* #endregion */
 
@@ -79,18 +69,25 @@ where
                 ScalarType::Float32 => Ok(Datum::from(parse_litval::<f32>(litval, "f32")?)),
                 ScalarType::Float64 => Ok(Datum::from(parse_litval::<f64>(litval, "f64")?)),
                 ScalarType::String => Ok(Datum::from(
-                    temp_storage.push_string(lowertest::unquote(litval)),
+                    temp_storage.push_string(mz_lowertest::unquote(litval)),
                 )),
-                ScalarType::Timestamp => {
+                ScalarType::Timestamp { .. } => {
                     let datetime = if litval.contains('.') {
                         NaiveDateTime::parse_from_str(litval, "\"%Y-%m-%d %H:%M:%S%.f\"")
                     } else {
                         NaiveDateTime::parse_from_str(litval, "\"%Y-%m-%d %H:%M:%S\"")
                     };
-                    Ok(Datum::from(datetime.map_err(|e| {
-                        format!("Error while parsing NaiveDateTime: {}", e)
-                    })?))
+                    Ok(Datum::from(
+                        CheckedTimestamp::from_timestamplike(
+                            datetime
+                                .map_err(|e| format!("Error while parsing NaiveDateTime: {}", e))?,
+                        )
+                        .unwrap(),
+                    ))
                 }
+                ScalarType::Jsonb => parse_jsonb(&mz_lowertest::unquote(litval))
+                    .map(|jsonb| temp_storage.push_unary_row(jsonb.into_row()))
+                    .map_err(|parse| format!("Invalid JSON literal: {:?}", parse)),
                 _ => Err(format!("Unsupported literal type {:?}", littyp)),
             }
         }
@@ -111,7 +108,7 @@ pub fn datum_to_test_spec(datum: Datum) -> String {
 
 /// Parses `ScalarType` from `scalar_type_stream` or infers it from `litval`
 ///
-/// See [lowertest::to_json] for the syntax for specifying a `ScalarType`.
+/// See [mz_lowertest::to_json] for the syntax for specifying a `ScalarType`.
 /// If `scalar_type_stream` is empty, will attempt to guess a `ScalarType` for
 /// the literal:
 /// * If `litval` is "true", "false", or "null", will return `Bool`.
@@ -125,12 +122,7 @@ pub fn get_scalar_type_or_default<I>(
 where
     I: Iterator<Item = TokenTree>,
 {
-    let typ: Option<ScalarType> = deserialize_optional(
-        scalar_type_stream,
-        "ScalarType",
-        &RTI,
-        &mut GenericTestDeserializeContext::default(),
-    )?;
+    let typ: Option<ScalarType> = deserialize_optional_generic(scalar_type_stream, "ScalarType")?;
     match typ {
         Some(typ) => Ok(typ),
         None => {
@@ -180,13 +172,13 @@ where
         TokenTree::Punct(punct) if punct.as_char() == '-' => {
             match rest_of_stream.next() {
                 Some(TokenTree::Literal(literal)) => {
-                    Ok(Some(format!("{}{}", punct.as_char(), literal.to_string())))
+                    Ok(Some(format!("{}{}", punct.as_char(), literal)))
                 }
                 None => Ok(None),
                 // Must error instead of handling the tokens using default
                 // behavior since `stream_iter` has advanced.
                 Some(other) => Err(format!(
-                    "{}{:?} is not a valid literal",
+                    "`{}` `{}` is not a valid literal",
                     punct.as_char(),
                     other
                 )),
@@ -208,14 +200,17 @@ pub fn parse_vec_of_literals(token: &TokenTree) -> Result<Vec<String>, String> {
                 match extract_literal_string(&symbol, &mut inner_iter)? {
                     Some(dat) => result.push(dat),
                     None => {
-                        return Err(format!("{:?} cannot be interpreted as a literal.", symbol));
+                        return Err(format!(
+                            "TokenTree `{}` cannot be interpreted as a literal.",
+                            symbol
+                        ));
                     }
                 }
             }
             Ok(result)
         }
         invalid => Err(format!(
-            "{:?} cannot be parsed as a vec of literals",
+            "TokenTree `{}` cannot be parsed as a vec of literals",
             invalid
         )),
     }

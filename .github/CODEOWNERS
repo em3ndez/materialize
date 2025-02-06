@@ -1,0 +1,140 @@
+# Describes which individuals/teams are reponsible for which code in the
+# repository.
+#
+# NOTE: ownership by an individual is a smell, as is ownership by multiple
+# teams. We have a soft goal of arranging our code so that each entry names
+# a single team as owner. Better not to hide the truth, though; we'd rather
+# be honest about where we still have individuals as owners.
+#
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+/.cargo                             @MaterializeInc/testing @parkmycar
+/.config                            @MaterializeInc/testing
+/.github                            @MaterializeInc/testing
+/bin
+/bin/lint-versions                  @MaterializeInc/testing
+/ci                                 @MaterializeInc/testing
+/ci/test/lint-deps.toml
+/doc/user                           @MaterializeInc/docs
+/doc/developer/reference/compute    @MaterializeInc/cluster
+/doc/developer/reference/storage    @MaterializeInc/cluster
+/misc/bazel                         @parkmycar
+/misc/dbt-materialize               @morsapaes @MaterializeInc/integrations
+/misc/python/materialize/benches    @MaterializeInc/testing
+/misc/python/materialize/buildkite_insights @MaterializeInc/testing
+/misc/python/materialize/checks     @MaterializeInc/testing
+/misc/python/materialize/ci_util    @MaterializeInc/testing
+/misc/python/materialize/cli/ci_annotate_errors.py @MaterializeInc/testing
+/misc/python/materialize/cli/ci_closed_issues_detect.py @MaterializeInc/testing
+/misc/python/materialize/cli/ci_coverage_pr_report.py @MaterializeInc/testing
+/misc/python/materialize/cli/ci_upload_heap_profiles.py @MaterializeInc/testing
+/misc/python/materialize/cloudtest  @MaterializeInc/cloud @MaterializeInc/testing
+/misc/python/materialize/data_ingest @MaterializeInc/testing
+/misc/python/materialize/parallel_workload @MaterializeInc/testing
+/misc/python/materialize/postgres_consistency @MaterializeInc/testing
+/misc/python/materialize/scalability @MaterializeInc/testing
+/misc/python/materialize/sqlsmith.py @MaterializeInc/testing
+/misc/python/materialize/version_consistency @MaterializeInc/testing
+/misc/python/materialize/zippy      @MaterializeInc/testing
+/src/adapter                        @MaterializeInc/adapter
+/src/adapter-types                  @MaterializeInc/adapter
+/src/adapter/src/explain            @MaterializeInc/cluster
+/src/adapter/src/optimize           @MaterializeInc/cluster
+# to track changes to feature flags
+/src/adapter/src/coord/ddl.rs       @MaterializeInc/testing
+# to track changes to introspection subscribes
+/src/adapter/src/coord/introspection.rs @MaterializeInc/cluster
+# to track changes to feature flags
+/src/adapter/src/flags.rs           @MaterializeInc/testing
+/src/alloc
+/src/audit-log                      @MaterializeInc/adapter
+/src/avro                           @MaterializeInc/cluster
+/src/avro-derive                    @MaterializeInc/cluster
+/src/build-id                       @teskje
+/src/build-info                     @MaterializeInc/testing @parkmycar
+/src/catalog                        @MaterializeInc/adapter
+/src/catalog-debug                  @MaterializeInc/adapter
+/src/ccsr                           @MaterializeInc/adapter @MaterializeInc/cluster
+/src/cloud-resources                @MaterializeInc/cloud
+/src/cluster                        @MaterializeInc/cluster
+/src/cluster-client                 @MaterializeInc/cluster
+/src/clusterd                       @MaterializeInc/cluster
+/src/compute                        @MaterializeInc/cluster
+/src/compute-client                 @MaterializeInc/cluster
+/src/compute-types                  @MaterializeInc/cluster
+/src/controller                     @MaterializeInc/cluster
+/src/controller-types               @MaterializeInc/cluster
+/src/durable-cache                  @MaterializeInc/adapter
+/src/dyncfg
+/src/dyncfgs
+/src/environmentd                   @MaterializeInc/adapter
+/src/expr                           @MaterializeInc/cluster
+/src/expr-parser                    @MaterializeInc/cluster
+/src/expr-test-util                 @MaterializeInc/cluster
+/src/fivetran-destination           @MaterializeInc/adapter
+/src/frontegg-auth                  @MaterializeInc/adapter
+/src/http-util                      @MaterializeInc/adapter
+/src/interchange                    @MaterializeInc/cluster
+/src/kafka-util                     @MaterializeInc/cluster
+/src/lowertest                      @MaterializeInc/cluster
+/src/lowertest-derive               @MaterializeInc/cluster
+/src/metabase
+/src/mysql-util                     @MaterializeInc/cluster
+/src/mz                             @MaterializeInc/integrations
+/src/npm
+/src/orchestrator                   @MaterializeInc/cloud
+/src/orchestrator-kubernetes        @MaterializeInc/cloud
+/src/orchestrator-process           @MaterializeInc/cloud
+/src/orchestrator-tracing           @MaterializeInc/cloud
+/src/ore
+/src/persist                        @MaterializeInc/persist
+/src/persist-cli                    @MaterializeInc/persist
+/src/persist-client                 @MaterializeInc/persist
+/src/persist-types                  @MaterializeInc/persist
+/src/pgcopy                         @MaterializeInc/adapter
+/src/pgrepr                         @MaterializeInc/adapter
+/src/pgtest                         @MaterializeInc/adapter
+/src/pgwire                         @MaterializeInc/adapter
+/src/postgres-util                  @MaterializeInc/cluster
+/src/prof                           @teskje
+/src/repr                           @MaterializeInc/cluster
+# The `explain` and `optimize` modules are owned solely by the cluster team.
+/src/repr/src/explain               @MaterializeInc/cluster
+/src/repr/src/optimize              @MaterializeInc/cluster
+# The row representation is owned by the persist team.
+/src/repr/src/row                   @MaterializeInc/persist
+/src/repr-test-util                 @MaterializeInc/cluster
+/src/rocksdb                        @MaterializeInc/cluster
+/src/s3-datagen                     @MaterializeInc/cluster
+/src/secrets                        @MaterializeInc/cloud
+/src/segment
+/src/service                        @MaterializeInc/cluster
+/src/sql                            @MaterializeInc/adapter
+/src/sql/src/session/vars.rs
+# HirRelationExpr is the boundary between the `sql` crate and the cluster
+# layer, and is jointly owned by the two teams.
+/src/sql/src/plan/explain           @MaterializeInc/cluster
+/src/sql/src/plan/expr.rs           @MaterializeInc/adapter @MaterializeInc/cluster
+# The lowering of HirRelationExpr to MirRelationExpr is part of the cluster
+# layer, despite being located in the `sql` crate.
+/src/sql/src/plan/lowering          @MaterializeInc/cluster
+/src/sql/src/plan/lowering.rs       @MaterializeInc/cluster
+/src/sql-lexer                      @MaterializeInc/adapter
+/src/sql-parser                     @MaterializeInc/adapter
+/src/sqllogictest                   @MaterializeInc/adapter
+/src/ssh-util                       @MaterializeInc/cluster
+/src/storage                        @MaterializeInc/cluster
+/src/storage-client                 @MaterializeInc/cluster
+/src/storage-controller             @MaterializeInc/cluster
+/src/storage-operators              @MaterializeInc/cluster
+/src/storage-types                  @MaterializeInc/cluster
+/src/test-macro                     @MaterializeInc/testing
+/src/testdrive                      @MaterializeInc/testing
+/src/timely-util                    @MaterializeInc/cluster
+/src/transform                      @MaterializeInc/cluster
+/src/txn-wal                        @aljoscha
+/src/walkabout                      @MaterializeInc/adapter
+/src/workspace-hack                 @MaterializeInc/testing
+/test
+/MODULE.bazel                       @parkmycar
+/WORKSPACE                          @parkmycar

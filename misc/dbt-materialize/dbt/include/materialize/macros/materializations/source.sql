@@ -15,25 +15,30 @@
 
 {% materialization source, adapter='materialize' %}
   {%- set identifier = model['alias'] -%}
+  {%- set old_relation = adapter.get_relation(identifier=identifier,
+                                              schema=schema,
+                                              database=database) -%}
   {%- set target_relation = api.Relation.create(identifier=identifier,
                                                 schema=schema,
                                                 database=database,
                                                 type='source') -%}
 
-  {% set source_name %}
-      {{ mz_generate_name(identifier) }}
-  {% endset %}
-  {{ materialize__drop_source(source_name) }}
+  {% if old_relation %}
+    {{ adapter.drop_relation(old_relation) }}
+  {% endif %}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
+  {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
-  {% call statement('main', auto_begin=False) -%}
-    {{ materialize__create_arbitrary_object(sql) }}
+  {% call statement('main') -%}
+    {{ materialize__create_source(target_relation, sql) }}
   {%- endcall %}
 
+  {{ create_indexes(target_relation) }}
   {% do persist_docs(target_relation, model) %}
 
   {{ run_hooks(post_hooks, inside_transaction=False) }}
+  {{ run_hooks(post_hooks, inside_transaction=True) }}
 
   {{ return({'relations': [target_relation]}) }}
 {% endmaterialization %}

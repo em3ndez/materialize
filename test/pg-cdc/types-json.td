@@ -11,6 +11,14 @@
 # Test the JSON data type
 #
 
+> CREATE SECRET pgpass AS 'postgres'
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass
+  )
+
 
 # Insert data pre-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
@@ -20,29 +28,27 @@ DROP PUBLICATION IF EXISTS mz_source;
 
 CREATE SCHEMA public;
 
-CREATE TABLE t1 (f1 JSON);
+CREATE TABLE t1 (f1 JSON, f2 JSONB);
 ALTER TABLE t1 REPLICA IDENTITY FULL;
 
-INSERT INTO t1 VALUES ('{"bar": "baz", "balance": 7.77, "active": false}'::json);
+INSERT INTO t1 VALUES ('{"bar": "baz", "balance": 7.77, "active": false}'::json, '{"bar": "baz", "balance": 7.77, "active": false}'::json);
 
 CREATE PUBLICATION mz_source FOR ALL TABLES;
 
-> CREATE MATERIALIZED SOURCE mz_source
-  FROM POSTGRES CONNECTION 'host=postgres port=5432 user=postgres password=postgres sslmode=require dbname=postgres'
-  PUBLICATION 'mz_source';
+> CREATE SOURCE mz_source FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
 
-> SELECT COUNT(*) > 0 FROM mz_source;
+> CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE t1);
+
+> SELECT COUNT(*) > 0 FROM t1;
 true
-
-> CREATE VIEWS FROM SOURCE mz_source;
 
 # Insert the same data post-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
-INSERT INTO t1 VALUES ('{"bar": "baz", "balance": 7.77, "active": false}'::json);
+INSERT INTO t1 VALUES ('{"bar": "baz", "balance": 7.77, "active": false}'::json, '{"bar": "baz", "balance": 7.77, "active": false}'::jsonb);
 
-> SELECT pg_typeof(f1) FROM t1 LIMIT 1;
-jsonb
+> SELECT pg_typeof(f1), pg_typeof(f2) FROM t1 LIMIT 1;
+jsonb jsonb
 
 > SELECT * FROM t1;
-"{\"active\":false,\"balance\":7.77,\"bar\":\"baz\"}"
-"{\"active\":false,\"balance\":7.77,\"bar\":\"baz\"}"
+"{\"active\":false,\"balance\":7.77,\"bar\":\"baz\"}" "{\"active\":false,\"balance\":7.77,\"bar\":\"baz\"}"
+"{\"active\":false,\"balance\":7.77,\"bar\":\"baz\"}" "{\"active\":false,\"balance\":7.77,\"bar\":\"baz\"}"

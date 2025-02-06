@@ -7,456 +7,301 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! This module houses a pretty printer for [`MirRelationExpr`]s.
-//!
-//! Format details:
-//!
-//!   * The nodes in a `MirRelationExpr` are printed in post-order, left to right.
-//!   * Nodes which only have a single input are grouped together
-//!     into "chains."
-//!   * Each chain of `MirRelationExpr`s is referred to by ID, e.g. %4.
-//!   * Nodes may be followed by additional, indented annotations.
-//!   * Columns are referred to by position, e.g. #4.
-//!   * Collections of columns are written as ranges where possible,
-//!     e.g. "#2..#5".
-//!
-//! It's important to avoid trailing whitespace everywhere, as plans may be
-//! printed in contexts where trailing whitespace is unacceptable, like
-//! sqllogictest files.
+//! `EXPLAIN` support for structures defined in this crate.
 
-use std::collections::HashMap;
-use std::fmt;
-use std::iter;
+use std::collections::BTreeMap;
+use std::fmt::Formatter;
+use std::time::Duration;
 
-use ore::str::{bracketed, separated, StrExt};
-use repr::RelationType;
+use mz_ore::str::{separated, Indent, IndentLike};
+use mz_repr::explain::text::DisplayText;
+use mz_repr::explain::ExplainError::LinearChainsPlusRecursive;
+use mz_repr::explain::{
+    AnnotatedPlan, Explain, ExplainConfig, ExplainError, ExprHumanizer, ScalarOps,
+    UnsupportedFormat, UsedIndexes,
+};
+use mz_repr::optimize::OptimizerFeatures;
+use mz_repr::GlobalId;
 
-use crate::{ExprHumanizer, Id, JoinImplementation, LocalId, MirRelationExpr};
+use crate::interpret::{Interpreter, MfpEval, Trace};
+use crate::visit::Visit;
+use crate::{
+    AccessStrategy, Id, LocalId, MapFilterProject, MirRelationExpr, MirScalarExpr, RowSetFinishing,
+};
 
-/// An `ViewExplanation` facilitates pretty-printing of a [`MirRelationExpr`].
-///
-/// By default, the [`fmt::Display`] implementation renders the expression as
-/// described in the module docs. Additional information may be attached to the
-/// explanation via the other public methods on the type.
+pub use crate::explain::text::{
+    fmt_text_constant_rows, HumanizedExplain, HumanizedExpr, HumanizedNotice, HumanizerMode,
+};
+
+mod json;
+mod text;
+
+/// Explain context shared by all [`mz_repr::explain::Explain`]
+/// implementations in this crate.
 #[derive(Debug)]
-pub struct ViewExplanation<'a> {
-    expr_humanizer: &'a dyn ExprHumanizer,
-    /// One `ExplanationNode` for each `MirRelationExpr` in the plan, in
-    /// left-to-right post-order.
-    nodes: Vec<ExplanationNode<'a>>,
-    /// Records the chain ID that was assigned to each expression.
-    expr_chains: HashMap<*const MirRelationExpr, usize>,
-    /// Records the chain ID that was assigned to each let.
-    local_id_chains: HashMap<LocalId, usize>,
-    /// Records the local ID that corresponds to a chain ID, if any.
-    chain_local_ids: HashMap<usize, LocalId>,
-    /// The ID of the current chain. Incremented while constructing the
-    /// `Explanation`.
-    chain: usize,
+pub struct ExplainContext<'a> {
+    pub config: &'a ExplainConfig,
+    pub features: &'a OptimizerFeatures,
+    pub humanizer: &'a dyn ExprHumanizer,
+    pub cardinality_stats: BTreeMap<GlobalId, usize>,
+    pub used_indexes: UsedIndexes,
+    pub finishing: Option<RowSetFinishing>,
+    pub duration: Duration,
+    // Cluster against which the explained plan is optimized.
+    pub target_cluster: Option<&'a str>,
+    // This is a String so that we don't have to move `OptimizerNotice` to `mz-expr`. We can revisit
+    // this decision if we want to every make this print in the json output in a machine readable
+    // way.
+    pub optimizer_notices: Vec<String>,
 }
 
-#[derive(Debug)]
-pub struct ExplanationNode<'a> {
-    /// The expression being explained.
-    pub expr: &'a MirRelationExpr,
-    /// The type of the expression, if desired.
-    pub typ: Option<RelationType>,
-    /// The ID of the linear chain to which this node belongs.
-    pub chain: usize,
+/// A structure produced by the `explain_$format` methods in
+/// [`mz_repr::explain::Explain`] implementations for points
+/// in the optimization pipeline identified with a single plan of
+/// type `T`.
+#[allow(missing_debug_implementations)]
+pub struct ExplainSinglePlan<'a, T> {
+    pub context: &'a ExplainContext<'a>,
+    pub plan: AnnotatedPlan<'a, T>,
 }
 
-impl<'a> fmt::Display for ViewExplanation<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut prev_chain = usize::max_value();
-        for node in &self.nodes {
-            if node.chain != prev_chain {
-                if node.chain != 0 {
-                    writeln!(f)?;
-                }
-                write!(f, "%{} =", node.chain)?;
-                if let Some(local_id) = self.chain_local_ids.get(&node.chain) {
-                    write!(f, " Let {} =", local_id)?;
-                }
-                writeln!(f)?;
-            }
-            prev_chain = node.chain;
+/// Carries metadata about the possibility of MFP pushdown for a source.
+/// (Likely to change, and only emitted when a context flag is enabled.)
+#[allow(missing_debug_implementations)]
+pub struct PushdownInfo<'a> {
+    /// Pushdown-able filters in the source, by index.
+    pub pushdown: Vec<&'a MirScalarExpr>,
+}
 
-            self.fmt_node(f, node)?;
+impl<'a, C, M> DisplayText<C> for HumanizedExpr<'a, PushdownInfo<'a>, M>
+where
+    C: AsMut<Indent>,
+    M: HumanizerMode,
+{
+    fn fmt_text(&self, f: &mut Formatter<'_>, ctx: &mut C) -> std::fmt::Result {
+        let PushdownInfo { pushdown } = self.expr;
+
+        if !pushdown.is_empty() {
+            let pushdown = pushdown.iter().map(|e| self.mode.expr(*e, self.cols));
+            let pushdown = separated(" AND ", pushdown);
+            writeln!(f, "{}pushdown=({})", ctx.as_mut(), pushdown)?;
         }
+
         Ok(())
     }
 }
 
-impl<'a> ViewExplanation<'a> {
+#[allow(missing_debug_implementations)]
+pub struct ExplainSource<'a> {
+    pub id: GlobalId,
+    pub op: Option<&'a MapFilterProject>,
+    pub pushdown_info: Option<PushdownInfo<'a>>,
+}
+
+impl<'a> ExplainSource<'a> {
     pub fn new(
-        expr: &'a MirRelationExpr,
-        expr_humanizer: &'a dyn ExprHumanizer,
-    ) -> ViewExplanation<'a> {
-        use MirRelationExpr::*;
-
-        // Do a post-order traversal of the expression, grouping "chains" of
-        // nodes together as we go. We have to break the chain whenever we
-        // encounter a node with multiple inputs, like a join.
-
-        fn walk<'a>(expr: &'a MirRelationExpr, explanation: &mut ViewExplanation<'a>) {
-            // First, walk the children, in order to perform a post-order
-            // traversal.
-            match expr {
-                // Leaf expressions. Nothing more to visit.
-                // TODO [btv] Explain complex sources.
-                Constant { .. } | Get { .. } => (),
-                // Single-input expressions continue the chain.
-                Project { input, .. }
-                | Map { input, .. }
-                | FlatMap { input, .. }
-                | Filter { input, .. }
-                | Reduce { input, .. }
-                | TopK { input, .. }
-                | Negate { input, .. }
-                | Threshold { input, .. }
-                | DeclareKeys { input, .. }
-                | ArrangeBy { input, .. } => walk(input, explanation),
-                // For join and union, each input may need to go in its own
-                // chain.
-                Join { inputs, .. } => walk_many(inputs, explanation),
-                Union { base, inputs, .. } => {
-                    walk_many(iter::once(&**base).chain(inputs), explanation)
-                }
-                Let { id, body, value } => {
-                    // Similarly the definition of a let goes in its own chain.
-                    walk(value, explanation);
-                    explanation.chain += 1;
-
-                    // Keep track of the chain ID <-> local ID correspondence.
-                    let value_chain = explanation.expr_chain(value);
-                    explanation.local_id_chains.insert(*id, value_chain);
-                    explanation.chain_local_ids.insert(value_chain, *id);
-
-                    walk(body, explanation);
-                }
-            }
-
-            // Then record the node.
-            explanation.nodes.push(ExplanationNode {
-                expr,
-                typ: None,
-                chain: explanation.chain,
-            });
-            explanation
-                .expr_chains
-                .insert(expr as *const MirRelationExpr, explanation.chain);
-        }
-
-        fn walk_many<'a, E>(exprs: E, explanation: &mut ViewExplanation<'a>)
-        where
-            E: IntoIterator<Item = &'a MirRelationExpr>,
-        {
-            for expr in exprs {
-                // Elide chains that would consist only a of single Get node.
-                if let MirRelationExpr::Get {
-                    id: Id::Local(id), ..
-                } = expr
-                {
-                    explanation.expr_chains.insert(
-                        expr as *const MirRelationExpr,
-                        explanation.local_id_chains[id],
-                    );
-                } else {
-                    walk(expr, explanation);
-                    explanation.chain += 1;
-                }
-            }
-        }
-
-        let mut explanation = ViewExplanation {
-            expr_humanizer,
-            nodes: vec![],
-            expr_chains: HashMap::new(),
-            local_id_chains: HashMap::new(),
-            chain_local_ids: HashMap::new(),
-            chain: 0,
+        id: GlobalId,
+        op: Option<&'a MapFilterProject>,
+        filter_pushdown: bool,
+    ) -> ExplainSource<'a> {
+        let pushdown_info = if filter_pushdown {
+            op.map(|op| {
+                let mfp_mapped = MfpEval::new(&Trace, op.input_arity, &op.expressions);
+                let pushdown = op
+                    .predicates
+                    .iter()
+                    .filter(|(_, e)| mfp_mapped.expr(e).pushdownable())
+                    .map(|(_, e)| e)
+                    .collect();
+                PushdownInfo { pushdown }
+            })
+        } else {
+            None
         };
-        walk(expr, &mut explanation);
-        explanation
-    }
 
-    /// Attach type information into the explanation.
-    pub fn explain_types(&mut self) {
-        for node in &mut self.nodes {
-            if let MirRelationExpr::Let { .. } = &node.expr {
-                // Skip.
-                // Since we don't print out Let nodes in the explanation,
-                // types of Let nodes should not be attached to the
-                // explanation. The type information of a Let is always the
-                // same as the the type of the body.
-            } else {
-                // TODO(jamii) `typ` is itself recursive, so this is quadratic :(
-                node.typ = Some(node.expr.typ());
-            }
+        ExplainSource {
+            id,
+            op,
+            pushdown_info,
         }
     }
 
-    fn fmt_node(&self, f: &mut fmt::Formatter, node: &ExplanationNode) -> fmt::Result {
-        use MirRelationExpr::*;
-
-        match node.expr {
-            Constant { rows, .. } => {
-                write!(f, "| Constant")?;
-                match rows {
-                    Ok(rows) if !rows.is_empty() => writeln!(
-                        f,
-                        " {}",
-                        separated(
-                            " ",
-                            rows.iter()
-                                .flat_map(|(row, count)| (0..*count).map(move |_| row))
-                        )
-                    )?,
-                    Ok(_) => writeln!(f)?,
-                    Err(e) => writeln!(f, " Err({})", e.to_string().quoted())?,
-                }
-            }
-            Get { id, .. } => match id {
-                Id::Local(local_id) => writeln!(
-                    f,
-                    "| Get %{} ({})",
-                    self.local_id_chains
-                        .get(local_id)
-                        .map_or_else(|| "?".to_owned(), |i| i.to_string()),
-                    local_id,
-                )?,
-                Id::Global(id) => writeln!(
-                    f,
-                    "| Get {} ({})",
-                    self.expr_humanizer
-                        .humanize_id(*id)
-                        .unwrap_or_else(|| "?".to_owned()),
-                    id,
-                )?,
-                Id::LocalBareSource => writeln!(f, "| Get Bare Source for This Source")?,
-            },
-            // Lets are annotated on the chain ID that they correspond to.
-            Let { .. } => (),
-            Project { outputs, .. } => {
-                writeln!(f, "| Project {}", bracketed("(", ")", Indices(outputs)))?
-            }
-            Map { scalars, .. } => writeln!(f, "| Map {}", separated(", ", scalars))?,
-            FlatMap { func, exprs, .. } => {
-                writeln!(f, "| FlatMap {}({})", func, separated(", ", exprs))?;
-            }
-            Filter { predicates, .. } => writeln!(f, "| Filter {}", separated(", ", predicates))?,
-            Join {
-                inputs,
-                equivalences,
-                implementation,
-            } => {
-                write!(
-                    f,
-                    "| Join {}",
-                    separated(
-                        " ",
-                        inputs
-                            .iter()
-                            .map(|input| bracketed("%", "", self.expr_chain(input)))
-                    ),
-                )?;
-                if !equivalences.is_empty() {
-                    write!(
-                        f,
-                        " {}",
-                        separated(
-                            " ",
-                            equivalences.iter().map(|equivalence| bracketed(
-                                "(= ",
-                                ")",
-                                separated(" ", equivalence)
-                            ))
-                        )
-                    )?;
-                }
-                writeln!(f)?;
-                write!(f, "| | implementation = ")?;
-                self.fmt_join_implementation(f, inputs, implementation)?;
-            }
-            Reduce {
-                group_key,
-                aggregates,
-                ..
-            } => {
-                if aggregates.is_empty() {
-                    writeln!(
-                        f,
-                        "| Distinct group={}",
-                        bracketed("(", ")", separated(", ", group_key)),
-                    )?
-                } else {
-                    writeln!(
-                        f,
-                        "| Reduce group={}",
-                        bracketed("(", ")", separated(", ", group_key)),
-                    )?;
-                    for agg in aggregates {
-                        writeln!(f, "| | agg {}", agg)?;
-                    }
-                }
-            }
-            TopK {
-                group_key,
-                order_key,
-                limit,
-                offset,
-                ..
-            } => {
-                write!(
-                    f,
-                    "| TopK group={} order={}",
-                    bracketed("(", ")", Indices(group_key)),
-                    bracketed("(", ")", separated(", ", order_key)),
-                )?;
-                if let Some(limit) = limit {
-                    write!(f, " limit={}", limit)?;
-                }
-                writeln!(f, " offset={}", offset)?
-            }
-            Negate { .. } => writeln!(f, "| Negate")?,
-            Threshold { .. } => writeln!(f, "| Threshold")?,
-            DeclareKeys { input: _, keys } => writeln!(
-                f,
-                "| Declare primary keys {}",
-                separated(
-                    " ",
-                    keys.iter()
-                        .map(|key| bracketed("(", ")", separated(", ", key)))
-                )
-            )?,
-            Union { base, inputs } => writeln!(
-                f,
-                "| Union %{} {}",
-                self.expr_chain(base),
-                separated(
-                    " ",
-                    inputs
-                        .iter()
-                        .map(|input| bracketed("%", "", self.expr_chain(input)))
-                )
-            )?,
-            ArrangeBy { keys, .. } => writeln!(
-                f,
-                "| ArrangeBy {}",
-                separated(
-                    " ",
-                    keys.iter()
-                        .map(|key| bracketed("(", ")", separated(", ", key)))
-                ),
-            )?,
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        match self.op {
+            Some(op) => op.is_identity(),
+            None => false,
         }
-
-        if let Some(RelationType { column_types, keys }) = &node.typ {
-            let column_types: Vec<_> = column_types
-                .iter()
-                .map(|c| self.expr_humanizer.humanize_column_type(c))
-                .collect();
-            writeln!(f, "| | types = ({})", separated(", ", column_types))?;
-            writeln!(
-                f,
-                "| | keys = ({})",
-                separated(
-                    ", ",
-                    keys.iter().map(|key| bracketed("(", ")", Indices(key)))
-                )
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn fmt_join_implementation(
-        &self,
-        f: &mut fmt::Formatter,
-        join_inputs: &[MirRelationExpr],
-        implementation: &JoinImplementation,
-    ) -> fmt::Result {
-        match implementation {
-            JoinImplementation::Differential((pos, first_arr), inputs) => writeln!(
-                f,
-                "Differential %{}{} {}",
-                self.expr_chain(&join_inputs[*pos]),
-                if let Some(arr) = first_arr {
-                    format!(".({})", separated(", ", arr))
-                } else {
-                    "".to_string()
-                },
-                separated(
-                    " ",
-                    inputs.iter().map(|(pos, input)| {
-                        format!(
-                            "%{}.({})",
-                            self.expr_chain(&join_inputs[*pos]),
-                            separated(", ", input)
-                        )
-                    })
-                ),
-            ),
-            JoinImplementation::DeltaQuery(inputs) => {
-                writeln!(f, "DeltaQuery")?;
-                for (pos, inputs) in inputs.iter().enumerate() {
-                    writeln!(
-                        f,
-                        "| |   delta %{} {}",
-                        self.expr_chain(&join_inputs[pos]),
-                        separated(
-                            " ",
-                            inputs.iter().map(|(pos, input)| {
-                                format!(
-                                    "%{}.({})",
-                                    self.expr_chain(&join_inputs[*pos]),
-                                    separated(", ", input)
-                                )
-                            })
-                        )
-                    )?;
-                }
-                Ok(())
-            }
-            JoinImplementation::Unimplemented => writeln!(f, "Unimplemented"),
-        }
-    }
-
-    /// Retrieves the chain ID for the specified expression.
-    ///
-    /// The `ExplanationNode` for `expr` must have already been inserted into
-    /// the explanation.
-    fn expr_chain(&self, expr: &MirRelationExpr) -> usize {
-        self.expr_chains[&(expr as *const MirRelationExpr)]
     }
 }
 
-/// Pretty-prints a list of indices.
-#[derive(Debug)]
-pub struct Indices<'a>(pub &'a [usize]);
-
-impl<'a> fmt::Display for Indices<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut is_first = true;
-        let mut slice = self.0;
-        while !slice.is_empty() {
-            if !is_first {
-                write!(f, ", ")?;
+impl<'a, 'h, C, M> DisplayText<C> for HumanizedExpr<'a, ExplainSource<'a>, M>
+where
+    C: AsMut<Indent> + AsRef<&'h dyn ExprHumanizer>,
+    M: HumanizerMode,
+{
+    fn fmt_text(&self, f: &mut std::fmt::Formatter<'_>, ctx: &mut C) -> std::fmt::Result {
+        let id = ctx
+            .as_ref()
+            .humanize_id(self.expr.id)
+            .unwrap_or_else(|| self.expr.id.to_string());
+        writeln!(f, "{}Source {}", ctx.as_mut(), id)?;
+        ctx.indented(|ctx| {
+            if let Some(op) = self.expr.op {
+                self.child(op).fmt_text(f, ctx)?;
             }
-            is_first = false;
-            let lead = &slice[0];
-            if slice.len() > 2 && slice[1] == lead + 1 && slice[2] == lead + 2 {
-                let mut last = 3;
-                while slice.get(last) == Some(&(lead + last)) {
-                    last += 1;
-                }
-                write!(f, "#{}..#{}", lead, lead + last - 1)?;
-                slice = &slice[last..];
-            } else {
-                write!(f, "#{}", slice[0])?;
-                slice = &slice[1..];
+            if let Some(pushdown_info) = &self.expr.pushdown_info {
+                self.child(pushdown_info).fmt_text(f, ctx)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A structure produced by the `explain_$format` methods in
+/// [`mz_repr::explain::Explain`] implementations at points
+/// in the optimization pipeline identified with a
+/// `DataflowDescription` instance with plans of type `T`.
+#[allow(missing_debug_implementations)]
+pub struct ExplainMultiPlan<'a, T> {
+    pub context: &'a ExplainContext<'a>,
+    // Maps the names of the sources to the linear operators that will be
+    // on them.
+    pub sources: Vec<ExplainSource<'a>>,
+    // elements of the vector are in topological order
+    pub plans: Vec<(String, AnnotatedPlan<'a, T>)>,
+}
+
+impl<'a> Explain<'a> for MirRelationExpr {
+    type Context = ExplainContext<'a>;
+
+    type Text = ExplainSinglePlan<'a, MirRelationExpr>;
+
+    type Json = ExplainSinglePlan<'a, MirRelationExpr>;
+
+    type Dot = UnsupportedFormat;
+
+    fn explain_text(&'a mut self, context: &'a Self::Context) -> Result<Self::Text, ExplainError> {
+        self.as_explain_single_plan(context)
+    }
+
+    fn explain_json(&'a mut self, context: &'a Self::Context) -> Result<Self::Json, ExplainError> {
+        self.as_explain_single_plan(context)
+    }
+}
+
+impl<'a> MirRelationExpr {
+    fn as_explain_single_plan(
+        &'a mut self,
+        context: &'a ExplainContext<'a>,
+    ) -> Result<ExplainSinglePlan<'a, MirRelationExpr>, ExplainError> {
+        // normalize the representation as linear chains
+        // (this implies !context.config.raw_plans by construction)
+        if context.config.linear_chains {
+            enforce_linear_chains(self)?;
+        };
+
+        let plan = AnnotatedPlan {
+            plan: self,
+            annotations: BTreeMap::default(),
+        };
+
+        Ok(ExplainSinglePlan { context, plan })
+    }
+}
+
+/// Normalize the way inputs of multi-input variants are rendered.
+///
+/// After the transform is applied, non-trival inputs `$input` of variants with
+/// more than one input are wrapped in a `let $x = $input in $x` blocks.
+///
+/// If these blocks are subsequently pulled up by `NormalizeLets`,
+/// the rendered version of the resulting tree will only have linear chains.
+pub fn enforce_linear_chains(expr: &mut MirRelationExpr) -> Result<(), ExplainError> {
+    use MirRelationExpr::{Constant, Get, Join, Union};
+
+    if expr.is_recursive() {
+        // `linear_chains` is not implemented for WMR, see
+        // https://github.com/MaterializeInc/database-issues/issues/5631
+        return Err(LinearChainsPlusRecursive);
+    }
+
+    // helper struct: a generator of fresh local ids
+    let mut id_gen = id_gen(expr).peekable();
+
+    let mut wrap_in_let = |input: &mut MirRelationExpr| {
+        match input {
+            Constant { .. } | Get { .. } => (),
+            input => {
+                // generate fresh local id
+                // let id = id_cnt
+                //     .next()
+                //     .map(|id| LocalId::new(1000_u64 + u64::cast_from(id_map.len()) + id))
+                //     .unwrap();
+                let id = id_gen.next().unwrap();
+                let value = input.take_safely(None);
+                // generate a `let $fresh_id = $body in $fresh_id` to replace this input
+                let mut binding = MirRelationExpr::Let {
+                    id,
+                    value: Box::new(value),
+                    body: Box::new(Get {
+                        id: Id::Local(id.clone()),
+                        typ: input.typ(),
+                        access_strategy: AccessStrategy::UnknownOrLocal,
+                    }),
+                };
+                // swap the current body with the replacement
+                std::mem::swap(input, &mut binding);
             }
         }
+    };
+
+    expr.try_visit_mut_post(&mut |expr: &mut MirRelationExpr| {
+        match expr {
+            Join { inputs, .. } => {
+                for input in inputs {
+                    wrap_in_let(input);
+                }
+            }
+            Union { base, inputs } => {
+                wrap_in_let(base);
+                for input in inputs {
+                    wrap_in_let(input);
+                }
+            }
+            _ => (),
+        }
         Ok(())
+    })
+}
+
+// Create an [`Iterator`] for [`LocalId`] values that are guaranteed to be
+// fresh within the scope of the given [`MirRelationExpr`].
+fn id_gen(expr: &MirRelationExpr) -> impl Iterator<Item = LocalId> {
+    let mut max_id = 0_u64;
+
+    expr.visit_pre(|expr| {
+        match expr {
+            MirRelationExpr::Let { id, .. } => max_id = std::cmp::max(max_id, id.into()),
+            _ => (),
+        };
+    });
+
+    (max_id + 1..).map(LocalId::new)
+}
+
+impl ScalarOps for MirScalarExpr {
+    fn match_col_ref(&self) -> Option<usize> {
+        match self {
+            MirScalarExpr::Column(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    fn references(&self, column: usize) -> bool {
+        match self {
+            MirScalarExpr::Column(c) => *c == column,
+            _ => false,
+        }
     }
 }

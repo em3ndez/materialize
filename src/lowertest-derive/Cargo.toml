@@ -1,14 +1,25 @@
 [package]
-name = "lowertest-derive"
+name = "mz-lowertest-derive"
 description = "Macros to support unit testing of lower parts of the stack"
 version = "0.0.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
+
+[lints]
+workspace = true
 
 [lib]
 proc-macro = true
 
 [dependencies]
-quote = "1.0.14"
-syn = {version="1.0.83", features=["extra-traits", "printing"]}
-proc-macro2 = "1.0.36"
+proc-macro2 = "1.0.60"
+quote = "1.0.23"
+syn = { version = "1.0.107", features = ["extra-traits", "printing"] }
+workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["workspace-hack"]
+
+[features]
+default = ["workspace-hack"]

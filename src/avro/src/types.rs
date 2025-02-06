@@ -22,12 +22,11 @@
 // of which can be found in the LICENSE file at the root of this repository.
 
 //! Logic handling the intermediate representation of Avro values.
-use std::collections::HashMap;
-use std::fmt;
-use std::hash::BuildHasher;
-use std::u8;
 
-use chrono::{NaiveDate, NaiveDateTime};
+use std::collections::BTreeMap;
+use std::fmt;
+
+use chrono::NaiveDateTime;
 use enum_kinds::EnumKind;
 use serde_json::Value as JsonValue;
 
@@ -71,7 +70,7 @@ pub enum Scalar {
     Long(i64),
     Float(f32),
     Double(f64),
-    Date(NaiveDate),
+    Date(i32),
     Timestamp(NaiveDateTime),
 }
 
@@ -87,20 +86,6 @@ impl From<Scalar> for Value {
             Scalar::Date(v) => Value::Date(v),
             Scalar::Timestamp(v) => Value::Timestamp(v),
         }
-    }
-}
-
-/// The values stored in an Avro map.
-// This simple wrapper exists so we can Debug-print the values deterministically, i.e. in sorted order
-// by keys.
-#[derive(Clone, PartialEq)]
-pub struct AvroMap(pub HashMap<String, Value>);
-
-impl fmt::Debug for AvroMap {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut entries = self.0.clone().into_iter().collect::<Vec<_>>();
-        entries.sort_by_key(|(k, _)| k.clone());
-        f.debug_map().entries(entries).finish()
     }
 }
 
@@ -122,8 +107,9 @@ pub enum Value {
     Float(f32),
     /// A `double` Avro value.
     Double(f64),
-    /// A `Date` coming from an avro Logical `Date`
-    Date(NaiveDate),
+    /// A `Date` coming from an avro Logical `Date`, which is an i32 number of
+    /// days since the Unix epoch.
+    Date(i32),
     /// A `DateTime` coming from an avro Logical `Timestamp`
     Timestamp(NaiveDateTime),
 
@@ -162,7 +148,7 @@ pub enum Value {
     /// An `array` Avro value.
     Array(Vec<Value>),
     /// A `map` Avro value.
-    Map(AvroMap),
+    Map(BTreeMap<String, Value>),
     /// A `record` Avro value.
     ///
     /// A Record is represented by a vector of (`<field name>`, `value`).
@@ -227,29 +213,29 @@ impl<'a> ToAvro for &'a [u8] {
     }
 }
 
-impl<T, S: BuildHasher> ToAvro for HashMap<String, T, S>
+impl<T> ToAvro for BTreeMap<String, T>
 where
     T: ToAvro,
 {
     fn avro(self) -> Value {
-        Value::Map(AvroMap(
+        Value::Map(
             self.into_iter()
                 .map(|(key, value)| (key, value.avro()))
                 .collect::<_>(),
-        ))
+        )
     }
 }
 
-impl<'a, T, S: BuildHasher> ToAvro for HashMap<&'a str, T, S>
+impl<'a, T> ToAvro for BTreeMap<&'a str, T>
 where
     T: ToAvro,
 {
     fn avro(self) -> Value {
-        Value::Map(AvroMap(
+        Value::Map(
             self.into_iter()
                 .map(|(key, value)| (key.to_owned(), value.avro()))
                 .collect::<_>(),
-        ))
+        )
     }
 }
 
@@ -282,7 +268,7 @@ pub struct Record<'a> {
     /// Ordered according to the fields in the schema given to create this
     /// `Record` object. Any unset field defaults to `Value::Null`.
     pub fields: Vec<(String, Value)>,
-    schema_lookup: &'a HashMap<String, usize>,
+    schema_lookup: &'a BTreeMap<String, usize>,
     schema_fields: &'a Vec<RecordField>,
 }
 
@@ -353,18 +339,18 @@ impl ToAvro for JsonValue {
             JsonValue::Array(items) => {
                 Value::Array(items.into_iter().map(|item| item.avro()).collect::<_>())
             }
-            JsonValue::Object(items) => Value::Map(AvroMap(
+            JsonValue::Object(items) => Value::Map(
                 items
                     .into_iter()
                     .map(|(key, value)| (key, value.avro()))
                     .collect::<_>(),
-            )),
+            ),
         }
     }
 }
 
 impl Value {
-    /// Validate the value against the given [Schema](../schema/enum.Schema.html).
+    /// Validate the value against the given [Schema2](../schema/enum.Schema.html).
     ///
     /// See the [Avro specification](https://avro.apache.org/docs/current/spec.html)
     /// for the full set of rules of schema validation.
@@ -395,10 +381,9 @@ impl Value {
             (&Value::String(_), SchemaPiece::String) => true,
             (&Value::Fixed(n, _), SchemaPiece::Fixed { size }) => n == *size,
             (&Value::String(ref s), SchemaPiece::Enum { symbols, .. }) => symbols.contains(s),
-            (&Value::Enum(i, ref s), SchemaPiece::Enum { symbols, .. }) => symbols
-                .get(i as usize)
-                .map(|symbol| symbol == s)
-                .unwrap_or(false),
+            (&Value::Enum(i, ref s), SchemaPiece::Enum { symbols, .. }) => {
+                symbols.get(i).map(|symbol| symbol == s).unwrap_or(false)
+            }
             (
                 &Value::Union {
                     index,
@@ -426,7 +411,7 @@ impl Value {
                 let node = schema.step(&**inner);
                 items.iter().all(|item| item.validate(node))
             }
-            (&Value::Map(AvroMap(ref items)), SchemaPiece::Map(inner)) => {
+            (&Value::Map(ref items), SchemaPiece::Map(inner)) => {
                 let node = schema.step(&**inner);
                 items.iter().all(|(_, value)| value.validate(node))
             }
@@ -478,10 +463,11 @@ impl Value {
 mod tests {
     use std::str::FromStr;
 
-    use super::*;
     use crate::Schema;
 
-    #[test]
+    use super::*;
+
+    #[mz_ore::test]
     fn validate() {
         let value_schema_valid = vec![
             (Value::Int(42), "\"int\"", true),
@@ -551,7 +537,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[mz_ore::test]
     fn validate_fixed() {
         let schema =
             Schema::from_str(r#"{"type": "fixed", "size": 4, "name": "some_fixed"}"#).unwrap();
@@ -560,7 +546,7 @@ mod tests {
         assert!(!Value::Fixed(5, vec![0, 0, 0, 0, 0]).validate(schema.top_node()));
     }
 
-    #[test]
+    #[mz_ore::test]
     fn validate_enum() {
         let schema = Schema::from_str(r#"{"type": "enum", "name": "some_enum", "symbols": ["spades", "hearts", "diamonds", "clubs"]}"#).unwrap();
 
@@ -575,7 +561,7 @@ mod tests {
         assert!(!Value::Enum(0, "spades".to_string()).validate(other_schema.top_node()));
     }
 
-    #[test]
+    #[mz_ore::test]
     fn validate_record() {
         let schema = Schema::from_str(
             r#"{
@@ -621,7 +607,7 @@ mod tests {
         .validate(schema.top_node()));
     }
 
-    #[test]
+    #[mz_ore::test]
     fn validate_decimal() {
         assert!(Value::Decimal(DecimalValue {
             unscaled: vec![7],

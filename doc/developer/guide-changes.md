@@ -17,9 +17,9 @@ We use [GitHub pull requests](https://github.com/MaterializeInc/materialize/pull
 small, must be submitted as a pull request, and that pull request must pass a
 battery of automated tests before it merges.
 
-Any substantial PR must additionally be reviewed by one or more engineers who
-are familiar with the areas of the codebase that are touched in the PR. The
-goals of code review are threefold:
+All PRs must be reviewed by one or more employees who are familiar with the
+areas of the codebase that are touched in the PR. The goals of code review are
+threefold:
 
 1. To ensure the health of the codebase improves over time.
 
@@ -28,8 +28,7 @@ goals of code review are threefold:
 3. To socialize changes with other engineers on the team.
 
 Once a PR is approved and merged to the `main` branch, CI will automatically
-deploy a new `materialized` binary to <https://binaries.materialize.com> and the
-[materialized Docker image][docker].
+deploy a new [materialized Docker image][docker].
 
 While we encourage customers to use the latest stable release in production,
 many of our prospective customers run their proofs-of-concept (POCs) off these
@@ -89,6 +88,16 @@ feature in isolation. This can be particularly problematic if the bugfix or
 feature needs to be reverted—it is much more difficult to revert just one or the
 other if they are in the same RU.
 
+You should also endeavor to limit each RU to one team's scope as defined by
+the [CODEOWNERS](/.github/CODEOWNERS) file, in particular for larger changes.
+When a single RU contains changes across multiple parts of the stack, each
+reviewer has the additional overhead of digging through the PR to figure out
+which files require their review. Splitting up the change into multiple RUs
+avoids this.\
+Areas where this is particularly applicable:
+* Changes to the [SQL parser](/src/sql-parser)
+* Changes to the [SQL planner](/src/sql/src/plan)
+
 ### Change descriptions
 
 Writing good commit messages (or PR descriptions, if you use the semantic PRs
@@ -124,7 +133,7 @@ encoding we are using corresponds to the hardcoded on setting.
 If the commit message closes an issue, you can tell GitHub to automatically
 close the issue when the PR lands by including the magic phrase
 
-    Fixes #1234.
+    Fixes database-issues#1234.
 
 in a commit or PR description. There are several other [supported
 phrasings][pr-phrasings], if you prefer.
@@ -138,12 +147,95 @@ A classic example of a bad commit message is
 ### Release notes
 
 If your PR contains one or more user-visible changes, be sure to add a
-preliminary release note to
-[doc/user/content/release-notes](doc/user/content/release-notes). See the
-comment within that file for details on writing a release note with the correct
-style.
+preliminary release note to the PR description in the marked location in the
+template.
 
 Your release note may sound very similar to your commit message. That's okay!
+
+#### What changes require a release note?
+
+Any behavior change to a stable, user-visible API requires a release note.
+Roughly speaking, Materialize's stable APIs are:
+
+  * The syntax and semantics of all documented SQL statements.
+  * The observable behavior of any source or sink.
+  * The behavior of all documented command-line flags.
+
+For details, see the [backwards compatibility policy](https://materialize.com/docs/releases/#backwards-compatibility).
+
+Notably, changes to experimental or unstable APIs should *not* have release
+notes. The point of having experimental and unstable APIs is to decrease the
+engineering burden when those features are changed. Instead, write a release
+note introducing the feature for the release in which the feature is
+de-experimentalized.
+
+Examples of changes that require release notes:
+
+  * The addition of a new, documented SQL function.
+  * The stabilization of a new source type.
+  * A bug fix that fixes a panic in any component.
+  * A bug fix that changes the output format of a particular data type in a
+    sink.
+
+Examples of changes that do not require release notes:
+
+  * **An improvement to the build system.** The build system is not user
+    visible.
+  * **The addition of a feature to testdrive.** Similarly, our test frameworks
+    are not user visible.
+  * **An upgrade of an internal Rust dependency.** Most dependency upgrades
+    do not result in user-visible changes. (If they do, document the change
+    itself, not the fact that the dependency was upgraded. Users care about
+    the visible behavior of Materialize, not its implementation!)
+
+Performance improvements are a borderline case. A small performance improvement
+does not need a release note, but a large performance improvement may warrant
+one if it results in a noticeable improvement for a large class of users or
+unlocks new use cases for Materialize. Examples of performance improvements
+that warrant a release note include:
+
+  * Improving the speed of Avro decoding by 2x
+  * Converting an O(n<sup>2</sup>) algorithm in the optimizer to an O(n)
+    algorithm so that queries with several dozen `UNION` operations can be
+    planned in a reasonable amount of time
+
+#### How to write a good release note
+
+Every release note should be phrased in the imperative mood, like a Git
+commit message. They should complete the sentence, "This release will...".
+
+Good release notes:
+
+  - [This release will...] Require the `-w` / `--workers` command-line option.
+  - [This release will...] In the event of a crash, print the stack trace.
+
+Misbehaved release notes:
+
+  - Users must now specify the `-w` / `-threads` command line option.
+  - Materialize will print a stack trace if it crashes.
+  - Instead of limiting SQL statements to 8KiB, limit them to 1024KiB instead.
+
+Link to at least one page where users can learn more about either the change or
+the area in which the change was made. Notes about new features can be concise if
+the new feature has comprehensive documentation. Notes about changes to features
+must be more detailed, as the note is likely the only documentation of the
+change in behavior. Consider linking to a GitHub issue or pull request via the
+`gh` shortcode if there is no good section of the documentation to link to.
+
+Strive for some variety of verbs. "Support new feature" gets boring as a release
+note.
+
+Use relative links (/path/to/doc), not absolute links
+(https://materialize.com/docs/path/to/doc).
+
+Wrap your release notes at the 80 character mark.
+
+#### Internal note order
+
+Put breaking changes before other release notes, and mark them with
+`**Breaking change.**` at the start.
+
+List new features before bug fixes.
 
 ### PR size limits
 
@@ -287,7 +379,7 @@ indicating the danger zones so they can pay closer attention.
 
 At the moment, choosing reviewers is a bit of a dark art. The best reviewer for
 a PR is the person besides you who is most familiar with the code that is
-changed. If you are not sure who that is, ask in #engineering.
+changed. If you are not sure who that is, ask in #eng-general.
 
 If you are more experienced, one additional aspect of choosing a reviewer to
 keep in mind is [mentoring](#mentoring). Asking a less experienced engineer to
@@ -298,18 +390,9 @@ strategy works best when you are fairly confident in the change. If you're not
 confident in the change, consider assigning _both_ an experienced an
 inexperienced reviewer.
 
-Coming soon: a breakdown of which tech lead is responsible for each area of the
-codebase. The tech lead needn't review every PR in their area of responsibility,
-but can help direct code review requests to the appropriate engineer.
-
 ### Merging
 
 #### When to merge
-
-For sufficiently trivial changes, you can consider merging without review. This
-should be somewhat rare, however, and only when you have high confidence that a)
-the change is correct, and b) the change is uncontroversial. When in doubt, get
-a review!
 
 When a reviewer approves your PR, they will either press the "approve" button
 in GitHub's code review interface, leaving a big green checkmark on your PR,
@@ -329,6 +412,10 @@ case you must use your discretion as to when you have received a covering set
 of approvals. (This is a great reason to prefer small PRs when possible, since
 you can gather full approvals from various owners in parallel.)
 
+We've configured GitHub to require at least one formal approval (i.e., clicking
+"Approve" in the review UI, rather than just posting a comment like "LGTM")
+before a PR can be merged.
+
 #### Stalled PRs
 
 In some cases, code review reveals that a PR should neither be merged or
@@ -347,7 +434,7 @@ their part. When work resumes on the PR, convert it back to an active PR.
 In a similar vein, if code review reveals that a PR needs to be scrapped
 entirely, close the PR rather than leaving it open. Even if the PR should serve
 useful example of an approach that didn't pan out, it can serve in that role
-while closed. Consider linking it an the associated issue for posterity, if
+while closed. Consider linking it and the associated issue for posterity, if
 applicable.
 
 #### Merge skew
@@ -383,12 +470,16 @@ Fixing merge skew is usually as simple as identifying the above situation
 and adjusting the new function call or test case to account for the change
 in the other PR.
 
-While there _are_ tools that can prevent merge skew, like [Bors], they introduce
-quite a bit of latency and flakiness when merging a PR. As long as merge skew is
-fairly rare—right now it seems to happen once every month or two—net
-productivity is still higher without Bors. If, however, the incidence of merge
-skew increases to about once per week, it's probably time to reevaluate this
-decision and consider a tool like Bors.
+We have a CI job called *Merge skew cargo check*, which is triggered in pull
+requests. It conducts a merge with the target branch and runs `cargo check` to
+validate the merge result.
+Since the job is not triggered on pushes to the target branch (usually `main`),
+merge skew can still occur, in particular when a PR is stale for a long time
+before its merge.
+In addition, the job does not run any linters or tests as of now.
+Further tools like [Bors] exist that can prevent merge skew. However, they introduce
+quite a bit of latency and flakiness when merging a PR, and are currently not
+in use.
 
 #### Branch restrictions
 
@@ -396,16 +487,7 @@ In very rare cases, it may be necessary to merge a PR whose tests are failing.
 This situation typically only occurs with chicken-and-egg CI configuration
 issues, where PR builds are broken until a fix can be merged to `main`.
 
-To perform a "god mode" merge, you can temporarily lift the branch restrictions
-on the `main` branch. Navigate to the [branch protection rules for the `main`
-branch][branch-protection] and uncheck the "Include administrators" box. Do
-*not* delete the rules or uncheck any other boxes, as it is much harder to
-reverse those changes.
-
-Your PR will be mergeable after you uncheck the "Include administrators" box,
-though you will have to click through several warning screens. Once the PR is
-merged, be sure to re-enable the "Include administrators" setting to prevent
-accidents.
+Only a few people have sufficient access, inquire in Slack if this situation arises.
 
 ## Reviewing changes
 
@@ -559,7 +641,7 @@ is easier to understand and less likely to have bugs.
 
 Some amount of complexity is inevitable. After all, Materialize provides value
 to its customers by absorbing complexity. But the goal is to strip away all
-*incidental* complexity, leaving only the *essential* commplexity of the problem
+*incidental* complexity, leaving only the *essential* complexity of the problem
 domain.
 
 The challenge is often defining what "simple" means. Which of these code samples
@@ -653,7 +735,7 @@ in the long term they harm the maintainability of the codebase. Put another way:
 adding the first special case is easy, but adding the tenth special case is
 nearly impossible.
 
-Usually, special casing a sign that the interface is wrong. Can you redesign the
+Usually, special casing is a sign that the interface is wrong. Can you redesign the
 interface to instead consist of several composable, non-interdependent pieces?
 This sort of refactor can be _really_ tricky to design, but if you can get it
 right, it pays dividends.
@@ -747,7 +829,7 @@ of code that you have written.
 
 A PR without appropriate code documentation may reasonably be rejected. Imagine
 that the reviewer would first like to read a precis of your new code, and only
-the read the code itself. This approximates the experience of most people new
+then read the code itself. This approximates the experience of most people new
 to your new code.
 
 User documentation is also important, but may be outside the tradecraft that
@@ -782,6 +864,21 @@ rather than its internal details. Always use your best judgment.
 Our testing philosophy is covered in much greater detail in
 [Developer guide: testing](guide-testing.md).
 
+### Force-Pushing to your PR Branch
+
+There is a culture at Materialize of other developers fixing small issues in
+someone's pull request by pushing to the branch directly. QA also uses this to
+add tests for newly introduced or changed features. It is easy to accidentally
+overwrite such changes on your PR when you force-push to your branch using
+`git push --force`. To prevent this you should force-push only with a lease,
+which will prevent you from accidentally overwriting new changes your teammates
+may have added to your PR:
+
+```bash
+$ git config --global alias.pushfwl "push --force-with-lease"
+$ git pushfwl
+```
+
 ## Deviations from Google
 
 As mentioned at the start of this guide, much of the above advice derives from
@@ -815,6 +912,9 @@ submit a PR to fix it!
 
 * Keep PRs small, and ideally less than 500 lines.
 
+* For larger PRs, aim to limit each RU to one team's scope as defined by the
+[CODEOWNERS](/.github/CODEOWNERS) file.
+
 * Always initiate PR reviews within one business day, and sooner if possible.
 
 * Verify that every PR has, at a minimum:
@@ -843,5 +943,5 @@ submit a PR to fix it!
 [rust-rdkafka]: https://github.com/fede1024/rust-rdkafka
 [rust-prometheus]: https://github.com/MaterializeInc/rust-prometheus
 [rust-postgres]: https://github.com/sfackler/rust-postgres
-[sqlparser]: https://github.com/ballista-compute/sqlparser-rs
+[sqlparser]: https://github.com/sqlparser-rs/sqlparser-rs
 [Tokio]: https://tokio.rs

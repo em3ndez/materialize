@@ -1,66 +1,295 @@
-{{/*  Copyright Materialize, Inc. All rights reserved.
-
-Use of this software is governed by the Business Source License
-included in the LICENSE file at the root of this repository.
-
-As of the Change Date specified in that file, in accordance with
-the Business Source License, use of this software will be governed
-by the Apache License, Version 2.0.  */}}
+{{/* Copyright Materialize, Inc. All rights reserved. Use of this software is
+governed by the Business Source License included in the LICENSE file at the root
+of this repository. As of the Change Date specified in that file, in accordance
+with the Business Source License, use of this software will be governed by the
+Apache License, Version 2.0. */}}
 <!DOCTYPE html>
 <html>
-
-<head>
-    <meta charset="utf-8">
-
-    <title>
-    {{ block "title" . }}
-        {{ if isset .Params "htmltitle" }}
-            {{ .Params.htmltitle }}
-        {{ else }}
-            {{ .Page.Title }}
-        {{ end }}
-        &mdash; {{ .Site.Title }}
-    {{ end }}
-    </title>
-
+  <head>
     {{ partial "head.html" . }}
-</head>
+  </head>
 
-<body>
-    {{ partial "header.html" . }}
-    {{ block "body" .}}
-        <div class="content-wrapper">
-            {{ partial "sidebar.html" . }}
+  <body>
+    <script>
+      const theme = localStorage.getItem("theme");
+      const darkMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
-            <main class="content">
-                {{ partial "breadcrumbs.html" . }}
-                {{ block "main" . }}{{ end }}
-                {{ partial "helpful.html" }}
-                <!-- Footer goes in main so the border-right of
-                sidebar.html can extend to the bottom of the page. -->
-                {{ partial "footer.html" . }}
-            </main>
+      if (theme === null) {
+        localStorage.setItem("theme", "system");
+        if (darkMediaQuery.matches) {
+          document.body.classList.add("dark");
+        } else {
+          document.body.classList.add("light");
+        }
+      } else if (theme === "dark") {
+        document.body.classList.add("dark");
+      } else if (theme === "light") {
+        document.body.classList.add("light");
+      } else if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
+        document.body.classList.add("dark");
+      } else {
+        document.body.classList.add("light");
+      }
+    </script>
 
-            {{ partial "toc.html" . }}
+    <!-- If a page uses supportlevel svg icons, embed them inline
+         so they can be referenced via <use> tags. -->
+    {{ if in .Page.RawContent "supportLevel" }} {{ partial "inline-svgs.html"}}
+    {{ end }} {{ partial "header.html" . }} {{ block "body" .}}
+    <div class="content-wrapper">
+      {{ partial "sidebar.html" . }}
+
+      <main
+        class="content {{ if .Params.make_table_row_headers_searchable }} docsearch_index_table_headers {{ end }}"
+      >
+        <button class="show-topics" aria-label="Open the topics sidebar">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            class="ionicon"
+            viewBox="0 0 512 512"
+          >
+            <title>Arrow Pointing to the left</title>
+            <path
+              fill="none"
+              stroke="currentColor"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="48"
+              d="M328 112L184 256l144 144"
+            />
+          </svg>
+          All Topics
+        </button>
+        <div>
+          {{ partial "breadcrumbs.html" . }} {{ block "main" . }}{{ end }}
         </div>
+
+        <a href="#top" class="back-to-top">Back to top &uarr;</a>
+        <!-- Footer goes in main so the border-right of
+                sidebar.html can extend to the bottom of the page. -->
+        {{ partial "footer.html" . }}
+      </main>
+
+      {{ partial "toc.html" . }}
+    </div>
     {{ end }}
+
+    <div class="backdrop"></div>
 
     <script>
-        anchors.add(".content h2, .content h3, .content h4, .content h5, .content h6");
+      /* Add anchor links to headings */
+      anchors.add(
+        ".content h2, .content h3, .content h4, .content h5, .content h6, .heading"
+      );
 
-        $(".content ol:has(p)").addClass("has-p");
-
-        /* Make external links open in new tabs */
-        $('a[href*="//"]:not([href*="materialize.com"])').attr({target:"_blank", title:"External Link"});
-
-        /* s to search */
-        document.addEventListener("keyup", e => {
-          if (e.key !== "s" || e.ctrlKey || e.metaKey) return;
-          if (/^(?:input|textarea|select|button)$/i.test(e.target.tagName)) return;
+      /* Copy anchor links to clipboard on click */
+      document.addEventListener("click", function (e) {
+        const target = e.target;
+        if (target.classList.contains("anchorjs-link")) {
+          const initialIcon = e.target.getAttribute("data-anchorjs-icon");
+          e.target.setAttribute("data-anchorjs-icon", "\u2713");
+          setTimeout(() => {
+            e.target.setAttribute("data-anchorjs-icon", initialIcon);
+          }, 1000);
           e.preventDefault();
-          document.getElementById("search-input").focus();
-        });
-    </script>
-</body>
+          const copyText = target.href;
+          window.location.assign(target.href);
+          navigator.clipboard
+            .writeText(copyText)
+            .then(() => {
+              // Successful copy
+              console.log("Text copied to clipboard: " + copyText);
+            })
+            .catch((error) => {
+              // Error occurred
+              console.error("Failed to copy text: " + error);
+            });
+        }
+      });
 
+      $(".content ol:has(p)").addClass("has-p");
+
+      /* Make external links open in new tabs */
+      $('a[href*="//"]:not([href*="materialize.com"])').attr({
+        target: "_blank",
+        title: "External Link",
+      });
+
+      /* Add "Click to Copy" button to code blocks */
+      $(document).ready(function () {
+        $("pre.chroma").append(
+          '<button class="default_button copy_button" title="Copy code to clipboard">Copy</button>'
+        );
+
+        $("pre.chroma button.copy_button").click(function (e) {
+          var _this = $(this),
+            copyHex = document.createElement("textarea");
+          copyHex.value = _this.parent().find("code").text().trim();
+          document.body.appendChild(copyHex);
+          copyHex.select();
+          document.execCommand("copy");
+          document.body.removeChild(copyHex);
+          _this.addClass("success").text("Copied");
+          setTimeout(function () {
+            _this.removeClass("success").text("Copy");
+          }, 1000);
+          window.analytics && window.analytics.track('Button Clicked');
+        });
+      });
+
+      // Add click handlers for all top-level items with children.
+      const menus = $("nav[role=navigation] li.has-children");
+      menus.find("a:not([href])").click((e) => {
+        $(e.target).parents("li").first().toggleClass("open");
+        e.preventDefault();
+        return false;
+      });
+      // When an item is already active, and it's clicked, just collapse it
+      menus.find("a.active").click((e) => {
+        $(e.target).parents("li").first().toggleClass("open");
+        e.preventDefault();
+        return false;
+      });
+
+      // Open the submenu containing the current page by default.
+      menus.has(".active").addClass("open");
+
+      //Scroll the sidebar to the active element
+      $(".sidebar").scrollTop(
+        $(".sidebar .active").offset().top - $(window).height() / 2
+      );
+    </script>
+
+    <script>
+      const menuToggle = document.querySelector("nav .toggle");
+      const mobileLinks = document.querySelector(".mobile");
+      const sidebarOpenButton = document.querySelector("button.show-topics");
+      const sidebarCloseButton = document.querySelector("button.close-topics");
+      const sidebarWrapper = document.querySelector(".sidebar-wrapper");
+      const backdrop = document.querySelector(".backdrop");
+      const allTables = document.querySelectorAll("table");
+
+      allTables.forEach((table) => {
+        table.outerHTML = `<div class="table-container">${table.outerHTML}</div>`;
+      });
+
+      const toggleBodyOverflow = (boolean) => {
+        if (boolean) {
+          document.documentElement.style.overflowY = "scroll";
+        } else {
+          document.documentElement.style.overflowY = "hidden";
+        }
+      };
+
+      sidebarOpenButton.addEventListener("click", () => {
+        sidebarWrapper.classList.add("shown");
+        backdrop.style.display = "block";
+        toggleBodyOverflow(false);
+      });
+
+      const closeSidebar = () => {
+        sidebarWrapper.classList.remove("shown");
+        backdrop.style.display = "none";
+        toggleBodyOverflow(true);
+      };
+
+      sidebarCloseButton.addEventListener("click", () => {
+        closeSidebar();
+      });
+
+      backdrop.addEventListener("click", () => {
+        closeSidebar();
+      });
+
+      menuToggle.addEventListener("click", () => {
+        menuToggle.classList.toggle("open");
+        if (menuToggle.classList.contains("open")) {
+          mobileLinks.style.display = "block";
+          toggleBodyOverflow(false);
+        } else {
+          mobileLinks.style.display = "none";
+          toggleBodyOverflow(true);
+        }
+      });
+
+      const query = window.matchMedia("(max-width: 850px)");
+
+      query.addEventListener("change", (e) => {
+        if (!e.matches) {
+          mobileLinks.style.display = "none";
+          menuToggle.classList.remove("open");
+          toggleBodyOverflow(true);
+          backdrop.style.display = "none";
+        }
+      });
+
+      const systemButton = document.querySelector("button.system");
+      const lightButton = document.querySelector("button.light");
+      const darkButton = document.querySelector("button.dark");
+
+      const highlightButton = (theme) => {
+        [systemButton, lightButton, darkButton].forEach((button) => {
+          if ([...button.classList].includes(theme)) {
+            button.classList.add("active");
+          } else {
+            button.classList.remove("active");
+          }
+        });
+      };
+
+      highlightButton(theme);
+
+      darkMediaQuery.addEventListener("change", () => {
+        const storedTheme = localStorage.getItem("theme");
+        if (storedTheme === "system") {
+          highlightButton(storedTheme);
+          if (darkMediaQuery.matches) {
+            document.body.classList.replace("light", "dark");
+          } else {
+            document.body.classList.replace("dark", "light");
+          }
+        }
+      });
+
+      systemButton.addEventListener("click", () => {
+        if (darkMediaQuery.matches) {
+          document.body.classList.replace("light", "dark");
+        } else {
+          document.body.classList.replace("dark", "light");
+        }
+        localStorage.setItem("theme", "system");
+        highlightButton("system");
+      });
+
+      lightButton.addEventListener("click", () => {
+        document.body.classList.replace("dark", "light");
+        localStorage.setItem("theme", "light");
+        highlightButton("light");
+      });
+
+      darkButton.addEventListener("click", () => {
+        document.body.classList.replace("light", "dark");
+        localStorage.setItem("theme", "dark");
+        highlightButton("dark");
+      });
+
+      const allLinks = document.querySelectorAll("a");
+      console.log(allLinks.length);
+
+      allLinks.forEach((link) => {
+        const firstChild = link.children[0];
+        if (firstChild) {
+          if (firstChild.nodeName === "CODE") {
+            link.classList.add("link-with-code");
+          }
+        }
+      });
+
+      const preferenceButton = document.querySelector("#cookie-preference");
+
+      preferenceButton.addEventListener("click", () => {
+        window.Osano.cm.showDrawer('osano-cm-dom-info-dialog-open');
+      })
+    </script>
+  </body>
 </html>

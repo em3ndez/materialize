@@ -19,86 +19,53 @@
 // limitations under the License.
 
 use std::error::Error;
+use std::iter;
 
-use unicode_width::UnicodeWidthStr;
+use datadriven::walk;
+use itertools::Itertools;
+use mz_ore::assert_ok;
+use mz_sql_parser::ast::display::AstDisplay;
+use mz_sql_parser::ast::visit::Visit;
+use mz_sql_parser::ast::visit_mut::{self, VisitMut};
+use mz_sql_parser::ast::{AstInfo, Expr, Ident, Raw, RawDataType, RawItemName};
+use mz_sql_parser::datadriven_testcase;
+use mz_sql_parser::parser::{
+    self, parse_statements, parse_statements_with_limit, MAX_STATEMENT_BATCH_SIZE,
+};
 
-use ore::collections::CollectionExt;
-use ore::fmt::FormatBuffer;
-use sql_parser::ast::display::AstDisplay;
-use sql_parser::ast::visit::Visit;
-use sql_parser::ast::visit_mut::{self, VisitMut};
-use sql_parser::ast::{AstInfo, Expr, Ident, Raw, RawName};
-use sql_parser::parser::{self, ParserError};
-
-#[test]
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `rust_psm_stack_pointer` on OS `linux`
 fn datadriven() {
-    use datadriven::{walk, TestCase};
-
-    fn render_error(sql: &str, e: ParserError) -> String {
-        let mut s = format!("error: {}\n", e.message);
-
-        // Do our best to emulate psql in rendering a caret pointing at the
-        // offending character in the query. This makes it possible to detect
-        // incorrect error positions by visually scanning the test files.
-        let end = sql.len();
-        let line_start = sql[..e.pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let line_end = sql[e.pos..].find('\n').map(|p| e.pos + p).unwrap_or(end);
-        writeln!(s, "{}", &sql[line_start..line_end]);
-        for _ in 0..sql[line_start..e.pos].width() {
-            write!(s, " ");
-        }
-        writeln!(s, "^");
-
-        s
-    }
-
-    fn parse_statement(tc: &TestCase) -> String {
-        let input = tc.input.strip_suffix('\n').unwrap_or(&tc.input);
-        match parser::parse_statements(input) {
-            Ok(s) => {
-                if s.len() != 1 {
-                    "expected exactly one statement".to_string()
-                } else if tc.args.get("roundtrip").is_some() {
-                    format!("{}\n", s.into_element().to_string())
-                } else {
-                    let stmt = s.into_element();
-                    // TODO(justin): it would be nice to have a middle-ground between this
-                    // all-on-one-line and {:#?}'s huge number of lines.
-                    format!("{}\n=>\n{:?}\n", stmt.to_string(), stmt)
-                }
-            }
-            Err(e) => render_error(input, e),
-        }
-    }
-
-    fn parse_scalar(tc: &TestCase) -> String {
-        let input = tc.input.trim();
-        match parser::parse_expr(input) {
-            Ok(s) => {
-                if tc.args.get("roundtrip").is_some() {
-                    format!("{}\n", s.to_string())
-                } else {
-                    // TODO(justin): it would be nice to have a middle-ground between this
-                    // all-on-one-line and {:#?}'s huge number of lines.
-                    format!("{:?}\n", s)
-                }
-            }
-            Err(e) => render_error(input, e),
-        }
-    }
-
     walk("tests/testdata", |f| {
-        f.run(|test_case| -> String {
-            match test_case.directive.as_str() {
-                "parse-statement" => parse_statement(test_case),
-                "parse-scalar" => parse_scalar(test_case),
-                dir => panic!("unhandled directive {}", dir),
+        f.run(|tc| -> String {
+            if tc.directive == "parse-statement" {
+                // Verify that redacted statements can be parsed. This is important so that we are
+                // still able to pretty-print redacted statements which helps out during debugging.
+                verify_parse_redacted(&tc.input);
             }
+            datadriven_testcase(tc)
         })
     });
 }
 
-#[test]
+fn verify_parse_redacted(stmt: &str) {
+    let stmt = match parse_statements(stmt) {
+        Ok(stmt) => match stmt.into_iter().next() {
+            Some(stmt) => stmt.ast,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    let redacted = stmt.to_ast_string_redacted();
+    let res = parse_statements(&redacted);
+    assert!(
+        res.is_ok(),
+        "redacted statement could not be parsed: {res:?}\noriginal:\n{stmt}\nredacted:\n{redacted}"
+    );
+}
+
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `rust_psm_stack_pointer` on OS `linux`
 fn op_precedence() -> Result<(), Box<dyn Error>> {
     struct RemoveParens;
 
@@ -129,6 +96,7 @@ fn op_precedence() -> Result<(), Box<dyn Error>> {
         ("+ a / b COLLATE coll", "(+a) / (b COLLATE coll)"),
         ("- ts AT TIME ZONE 'tz'", "(-ts) AT TIME ZONE 'tz'"),
         ("a[b].c::d", "((a[b]).c)::d"),
+        ("2 OPERATOR(*) 2 + 2", "2 OPERATOR(*) (2 + 2)"),
     ] {
         let left = parser::parse_expr(actual)?;
         let mut right = parser::parse_expr(expected)?;
@@ -139,7 +107,7 @@ fn op_precedence() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[test]
+#[mz_ore::test]
 fn format_ident() {
     let cases = vec![
         ("foo", "foo", "\"foo\""),
@@ -163,12 +131,16 @@ fn format_ident() {
         ("", "\"\"", "\"\""),
     ];
     for (name, formatted, forced_quotation) in cases {
-        assert_eq!(formatted, format!("{}", Ident::new(name)));
-        assert_eq!(forced_quotation, Ident::new(name).to_ast_string_stable());
+        assert_eq!(formatted, format!("{}", Ident::new(name).unwrap()));
+        assert_eq!(
+            forced_quotation,
+            Ident::new(name).unwrap().to_ast_string_stable()
+        );
     }
 }
 
-#[test]
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `rust_psm_stack_pointer` on OS `linux`
 fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
     struct Visitor<'a> {
         seen_idents: Vec<&'a str>,
@@ -178,11 +150,16 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
         fn visit_ident(&mut self, ident: &'a Ident) {
             self.seen_idents.push(ident.as_str());
         }
-        fn visit_object_name(&mut self, object_name: &'a <Raw as AstInfo>::ObjectName) {
-            if let RawName::Name(name) = object_name {
+        fn visit_item_name(&mut self, item_name: &'a <Raw as AstInfo>::ItemName) {
+            if let RawItemName::Name(name) = item_name {
                 for ident in &name.0 {
                     self.seen_idents.push(ident.as_str());
                 }
+            }
+        }
+        fn visit_data_type(&mut self, data_type: &'a <Raw as AstInfo>::DataType) {
+            if let RawDataType::Other { name, .. } = data_type {
+                self.visit_item_name(name)
             }
         }
     }
@@ -208,7 +185,7 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
                 AND CASE a27 WHEN a28 THEN a29 ELSE a30 END
                 AND a31 BETWEEN a32 AND a33
                 AND a34 COLLATE a35 = a36
-                AND EXTRACT(YEAR FROM a37)
+                AND DATE_PART('YEAR', a37)
                 AND (SELECT a38)
                 AND EXISTS (SELECT a39)
             FROM a40(a41) AS a42
@@ -228,8 +205,8 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
         CREATE TABLE e01 (
             e02 INT PRIMARY KEY DEFAULT e03 CHECK (e04),
             CHECK (e05)
-        ) WITH (e06 = 1);
-        CREATE VIEW f01 (f02) WITH (f03 = 1) AS SELECT * FROM f04;
+        );
+        CREATE VIEW f01 (f02) AS SELECT * FROM f03;
         DROP TABLE j01;
         DROP VIEW k01;
         COPY l01 (l02) FROM stdin;
@@ -241,7 +218,6 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
     )?;
 
     #[rustfmt::skip]  // rustfmt loses the structure of the expected vector by wrapping all lines
-
     let expected = vec![
         "a01", "a02", "a03", "a04", "a05", "a06", "a07", "a08", "a09", "a10", "a11", "a12",
         "a13", "a14", "a15", "a16", "a17", "a18", "a19", "a20", "a21", "a22", "int4", "a23", "a24",
@@ -252,8 +228,8 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
         "b01", "b02", "b03", "b04",
         "c01", "c02", "c03", "c04", "c05",
         "d01", "d02",
-        "e01", "e02", "int4", "e03", "e04", "e05", "e06",
-        "f01", "f02", "f03", "f04",
+        "e01", "e02", "int4", "e03", "e04", "e05",
+        "f01", "f02", "f03",
         "j01",
         "k01",
         "l01", "l02",
@@ -263,9 +239,24 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
         seen_idents: Vec::new(),
     };
     for stmt in &stmts {
-        Visit::visit_statement(&mut visitor, stmt);
+        Visit::visit_statement(&mut visitor, &stmt.ast);
     }
     assert_eq!(visitor.seen_idents, expected);
 
     Ok(())
+}
+
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // too slow
+fn test_max_statement_batch_size() {
+    let statement = "SELECT 1;";
+    let size = statement.bytes().count();
+    let max_statement_count = MAX_STATEMENT_BATCH_SIZE / size;
+    let statements = iter::repeat(statement).take(max_statement_count).join("");
+
+    assert_ok!(parse_statements_with_limit(&statements));
+    let statements = format!("{statements}{statement}");
+    let err = parse_statements_with_limit(&statements).expect_err("statements should be too big");
+    assert!(err.contains("statement batch size cannot exceed "));
+    assert_ok!(parse_statements(&statements));
 }

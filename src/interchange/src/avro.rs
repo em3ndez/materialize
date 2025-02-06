@@ -11,30 +11,14 @@ use mz_avro::schema::{SchemaPiece, SchemaPieceOrNamed};
 
 mod decode;
 mod encode;
-pub mod envelope_cdc_v2;
-mod envelope_debezium;
 mod schema;
 
-pub use envelope_cdc_v2 as cdc_v2;
-
-pub use self::decode::{Decoder, DiffPair};
-pub use self::encode::{
+pub use crate::avro::decode::{Decoder, DiffPair};
+pub use crate::avro::encode::{
     encode_datums_as_avro, encode_debezium_transaction_unchecked, get_debezium_transaction_schema,
-    AvroEncoder, AvroSchemaGenerator,
+    AvroEncoder, AvroSchemaGenerator, DocTarget,
 };
-pub use self::envelope_debezium::DebeziumDeduplicationStrategy;
-pub use self::schema::{parse_schema, schema_to_relationdesc, ConfluentAvroResolver};
-
-use self::decode::{AvroStringDecoder, OptionalRecordDecoder, RowWrapper};
-use self::envelope_debezium::{AvroDebeziumDecoder, RowCoordinates};
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum EnvelopeType {
-    None,
-    Debezium,
-    Upsert,
-    CdcV2,
-}
+pub use crate::avro::schema::{parse_schema, schema_to_relationdesc, ConfluentAvroResolver};
 
 fn is_null(schema: &SchemaPieceOrNamed) -> bool {
     matches!(schema, SchemaPieceOrNamed::Piece(SchemaPiece::Null))
@@ -43,15 +27,16 @@ fn is_null(schema: &SchemaPieceOrNamed) -> bool {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-    use ordered_float::OrderedFloat;
-
     use mz_avro::types::{DecimalValue, Value};
-    use repr::adt::numeric;
-    use repr::{Datum, RelationDesc, ScalarType};
+    use mz_repr::adt::date::Date;
+    use mz_repr::adt::numeric::{self, NumericMaxScale};
+    use mz_repr::adt::timestamp::CheckedTimestamp;
+    use mz_repr::{Datum, RelationDesc, ScalarType};
+    use ordered_float::OrderedFloat;
 
     use super::*;
 
-    #[test]
+    #[mz_ore::test]
     fn record_without_fields() -> anyhow::Result<()> {
         let schema = r#"{
             "type": "record",
@@ -65,7 +50,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[mz_ore::test]
     fn basic_record() -> anyhow::Result<()> {
         let schema = r#"{
             "type": "record",
@@ -77,15 +62,17 @@ mod tests {
         }"#;
 
         let desc = schema_to_relationdesc(parse_schema(schema)?)?;
-        let expected_desc = RelationDesc::empty()
+        let expected_desc = RelationDesc::builder()
             .with_column("f1", ScalarType::Int32.nullable(false))
-            .with_column("f2", ScalarType::String.nullable(false));
+            .with_column("f2", ScalarType::String.nullable(false))
+            .finish();
 
         assert_eq!(desc, expected_desc);
         Ok(())
     }
 
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `decNumberFromInt32` on OS `linux`
     /// Test that primitive Avro Schema types are allow Datums to be correctly
     /// serialized into Avro Values.
     ///
@@ -95,8 +82,11 @@ mod tests {
     fn test_diff_pair_to_avro_primitive_types() -> anyhow::Result<()> {
         use numeric::Numeric;
         // Data to be used later in assertions.
-        let date = NaiveDate::from_ymd(2020, 1, 8);
-        let date_time = NaiveDateTime::new(date, NaiveTime::from_hms(1, 1, 1));
+        let date = 365 * 50 + 20;
+        let date_time = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2020, 1, 8).unwrap(),
+            NaiveTime::from_hms_opt(1, 1, 1).unwrap(),
+        );
         let bytes: Vec<u8> = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10];
         let string = String::from("test");
 
@@ -117,19 +107,30 @@ mod tests {
                 Datum::Float64(OrderedFloat::from(1f64)),
                 Value::Double(1f64),
             ),
-            (ScalarType::Date, Datum::Date(date), Value::Date(date)),
             (
-                ScalarType::Timestamp,
-                Datum::Timestamp(date_time),
+                ScalarType::Date,
+                Datum::Date(Date::from_unix_epoch(date).unwrap()),
+                Value::Date(date),
+            ),
+            (
+                ScalarType::Timestamp { precision: None },
+                Datum::Timestamp(CheckedTimestamp::from_timestamplike(date_time).unwrap()),
                 Value::Timestamp(date_time),
             ),
             (
-                ScalarType::TimestampTz,
-                Datum::TimestampTz(DateTime::from_utc(date_time, Utc)),
+                ScalarType::TimestampTz { precision: None },
+                Datum::TimestampTz(
+                    CheckedTimestamp::from_timestamplike(DateTime::from_naive_utc_and_offset(
+                        date_time, Utc,
+                    ))
+                    .unwrap(),
+                ),
                 Value::Timestamp(date_time),
             ),
             (
-                ScalarType::Numeric { scale: Some(1) },
+                ScalarType::Numeric {
+                    max_scale: Some(NumericMaxScale::try_from(1_i64)?),
+                },
                 Datum::from(Numeric::from(1)),
                 Value::Decimal(DecimalValue {
                     unscaled: bytes.clone(),
@@ -138,7 +139,7 @@ mod tests {
                 }),
             ),
             (
-                ScalarType::Numeric { scale: None },
+                ScalarType::Numeric { max_scale: None },
                 Datum::from(Numeric::from(1)),
                 Value::Decimal(DecimalValue {
                     // equivalent to 1E39
@@ -162,10 +163,14 @@ mod tests {
             ),
         ];
         for (typ, datum, expected) in valid_pairings {
-            let desc = RelationDesc::empty().with_column("column1", typ.nullable(false));
-            let schema_generator = AvroSchemaGenerator::new(None, desc, false);
+            let desc = RelationDesc::builder()
+                .with_column("column1", typ.nullable(false))
+                .finish();
+            let schema_generator =
+                AvroSchemaGenerator::new(desc, false, Default::default(), "row", false, None, true)
+                    .unwrap();
             let avro_value =
-                encode_datums_as_avro(std::iter::once(datum), schema_generator.value_columns());
+                encode_datums_as_avro(std::iter::once(datum), schema_generator.columns());
             assert_eq!(
                 Value::Record(vec![("column1".into(), expected)]),
                 avro_value

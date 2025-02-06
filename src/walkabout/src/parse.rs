@@ -20,8 +20,6 @@ use syn::{Data, DataEnum, DataStruct, DataUnion, DeriveInput, Item};
 /// Returns [`DeriveInput`]s representing all struct and enum items in the
 /// module. This is exactly what a custom derive procedural macro would see,
 /// except that we can present information for all types simultaneously.
-///
-
 pub fn parse_mod<P>(path: P) -> Result<Vec<DeriveInput>>
 where
     P: AsRef<Path>,
@@ -52,8 +50,8 @@ where
         match item {
             Item::Mod(item) if item.content.is_none() => {
                 let path = match stem {
-                    "mod" | "lib" => dir.join(&format!("{}.rs", item.ident)),
-                    _ => dir.join(&format!("{}/{}.rs", stem, item.ident)),
+                    "mod" | "lib" => dir.join(format!("{}.rs", item.ident)),
+                    _ => dir.join(format!("{}/{}.rs", stem, item.ident)),
                 };
                 collect_items(path, out)?;
             }

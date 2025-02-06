@@ -10,17 +10,23 @@
 mode cockroach
 
 statement ok
-CREATE TABLE bools (b text)
+CREATE TABLE bools (b bool)
 
 statement ok
-INSERT INTO bools VALUES
+INSERT INTO bools VALUES (TRUE), (FALSE), (NULL);
+
+statement ok
+CREATE TABLE bools_text (b text)
+
+statement ok
+INSERT INTO bools_text VALUES
     ('t'), ('tr'), ('tR'), ('tRuE'), ('TRUE'), ('    tr    '),
     ('f'), ('fa'), ('faL'), ('fAlsE'), ('FALSE'), ('           fal '),
     ('on'), ('off'), ('On'), ('Off'), ('ON'), ('oFf'),
     ('1'), ('0'), ('               1'), ('0        ')
 
 query TB rowsort
-SELECT replace(b, ' ', 'x'), b::bool FROM bools
+SELECT replace(b, ' ', 'x'), b::bool FROM bools_text
 ----
 xxxxxxxxxxxxxxx1  true
 xxxxxxxxxxxfalx   false
@@ -69,6 +75,18 @@ SELECT 1 AND FALSE
 query error AND argument must have type boolean, not type integer
 SELECT FALSE AND 1
 
+query B colnames
+SELECT TRUE
+----
+bool
+true
+
+query B colnames
+SELECT FALSE
+----
+bool
+false
+
 query B
 SELECT NOT TRUE
 ----
@@ -79,75 +97,99 @@ SELECT NOT FALSE
 ----
 true
 
+query BBB rowsort
+SELECT a.b, b.b, a.b AND b.b FROM bools AS a CROSS JOIN bools AS b;
+----
+true  true  true
+true  false false
+true  NULL  NULL
+false true  false
+false false false
+false NULL  false
+NULL  true  NULL
+NULL  false false
+NULL  NULL  NULL
+
+# Boolean AND error cases
+
+query error division by zero
+SELECT (1/0 > 0) AND TRUE;
+
+# Postgres returns the error instead
 query B
-SELECT TRUE AND FALSE
+SELECT (1/0 > 0) AND FALSE;
 ----
 false
 
-query B
-SELECT TRUE AND TRUE
-----
-true
+query error division by zero
+SELECT (1/0 > 0) AND NULL;
+
+query error division by zero
+SELECT TRUE AND (1/0 > 0);
 
 query B
-SELECT FALSE AND FALSE
+SELECT FALSE AND (1/0 > 0);
 ----
 false
 
-query B
-SELECT TRUE AND NULL
-----
-NULL
+query error division by zero
+SELECT NULL AND (1/0 > 0);
 
-query B
-SELECT NULL AND TRUE
-----
-NULL
+# Check we consistently pick the same error
+# Postgres returns the first error instead
 
-query B
-SELECT FALSE AND null
-----
-false
+query error "32768" smallint out of range
+SELECT (32768::int2 > 0) AND (1/0 > 0);
 
-query B
-SELECT NULL AND FALSE
-----
-false
+query error "32768" smallint out of range
+SELECT (1/0 > 0) AND (32768::int2 > 0);
 
+query BBB rowsort
+SELECT a.b, b.b, a.b OR b.b FROM bools AS a CROSS JOIN bools AS b;
+----
+true  true  true
+true  false true
+true  NULL  true
+false true  true
+false false false
+false NULL  NULL
+NULL  true  true
+NULL  false NULL
+NULL  NULL  NULL
+
+# Boolean OR error cases
+
+# Postgres returns the error instead
 query B
-SELECT TRUE OR FALSE
+SELECT (1/0 > 0) OR TRUE;
 ----
 true
 
+query error division by zero
+SELECT (1/0 > 0) OR FALSE;
+
+query error division by zero
+SELECT (1/0 > 0) OR NULL;
+
 query B
-SELECT TRUE OR TRUE
+SELECT TRUE OR (1/0 > 0);
 ----
 true
 
-query B
-SELECT FALSE OR FALSE
-----
-false
+query error division by zero
+SELECT FALSE OR (1/0 > 0);
 
-query B
-SELECT TRUE OR NULL
-----
-true
+query error division by zero
+SELECT NULL OR (1/0 > 0);
 
-query B
-SELECT NULL OR TRUE
-----
-true
+# Check we consistently pick the same error
+# Postgres returns the first error instead
 
-query B
-SELECT FALSE OR null
-----
-NULL
+query error smallint out of range
+SELECT (32768::int2 > 0) OR (1/0 > 0);
 
-query B
-SELECT NULL OR FALSE
-----
-NULL
+query error smallint out of range
+SELECT (1/0 > 0) OR (32768::int2 > 0);
 
 query B
 SELECT TRUE AND NOT TRUE
@@ -210,7 +252,7 @@ CREATE TABLE x (a int, u int, j jsonb, b bool)
 
 # Ensure the NOT gets pushed into the binary operation.
 query T multiline
-EXPLAIN PLAN FOR SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   NOT(a = u),
   NOT(a != u),
   NOT(a < u),
@@ -222,10 +264,14 @@ EXPLAIN PLAN FOR SELECT
   NOT(j @> '{}'::JSONB)
 FROM x
 ----
-%0 =
-| Get materialize.public.x (u3)
-| Map (#0 != #1), (#0 = #1), (#0 >= #1), (#0 <= #1), (#0 < #1), (#0 > #1), !((#2 @> {}))
-| Project (#4..#9, #3, #10)
+Explained Query:
+  Project (#4..=#9, #3, #10) // { arity: 8 }
+    Map ((#0 != #1), (#0 = #1), (#0 >= #1), (#0 <= #1), (#0 < #1), (#0 > #1), NOT((#2 @> {}))) // { arity: 11 }
+      ReadStorage materialize.public.x // { arity: 4 }
+
+Source materialize.public.x
+
+Target cluster: quickstart
 
 EOF
 
@@ -234,78 +280,102 @@ CREATE TABLE y (a boolean, b bool)
 
 # Bypass if statements with identical branches
 query T multiline
-EXPLAIN PLAN FOR SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   CASE WHEN b THEN a ELSE a END
 FROM y
 ----
-%0 =
-| Get materialize.public.y (u5)
-| Project (#0)
+Explained Query:
+  Project (#0) // { arity: 1 }
+    ReadStorage materialize.public.y // { arity: 2 }
+
+Source materialize.public.y
+
+Target cluster: quickstart
 
 EOF
 
 # Bypass if statements with identical branches
 query T multiline
-EXPLAIN PLAN FOR SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   CASE WHEN b THEN NULL ELSE true END
 FROM y
 ----
-%0 =
-| Get materialize.public.y (u5)
-| Map (null || (!(#1) || isnull(#1)))
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((null OR NOT(#1) OR (#1) IS NULL)) // { arity: 3 }
+      ReadStorage materialize.public.y // { arity: 2 }
+
+Source materialize.public.y
+
+Target cluster: quickstart
 
 EOF
 
 
 # Bypass if statements with identical branches
 query T multiline
-EXPLAIN PLAN FOR SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   CASE WHEN b THEN NULL ELSE false END
 FROM y
 ----
-%0 =
-| Get materialize.public.y (u5)
-| Map (null && (#1 && !(isnull(#1))))
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((#1 AND null AND (#1) IS NOT NULL)) // { arity: 3 }
+      ReadStorage materialize.public.y // { arity: 2 }
+
+Source materialize.public.y
+
+Target cluster: quickstart
 
 EOF
 
 
 query T multiline
-EXPLAIN PLAN FOR SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   CASE WHEN b THEN true ELSE NULL END
 FROM y
 ----
-%0 =
-| Get materialize.public.y (u5)
-| Map (null || (#1 && !(isnull(#1))))
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((null OR (#1 AND (#1) IS NOT NULL))) // { arity: 3 }
+      ReadStorage materialize.public.y // { arity: 2 }
+
+Source materialize.public.y
+
+Target cluster: quickstart
 
 EOF
 
 
 query T multiline
-EXPLAIN PLAN FOR SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   CASE WHEN b THEN false ELSE NULL END
 FROM y
 ----
-%0 =
-| Get materialize.public.y (u5)
-| Map (null && (!(#1) || isnull(#1)))
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((null AND (NOT(#1) OR (#1) IS NULL))) // { arity: 3 }
+      ReadStorage materialize.public.y // { arity: 2 }
+
+Source materialize.public.y
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   CASE WHEN b THEN false ELSE TRUE END
 FROM y
 ----
-%0 =
-| Get materialize.public.y (u5)
-| Map (!(#1) || isnull(#1))
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((NOT(#1) OR (#1) IS NULL)) // { arity: 3 }
+      ReadStorage materialize.public.y // { arity: 2 }
+
+Source materialize.public.y
+
+Target cluster: quickstart
 
 EOF
 
@@ -316,13 +386,18 @@ statement ok
 insert into z values (null, null), (1, null), (null, 2), (1, 2), (2, 1)
 
 query T multiline
-EXPLAIN PLAN FOR SELECT *
+EXPLAIN WITH(arity, join implementations) SELECT *
 FROM z
 WHERE CASE WHEN a > b THEN FALSE ELSE TRUE END
 ----
-%0 =
-| Get materialize.public.z (u7)
-| Filter ((isnull(#0) || isnull(#1)) || (#0 <= #1))
+Explained Query:
+  Filter ((#0) IS NULL OR (#1) IS NULL OR (#0 <= #1)) // { arity: 2 }
+    ReadStorage materialize.public.z // { arity: 2 }
+
+Source materialize.public.z
+  filter=(((#0) IS NULL OR (#1) IS NULL OR (#0 <= #1)))
+
+Target cluster: quickstart
 
 EOF
 
@@ -335,3 +410,9 @@ NULL  NULL
 NULL  2
 1  NULL
 1  2
+
+# TODO: Reenable when database-issues#8807 is fixed
+# query T
+# SELECT CASE WHEN FALSE THEN 'short_string'::char(20) ELSE 'long_string_long_string'::char(30) END
+# ----
+# long_string_long_string

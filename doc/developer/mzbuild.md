@@ -2,23 +2,24 @@
 
 mzbuild is an build and orchestration system for [Docker] containers.
 
-As a user or developer, you'll interact with mzbuild through three commands:
+As a user or developer, you'll interact with mzbuild through two commands:
 
-  * [**`mzcompose`**](#mzcompose) is a thin layer on top of [Docker Compose]
-    that automatically downloads cached images from Docker Hub if available, or
+  * [**`mzcompose`**](#mzcompose) is a layer on top of [Docker Compose]
+    that permits orchestrating and interacting with services via Python
+    scripts.
+
+    It  automatically downloads cached images from Docker Hub if available, or
     otherwise builds them locally if you've made changes to the inputs of the
-    image.
-
-    This approach keeps things snappy when running a demo or test on the latest
-    tip of main, while ensuring that you don't need to modify the Docker
-    Compose configuration as you make changes to the source code.
+    image. This approach keeps things snappy when running a test on the latest
+    tip of main, while ensuring that you don't need to modify the composition
+    as you make changes to the source code.
 
   * [**`mzimage`**](#mzimage) is a lower-level command that allows inspection
     and finer-grained control over the build process for the images in the
     repository.
 
 From the root of the repository, invoke the commands as `bin/mzcompose` and
-`bin/mzimage`, respectively. Any directory with an `mzcompose.yml` file will
+`bin/mzimage`, respectively. Any directory with an `mzcompose.py` file will
 also have a convenience script alongside it, which you can invoke as
 `./mzcompose` from within that directory.
 
@@ -31,8 +32,9 @@ also have a convenience script alongside it, which you can invoke as
   * [Development](#development)
   * [Reference](#reference)
     * [`mzbuild.yml`](#mzbuildyml)
-    * [`mzcompose.yml`](#mzcomposeyml)
+    * [`mzcompose.py`](#mzcomposepy)
     * [mzbuild `Dockerfile`](#mzbuild-Dockerfile)
+    * [`README.md`](#readmemd)
   * [Motivation](#motivation)
     * [Why a new build system?](#why-a-new-build-system)
     * [Why Docker?](#why-docker)
@@ -175,19 +177,21 @@ Docker Hub! Seamless.
 ### `mzcompose`
 
 To create an mzcompose configuration that uses the `fancy-loadgen` image we
-built in the previous tutorial, just drop an `mzcompose.yml` file into a
+built in the previous tutorial, just drop an `mzcompose.py` file into a
 directory:
 
-```yml
-version: "3.7"
+```py
+from materialize.mzcompose import Service
 
-services:
-  fancy:
-    mzbuild: fancy-loadgen
+SERVICES = [
+    Service(
+        "fancy-loadgen",
+        {
+            "mzbuild": "fancy-loadgen",
+        },
+    ),
+]
 ```
-
-If you're unfamiliar with Compose, you may want to take a look at the
-[Compose file reference][compose-ref] for details.
 
 Now bring the configuration up with `bin/mzcompose`:
 
@@ -204,7 +208,7 @@ fancy_fancy_1 exited with code 0
 ```
 
 The argument you pass to `--find` is the name of the directory containing the
-`mzcompose.yml`. Don't worry: if this directory name is not unique across the
+`mzcompose.py`. Don't worry: if this directory name is not unique across the
 entire repository, `mzcompose` will complain.
 
 Notice how `mzcompose` automatically acquired images for not just
@@ -234,15 +238,24 @@ fancy_fancy_1   python3 fancy-loadgen.py   Exit 0
 
 Let's add another mzbuild dependency, this time on `materialized`:
 
-```yml
-version: "3.7"
+```py
+from materialize.mzcompose import Service
+from materialize.mzcompose.services.materialized import Materialized
 
-services:
-  fancy:
-    mzbuild: fancy-loadgen
-  materialized:
-    mzbuild: materialized
+SERVICES = [
+    Materialized(),
+    Service(
+        "fancy-loadgen",
+        {
+            "mzbuild": "fancy-loadgen",
+        },
+    ),
+]
 ```
+
+Notice how we reused the service definition in the `services` module. If
+`fancy-loadgen` were used in multiple compositions, we'd similarly want to
+create a reusable service definition called `FancyLoadgen`.
 
 `mzcompose` will automatically acquire the new dependency on the next
 invocation. Note that if you have local changes to any Rust code, you'll likely
@@ -254,75 +267,50 @@ $ ./mzcompose up
 ==> Collecting mzbuild dependencies
 materialize/billing-demo:FM4STU42G7W44OLAPKZNEZWGEPTMIVE6
 materialize/fancy-loadgen:Z2GPU4TQMCV2PGFTNUPYLQO2PQAYD6OY
-materialize/materialized:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
-==> Acquiring materialize/materialized:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
-$ docker pull materialize/materialized:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
-EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM: Pulling from materialize/materialized
+materialize/environmentd:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
+==> Acquiring materialize/environmentd:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
+$ docker pull materialize/environmentd:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
+EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM: Pulling from materialize/environmentd
 ...
-Status: Downloaded newer image for materialize/materialized:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
-docker.io/materialize/materialized:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
+Status: Downloaded newer image for materialize/environmentd:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
+docker.io/materialize/environmentd:EYBAS3HTGQS2SAVO3RBR5JS6AVGVRPJM
 ==> Delegating to Docker Compose
 Starting fancy_fancy_1        ... done
 Creating fancy_materialized_1 ... done
 Attaching to fancy_fancy_1, fancy_materialized_1
 fancy_1         | 🎩 load
-materialized_1  | materialized: '--workers' must be specified and greater than 0
-materialized_1  | hint: As a starting point, set the number of threads to half of the number of
-materialized_1  | cores on your system. Then, further adjust based on your performance needs.
-materialized_1  | hint: You may also set the environment variable MZ_WORKERS to the desired number
-materialized_1  | of threads.
+materialized_1  | booting...
 fancy_fancy_1 exited with code 0
 fancy_materialized_1 exited with code 1
 ```
 
 And that's it. Pretty simple. Note that you can add normal `image` services to
-your `mzcompose.yml`, too. That works just as it would in vanilla Docker
+your `mzcompose.py`, too. That works just as it would in vanilla Docker
 Compose.
 
-```yml
-version: "3.7"
+```py
+from materialize.mzcompose import Service
+from materialize.mzcompose.services.materialized import Materialized
 
-services:
-  fancy:
-    mzbuild: fancy-loadgen
-  materialized:
-    mzbuild: materialized
-  zookeeper:
-    image: zookeeper:3.4.13
+SERVICES = [
+    Materialized(),
+    Service(
+        "fancy-loadgen",
+        {
+            "mzbuild": "fancy-loadgen",
+        },
+    ),
+    Service(
+        "zookeeper",
+        {
+            "image": "zookeeper:3.4.13",
+        },
+    ),
+]
 ```
 
-A common complaint with Docker Compose is the lack of proper service
-orchestration. It is not possible to express, for exaple, that the `fancy`
-service cannot be started until `materialized` has booted successfully.
-
-`mzcompose` therefore provides a feature called "workflows" that orchestrate
-interacting with the defined services. The following `load-test` workflow waits
-for `materialized` to start listening on port 6875 before launching the `fancy`
-service.
-
-```
-version: "3.7"
-
-services:
-  fancy:
-    mzbuild: fancy-loadgen
-  materialized:
-    mzbuild: materialized
-
-mzworkflows:
-  load-test:
-    steps:
-    - step: start-services
-      services: [materialized]
-    - step: wait-for-tcp
-      host: materialized
-      port: 6875
-    - step: start-services
-      services: [fancy-loadgen]
-```
-
-To run the workflow, run `./mzcompose run load-test`, just like you would if
-`load-test` were a normal service.
+(Although, in a real composition, you'd use the built in `Zookeeper` service
+rather than inlining the service definition.)
 
 #### Release vs development builds
 
@@ -380,10 +368,11 @@ The directory containing a `mzbuild.yml` file is called the "mzbuild context."
 #### Example
 
 ```yml
-name: materialized
+name: environmentd
+description: "A Docker image containing just environmentd."
 pre-image:
   - type: cargo-build
-    bin: materialized
+    bin: environmentd
     strip: false
 publish: true
 ```
@@ -416,9 +405,11 @@ publish: true
      The optional `matching` field specifies a glob that determines which
      files in the `source` directory to copy.
 
-  *  `type: cargo-bin` builds a Rust binary with Cargo. The `bin` field
-     indicates the name of the binary target in the Cargo workspace to build.
-     The resulting artifact will be placed into the mzbuild context.
+  *  `type: cargo-build` builds a Rust binary with Cargo. The `bin` field is a
+     string or a list of strings that indicates the name of one or more binary
+     targets in the Cargo workspace to build. The resulting artifact will be
+     placed into the mzbuild context. The `example` field works identically but
+     names an example to build rather than a binary.
 
      All files within the crate directory, and all files within the directories
      of any transitive _path_ dependencies of the crate (i.e., dependencies in
@@ -427,27 +418,29 @@ publish: true
      `.cargo/config` files.
 
      Cargo is invoked with the `--release` flag unless the `--dev` flag is
-     specified. The binary will be stripped of debug information unless
-     `strip: false` is requested.
+     specified.
 
      In rare cases, it may be necessary to extract files from the build
      directory of a dependency. The `extract` key specifies a mapping from a
-     dependent package to a list of files to copy into the build context. Paths
-     should be relative and are interpreted relative to that crate's build
-     directory. Each extracted file will be placed in the root of the build
-     context with the same name as the original file. Copying directories is not
-     supported. Note that `extract` is only relevant if the dependency has a
-     custom Cargo build script, as Rust crates without a build script do not
-     have a build directory.
-
-  * `type: cargo-test` builds a special image that simulates `cargo test`. This
-     plugin is very special-cased at the moment, and unlikely to be generally
-     useful.
+     dependent package to a mapping from source files and directories to
+     destination directories. Source paths are interpreted relative to that
+     crate's build directory while destination paths are interpreted relative to
+     the build context. Note that `extract` is only relevant if the dependency
+     has a custom Cargo build script, as Rust crates without a build script do
+     not have a build directory.
 
 * `publish` (bool) specifies whether the image should be automatically published
   to Docker Hub by CI. Non-publishable images can still be *used* by users and
   CI, but they must always be built from source. Use sparingly. The default is
   `true`.
+
+* `description` (str) is a short description for the image. If `publish` is
+  true, CI will automatically sync the description to Docker Hub.
+
+* `mainline` (bool) indicates whether the image participates in the main
+  Materialize versioning scheme. CI will automatically push version tags for
+  mainline images for unprefixed tag builds (e.g., `v0.27.0`). Non-mainline
+  images must handle their own release scheme. The default is `true`.
 
 * `build-args` (map[str, str]) a list of parameters to pass as [`--build-arg`][buildarg]
   to Docker. For example:
@@ -468,129 +461,9 @@ ignore these files! Ignored files will be excluded from the mzbuild fingerprint,
 and will be automatically deleted at the beginning of the pre-image phase to
 ensure idempotent builds.
 
-### mzcompose.yml
+### mzcompose.py
 
-An mzcompose configuration file is a small extension to the [Docker Compose
-configuration file][compose-ref]. All extensions apply to the `services`
-top-level map.
-
-#### Example
-
-```yaml
-version: "3.7"
-
-services:
-  materialized:
-    mzbuild: materialized
-    propagate_uid_gid: true
-
-mzworkflows:
-  NAME:
-    env:
-      KEY: VALUE
-    steps:
-    - step: STEP-NAME
-      STEP-OPTION: STEP-OPTION-VALUE
-```
-
-#### Fields
-
-* `mzbuild` (string) indicates that the service's image should be dynamically
-  acquired by mzcompose prior to invoking Docker Compose. The value must match
-  the name of an image in the repository.
-
-  If `mzbuild` is specified, neither of the standard properties `build` nor
-  `image` should be specified.
-
-* `propagate_uid_gid` (bool) requests that the Docker image be run with the user
-  ID and group ID of the host user. It is equivalent to passing `--user $(id
-  -u):$(id -g)` to `docker run`. The default is `false`.
-
-* `mzworkflows` (dict) specifies a named set of workflows. A workflow consists
-  of a series of steps that are executed in sequence and a set of environment
-  variables that are set during the execution of the workflow. The available
-  steps and their options are only documented by way of the developer docs.
-  See <https://dev.materialize.com/api/python/materialize/mzcompose.html>.
-
-  Also see the [chbench demo mzcompose](../../demo/chbench/mzcompose.yml) for
-  a detailed example.
-
-#### Bash-like Environment Substitution
-
-`mzcompose` performs "bash-like" variable substitution within workflows (for `services` the block,
-docker-compose is responsible for [variable
-substitution](https://docs.docker.com/compose/compose-file/compose-file-v3/#variable-substitution)).
-For example, you can define the following workflow, and it will pull `MZ_WORKERS` from your
-environment:
-
-```yaml
-mzworkflows:
-  example_workflow:
-    env:
-      # Use MZ_WORKERS from the environment. If not set, default to empty string
-      MZ_WORKERS: ${MZ_WORKERS}
-    steps:
-    - step: STEP-NAME
-      STEP-OPTION: STEP-OPTION-VALUE
-```
-
-The variable substitution can occur anywhere with the workflow specification:
-
-```yaml
-mzworkflows:
-  example_workflow:
-    env:
-      # Use MZ_WORKERS from the environment. If not set, default to empty string
-      MZ_WORKERS: ${MZ_WORKERS}
-    steps:
-    - step: STEP-NAME
-      STEP-OPTION: ${MZ_WORKERS}
-```
-
-Support for default values similarly as it does in bash, but the full syntax is not supported. At
-the moment, `mzcompose` only supports default replacement via the `:-` operator and only for
-variables using the `${VARIABLE}` syntax:
-
-```yaml
-mzworkflows:
-  example_workflow:
-    env:
-      # If MZ_WORKERS is set, use the value from the environment. Otherwise use 16
-      MZ_WORKERS: ${MZ_WORKERS:-16}
-    steps:
-    - step: STEP-NAME
-      STEP-OPTION: STEP-OPTION-VALUE
-```
-
-For workflows triggered by another workflow, variables substitution occurs at the time the
-workflow is triggered (as opposed to when the composition is loaded). This means that you can set
-an environment variable in one workflow and it will be picked up by the second workflow:
-
-```yaml
-mzworkflows:
-  workflow1:
-    env:
-      # Explicitly set the value to 16, ignoring the parent environment
-      MZ_WORKERS: 16
-    steps:
-    - step: workflow
-      workflow: workflow2
-  workflow2:
-    env:
-      # MZ_WORKERS will be 16 if called from workflow1
-      # If not called from workflow1, it pull the value from the environment or default
-      MZ_WORKERS: ${MZ_WORKERS:-32}
-    steps:
-    - step: STEP-NAME
-      STEP-OPTION: STEP-OPTION-VALUE
-```
-
-The preference order for variable subsitution is:
-
-1. The value specified by the mzworkflow.
-2. The value specified by the environment.
-3. The default value specified where the variable is being used.
-4. Empty string.
+See [mzcompose.md](mzcompose.md) for details.
 
 ### mzbuild Dockerfile
 
@@ -600,7 +473,7 @@ mzbuild images.
 #### Example
 
 ```dockerfile
-MZFROM materialized
+MZFROM environmentd
 
 MZFROM ubuntu-base
 
@@ -614,6 +487,12 @@ COPY --from=0 ...
   specified mzbuild image. It is like the vanilla Dockerfile [FROM
   command][dockerfile-from], except that the image named must be a valid mzbuild
   image in the repository, not a vanilla Docker image.
+
+### README.md
+
+If an mzbuild.yml file contains a file named README.md and `publish` is true, CI
+will automatically sync that file to Docker Hub as the repository's "full
+description."
 
 ## Motivation
 

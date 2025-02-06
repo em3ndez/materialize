@@ -9,28 +9,50 @@
 
 //! Detects an input being unioned with its negation and cancels them out
 
-use crate::{TransformArgs, TransformError};
-use expr::MirRelationExpr;
 use itertools::Itertools;
+use mz_expr::visit::Visit;
+use mz_expr::MirRelationExpr;
+
+use crate::{TransformCtx, TransformError};
 
 /// Detects an input being unioned with its negation and cancels them out
+///
+/// `UnionBranchCancellation` is recursion-safe, but this is not immediately trivial:
+/// It relies on the equality of certain `MirRelationExpr`s, which is a scary thing in a WMR
+/// context, because `Get x` can mean not-equal things in different Let bindings.
+/// However, this problematic case can't happen here, because when `UnionBranchCancellation` is
+/// looking at two Gets to the same Id, then these have to be under the same Let binding.
+/// This is because the recursion of `compare_branches` starts from two things in the same Let
+/// binding (from two inputs of a Union), and then we don't make any `compare_branches` call
+/// where `relation` and `other` are in different Let bindings.
 #[derive(Debug)]
 pub struct UnionBranchCancellation;
 
 impl crate::Transform for UnionBranchCancellation {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "UnionBranchCancellation"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "union_branch_cancellation")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), TransformError> {
-        relation.try_visit_mut_post(&mut |e| self.action(e))
+        let result = relation.try_visit_mut_post(&mut |e| self.action(e));
+        mz_repr::explain::trace_plan(&*relation);
+        result
     }
 }
 
 /// Result of the comparison of two branches of a union for cancellation
 /// purposes.
 enum BranchCmp {
-    /// The two branches are equivalent in the sense the the produce the
+    /// The two branches are equivalent in the sense the produce the
     /// same exact results.
     Equivalent,
     /// The two branches are equivalent, but one of them produces negated

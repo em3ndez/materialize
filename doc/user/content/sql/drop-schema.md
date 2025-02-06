@@ -1,12 +1,12 @@
 ---
 title: "DROP SCHEMA"
-description: "`DROP SCHEMA` removes a schema from your Materialize instances."
+description: "`DROP SCHEMA` removes a schema from Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`DROP SCHEMA` removes a schema from your Materialize instances.
+`DROP SCHEMA` removes a schema from Materialize.
 
 ## Syntax
 
@@ -27,24 +27,24 @@ Before you can drop a schema, you must [drop all sources](../drop-source) and
 ## Example
 
 ### Remove a schema with no dependent objects
-```sql
+```mzsql
 SHOW SOURCES FROM my_schema;
 ```
 ```nofmt
 my_file_source
 ```
-```sql
+```mzsql
 DROP SCHEMA my_schema;
 ```
 
 ### Remove a schema with dependent objects
-```sql
+```mzsql
 SHOW SOURCES FROM my_schema;
 ```
 ```nofmt
 my_file_source
 ```
-```sql
+```mzsql
 DROP SCHEMA my_schema CASCADE;
 ```
 
@@ -52,20 +52,28 @@ DROP SCHEMA my_schema CASCADE;
 
 You can use either of the following commands:
 
-- ```sql
+- ```mzsql
   DROP SCHEMA my_schema;
   ```
-- ```sql
+- ```mzsql
   DROP SCHEMA my_schema RESTRICT;
   ```
 
 ### Do not issue an error if attempting to remove a nonexistent schema
 
-```sql
+```mzsql
 DROP SCHEMA IF EXISTS my_schema;
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of the dropped schema.
+- `USAGE` privileges on the containing database.
 
 ## Related pages
 
 - [`SHOW SCHEMAS`](../show-schemas)
 - [`CREATE SCHEMA`](../create-schema)
+- [DROP OWNED](../drop-owned)

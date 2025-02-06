@@ -1,5 +1,5 @@
 ---
-title: "jsonb_agg Function"
+title: "jsonb_agg function"
 description: "Aggregates values (including nulls) as a jsonb array."
 menu:
   main:
@@ -40,30 +40,29 @@ Instead, we recommend that you materialize all components required for the
 `jsonb_agg` function call and create a non-materialized view using `jsonb_agg`
 on top of that. That pattern is illustrated in the following statements:
 
-```sql
+```mzsql
 CREATE MATERIALIZED VIEW foo_view AS SELECT * FROM foo;
 CREATE VIEW bar AS SELECT jsonb_agg(foo_view.bar) FROM foo_view;
 ```
 
 ## Examples
 
-```sql
-SELECT jsonb_agg(1);
+```mzsql
+SELECT
+  jsonb_agg(t) FILTER (WHERE t.content LIKE 'h%')
+    AS my_agg
+FROM (
+  VALUES
+  (1, 'hey'),
+  (2, NULL),
+  (3, 'hi'),
+  (4, 'salutations')
+  ) AS t(id, content);
 ```
 ```nofmt
- jsonb_agg
------------
- [1]
-```
-<hr/>
-
-```sql
-SELECT jsonb_agg('example'::text);
-```
-```nofmt
-  jsonb_agg
--------------
- ["example"]
+                       my_agg
+----------------------------------------------------
+ [{"content":"hi","id":3},{"content":"hey","id":1}]
 ```
 
 ## See also

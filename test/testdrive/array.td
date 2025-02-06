@@ -21,18 +21,28 @@ array
 {{a,b},{NULL,d}}
 
 ! CREATE TABLE foobar (f1 int list[]);
-integer list[] not yet supported
+contains:type "int4 list[]" does not exist
 
 ! SELECT ARRAY[LIST[1]];
-integer list[] not yet supported
+contains:integer list[] not yet supported
 
-> CREATE TYPE bigint_list AS LIST (element_type=bigint);
+> CREATE TYPE bigint_list AS LIST (ELEMENT TYPE = bigint);
 ! CREATE TABLE bigint_list_arr (f1 bigint_list[]);
-bigint_list[] not yet supported
+contains:type "bigint_list[]" does not exist
 
 ! SELECT ARRAY['{a => 1}'::map[text=>int]];
-map[text=>integer][] not yet supported
+contains:map[text=>integer][] not yet supported
 
-> CREATE TYPE bigint_map AS MAP (key_type=text, value_type=bigint);
+> CREATE TYPE bigint_map AS MAP (KEY TYPE = text, VALUE TYPE = bigint);
 ! CREATE TABLE bigint_map_map_array_table (f1 bigint_map[]);
-bigint_map[] not yet supported
+contains:type "bigint_map[]" does not exist
+
+> SELECT array_fill(1, ARRAY[2], ARRAY[3]);
+[3:4]={1,1}
+
+# Test that table creation involving array typescorrectly describe their resolved_ids on restart.
+# This is asserted by testdrive during its catalog verification step after each DDL.
+
+> CREATE TABLE t1 (a int4[]);
+
+> CREATE TABLE t2 (a _int4);

@@ -17,22 +17,93 @@
 from dataclasses import dataclass
 from typing import Optional
 
-import dbt.exceptions
+import dbt_common.exceptions
 import psycopg2
-from dbt import flags
+from dbt_common.semver import versions_compatible
+
+from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.postgres import PostgresConnectionManager, PostgresCredentials
-from dbt.logger import GLOBAL_LOGGER as logger
+
+from .__version__ import version as __version__
+
+# If you bump this version, bump it in README.md too.
+SUPPORTED_MATERIALIZE_VERSIONS = ">=0.68.0"
+
+logger = AdapterLogger("Materialize")
+
+
+# Override the psycopg2 connect function in order to inject Materialize-specific
+# session parameter defaults.
+#
+# This approach is a bit hacky, but some of these session parameters *must* be
+# set as part of connection initiation, so we can't simply run `SET` commands
+# after the session is established.
+def connect(**kwargs):
+    options = [
+        # Ensure that dbt's catalog queries get routed to the
+        # `mz_catalog_server` cluster, even if the server or role's default is
+        # different.
+        "--auto_route_catalog_queries=on",
+        # dbt prints notices to stdout, which is very distracting because dbt
+        # can establish many new connections during `dbt run`.
+        "--welcome_message=off",
+        # Disable warnings about the session's default database or cluster not
+        # existing, as these get quite spammy, especially with multiple threads.
+        #
+        # Details: it's common for the default cluster for the role dbt is
+        # connecting as (often `quickstart`) to be absent. For many dbt
+        # deployments, clusters are explicitly specified on a model-by-model
+        # basis, and there in fact is no natural "default" cluster. So warning
+        # repeatedly that the default cluster doesn't exist isn't helpful, since
+        # each DDL statement will specify a different, valid cluster. If a DDL
+        # statement ever specifies an invalid cluster, dbt will still produce an
+        # error about the invalid cluster, even with this setting enabled.
+        "--current_object_missing_warnings=off",
+        *(kwargs.get("options") or []),
+    ]
+    kwargs["options"] = " ".join(options)
+
+    return _connect(**kwargs)
+
+
+_connect = psycopg2.connect
+psycopg2.connect = connect
 
 
 @dataclass
 class MaterializeCredentials(PostgresCredentials):
-    sslcert: Optional[str] = None
-    sslkey: Optional[str] = None
-    sslrootcert: Optional[str] = None
+    # NOTE(morsapaes) The cluster parameter defined in `profiles.yml` is not
+    # picked up in the connection string, but is picked up wherever we fall
+    # back to `target.cluster`. When no cluster is specified, either in
+    # `profiles.yml` or as a configuration, we should default to the default
+    # cluster configured for the connected dbt user (or, the active cluster for
+    # the connection). This is strictly better than hardcoding `quickstart` as
+    # the `target.cluster`, which might not exist and leads to all sorts of
+    # annoying errors. This will still fail if the defalt cluster for the
+    # connected user is invalid or set to `mz_catalog_server` (which cannot be
+    # modified).
+    cluster: Optional[str] = None
+    application_name: Optional[str] = f"dbt-materialize v{__version__}"
 
     @property
     def type(self):
         return "materialize"
+
+    def _connection_keys(self):
+        return (
+            "host",
+            "port",
+            "user",
+            "database",
+            "schema",
+            "cluster",
+            "sslmode",
+            "keepalives_idle",
+            "connect_timeout",
+            "search_path",
+            "retries",
+            "application_name",
+        )
 
 
 class MaterializeConnectionManager(PostgresConnectionManager):
@@ -40,92 +111,70 @@ class MaterializeConnectionManager(PostgresConnectionManager):
 
     @classmethod
     def open(cls, connection):
-        if connection.state == "open":
-            logger.debug("Connection is already open, skipping open.")
-            return connection
+        connection = super().open(connection)
 
-        credentials = cls.get_credentials(connection.credentials)
-        kwargs = {}
-        # we don't want to pass 0 along to connect() as postgres will try to
-        # call an invalid setsockopt() call (contrary to the docs).
-        if credentials.keepalives_idle:
-            kwargs["keepalives_idle"] = credentials.keepalives_idle
-
-        # psycopg2 doesn't support search_path officially,
-        # see https://github.com/psycopg/psycopg2/issues/465
-        search_path = credentials.search_path
-        if search_path is not None and search_path != "":
-            # see https://postgresql.org/docs/9.5/libpq-connect.html
-            kwargs["options"] = "-c search_path={}".format(
-                search_path.replace(" ", "\\ ")
-            )
-
-        if credentials.sslmode:
-            kwargs["sslmode"] = credentials.sslmode
-
-        if credentials.sslcert is not None:
-            kwargs["sslcert"] = credentials.sslcert
-
-        if credentials.sslkey is not None:
-            kwargs["sslkey"] = credentials.sslkey
-
-        if credentials.sslrootcert is not None:
-            kwargs["sslrootcert"] = credentials.sslrootcert
-
-        try:
-            handle = psycopg2.connect(
-                dbname=credentials.database,
-                user=credentials.user,
-                host=credentials.host,
-                password=credentials.password,
-                port=credentials.port,
-                connect_timeout=10,
-                **kwargs,
-            )
-
-            if credentials.role:
-                handle.cursor().execute("set role {}".format(credentials.role))
-
-            connection.handle = handle
-            connection.state = "open"
-        except psycopg2.Error as e:
-            logger.debug(
-                "Got an error when attempting to open a postgres "
-                "connection: '{}'".format(e)
-            )
-
-            connection.handle = None
-            connection.state = "fail"
-
-            raise dbt.exceptions.FailedToConnectException(str(e))
-
-        # Prevents psycopg connection from automatically opening transactions
+        # Prevents psycopg connection from automatically opening transactions.
         # More info: https://www.psycopg.org/docs/usage.html#transactions-control
         connection.handle.autocommit = True
-        return connection
 
-    def commit(self):
-        connection = self.get_thread_connection()
-        if flags.STRICT_MODE:
-            if not isinstance(connection, Connection):
-                raise dbt.exceptions.CompilerException(
-                    f"In commit, got {connection} - not a Connection!"
-                )
-
-        # Instead of throwing an error, quietly log if something tries to commit
-        # without an open transaction.
-        # This is needed because the dbt-adapter-tests commit after executing SQL,
-        # but Materialize can't handle all of the required transactions.
-        # https://github.com/fishtown-analytics/dbt/blob/42a85ac39f34b058678fd0c03ff8e8d2835d2808/test/integration/base.py#L681
-        if not connection.transaction_open:
-            logger.debug(
-                'Tried to commit without a transaction on connection "%s"',
-                connection.name,
+        mz_version = connection.handle.info.parameter_status(
+            "mz_version"
+        )  # e.g. v0.79.0-dev (937dfde5e)
+        mz_version = mz_version.split()[0]  # e.g. v0.79.0-dev
+        mz_version = mz_version[1:]  # e.g. 0.79.0-dev
+        if not versions_compatible(mz_version, SUPPORTED_MATERIALIZE_VERSIONS):
+            raise dbt_common.exceptions.DbtRuntimeError(
+                f"Detected unsupported Materialize version {mz_version}\n"
+                f"  Supported versions: {SUPPORTED_MATERIALIZE_VERSIONS}"
             )
 
-        logger.debug("On %s: COMMIT", connection.name)
-        self.add_commit_query()
-
-        connection.transaction_open = False
-
         return connection
+
+    def cancel(self, connection):
+        # The PostgreSQL implementation calls `pg_terminate_backend` from a new
+        # connection to terminate `connection`. At the time of writing,
+        # Materialize doesn't support `pg_terminate_backend`, so we implement
+        # cancellation by calling `close` on the connection.
+        #
+        # NOTE(benesch): I'm not entirely sure why the PostgreSQL implementation
+        # uses `pg_terminate_backend`. I suspect that disconnecting the network
+        # connection by calling `connection.handle.close()` is not immediately
+        # noticed by the PostgreSQL server, and so the queries running on that
+        # connection may continue executing to completion. Materialize, however,
+        # will quickly notice if the network socket disconnects and cancel any
+        # queries that were initiated by that connection.
+
+        connection_name = connection.name
+        try:
+            logger.debug("Closing connection '{}' to force cancellation")
+            connection.handle.close()
+        except psycopg2.InterfaceError as exc:
+            # if the connection is already closed, not much to cancel!
+            if "already closed" in str(exc):
+                logger.debug(f"Connection {connection_name} was already closed")
+                return
+            # probably bad, re-raise it
+            raise
+
+    # Disable transactions. Materialize transactions do not support arbitrary
+    # queries in transactions and therefore many of dbt's internal macros
+    # produce invalid transactions.
+    #
+    # Disabling transactions has precedent in dbt-snowflake and dbt-biquery.
+    # See, for example:
+    # https://github.com/dbt-labs/dbt-snowflake/blob/ffbb05391/dbt/adapters/snowflake/connections.py#L359-L374
+
+    def add_begin_query(self, *args, **kwargs):
+        pass
+
+    def add_commit_query(self, *args, **kwargs):
+        pass
+
+    def begin(self):
+        pass
+
+    def commit(self):
+        pass
+
+    def clear_transaction(self):
+        pass

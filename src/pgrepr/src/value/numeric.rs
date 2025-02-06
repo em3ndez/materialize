@@ -7,20 +7,18 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-#![allow(clippy::as_conversions)]
-
 use std::error::Error;
 use std::fmt;
+use std::sync::LazyLock;
 
 use byteorder::{NetworkEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 use dec::OrderedDecimal;
-use lazy_static::lazy_static;
+use mz_ore::cast::CastFrom;
+use mz_repr::adt::numeric::{self, cx_datum, Numeric as AdtNumeric, NumericAgg};
 use postgres_types::{to_sql_checked, FromSql, IsNull, ToSql, Type};
 
-use repr::adt::numeric::{self, cx_datum, Numeric as AdtNumeric, NumericAgg};
-
-/// (TO BE DEPRECATED) A wrapper for the `repr` crate's `Decimal` type that can be serialized to
+/// A wrapper for the `repr` crate's `Decimal` type that can be serialized to
 /// and deserialized from the PostgreSQL binary format.
 #[derive(Debug)]
 pub struct Numeric(pub OrderedDecimal<AdtNumeric>);
@@ -38,12 +36,12 @@ impl From<AdtNumeric> for Numeric {
 }
 
 /// `ToSql` and `FromSql` use base 10,000 units.
-const TO_FROM_SQL_BASE_POW: usize = 4;
+const TO_FROM_SQL_BASE_POW: u32 = 4;
 
-lazy_static! {
-    static ref TO_SQL_BASER: AdtNumeric = AdtNumeric::from(10u32.pow(TO_FROM_SQL_BASE_POW as u32));
-    static ref FROM_SQL_SCALER: AdtNumeric = AdtNumeric::from(TO_FROM_SQL_BASE_POW);
-}
+static TO_SQL_BASER: LazyLock<AdtNumeric> =
+    LazyLock::new(|| AdtNumeric::from(10u32.pow(TO_FROM_SQL_BASE_POW)));
+static FROM_SQL_SCALER: LazyLock<AdtNumeric> =
+    LazyLock::new(|| AdtNumeric::from(TO_FROM_SQL_BASE_POW));
 
 /// The maximum number of units necessary to represent a valid [`AdtNumeric`] value.
 const UNITS_LEN: usize = 11;
@@ -55,17 +53,18 @@ impl ToSql for Numeric {
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn Error + 'static + Send + Sync>> {
         let mut d = self.0 .0.clone();
-        let scale = u16::from(numeric::get_scale(&d));
+        let scale = u16::try_from(numeric::get_scale(&d))?;
+        let is_zero = d.is_zero();
         let is_nan = d.is_nan();
-        let is_neg = d.is_negative();
+        let is_neg = d.is_negative() && !is_zero;
         let is_infinite = d.is_infinite();
 
         let mut cx = numeric::cx_datum();
         // Need to extend exponents slightly because fractional components need
         // to be aligned to base 10,000.
-        cx.set_max_exponent(cx.max_exponent() + TO_FROM_SQL_BASE_POW as isize)
+        cx.set_max_exponent(cx.max_exponent() + isize::cast_from(i64::from(TO_FROM_SQL_BASE_POW)))
             .unwrap();
-        cx.set_min_exponent(cx.min_exponent() - TO_FROM_SQL_BASE_POW as isize)
+        cx.set_min_exponent(cx.min_exponent() - isize::cast_from(i64::from(TO_FROM_SQL_BASE_POW)))
             .unwrap();
         cx.abs(&mut d);
 
@@ -77,21 +76,26 @@ impl ToSql for Numeric {
             // You have leading zeroes in the case where:
             // - The exponent's absolute value exceeds the number of digits
             // - `d` only contains fractional zeroes
-            let leading_zero_units = if pos_exp >= d.digits() as usize {
+            let leading_zero_units = if pos_exp >= usize::cast_from(d.digits()) {
                 // If the value is zero, one zero digit gets double counted
                 // (this is also why the above inequality is not strict)
-                let digits = if d.is_zero() { 0 } else { d.digits() as usize };
+                let digits = if d.is_zero() {
+                    0
+                } else {
+                    usize::cast_from(d.digits())
+                };
                 // integer division with rounding up instead of down
-                (pos_exp - digits + TO_FROM_SQL_BASE_POW - 1) / TO_FROM_SQL_BASE_POW
+                (pos_exp - digits + usize::cast_from(TO_FROM_SQL_BASE_POW) - 1)
+                    / usize::cast_from(TO_FROM_SQL_BASE_POW)
             } else {
                 0
             };
 
             // Ensure most significant fractional digit in ten's place of base
             // 10,000 value.
-            let s = pos_exp % TO_FROM_SQL_BASE_POW;
+            let s = pos_exp % usize::cast_from(TO_FROM_SQL_BASE_POW);
             let unit_shift_exp = if s != 0 {
-                pos_exp + TO_FROM_SQL_BASE_POW - s
+                pos_exp + usize::cast_from(TO_FROM_SQL_BASE_POW) - s
             } else {
                 pos_exp
             };
@@ -101,7 +105,8 @@ impl ToSql for Numeric {
             cx.scaleb(&mut d, &AdtNumeric::from(unit_shift_exp));
 
             (
-                u16::try_from(unit_shift_exp / TO_FROM_SQL_BASE_POW).expect("value < 40"),
+                u16::try_from(unit_shift_exp / usize::cast_from(TO_FROM_SQL_BASE_POW))
+                    .expect("value < 40"),
                 leading_zero_units,
             )
         } else {
@@ -122,7 +127,11 @@ impl ToSql for Numeric {
         d_i -= leading_zero_units;
 
         let units = u16::try_from(UNITS_LEN - d_i).unwrap();
-        let weight = i16::try_from(units - fract_units).unwrap() - 1;
+        let weight = if is_zero {
+            0
+        } else {
+            i16::try_from(units - fract_units).unwrap() - 1
+        };
 
         out.put_u16(units);
         out.put_i16(weight);
@@ -159,7 +168,7 @@ impl ToSql for Numeric {
 
 impl<'a> FromSql<'a> for Numeric {
     fn from_sql(_: &Type, mut raw: &'a [u8]) -> Result<Numeric, Box<dyn Error + Sync + Send>> {
-        let units = usize::from(raw.read_u16::<NetworkEndian>()?);
+        let units = raw.read_i16::<NetworkEndian>()?;
         let weight = raw.read_i16::<NetworkEndian>()?;
         let sign = raw.read_u16::<NetworkEndian>()?;
         let in_scale = raw.read_i16::<NetworkEndian>()?;
@@ -173,7 +182,10 @@ impl<'a> FromSql<'a> for Numeric {
         let mut cx = numeric::cx_agg();
         let mut d = NumericAgg::zero();
 
-        for digit in digits[..units].iter() {
+        let units_usize =
+            usize::try_from(units).map_err(|_| "units must not be negative: {units}")?;
+
+        for digit in digits[..units_usize].iter() {
             cx.scaleb(&mut d, &FROM_SQL_SCALER);
             let n = AdtNumeric::from(u32::from(*digit));
             cx.add(&mut d, &n);
@@ -197,7 +209,7 @@ impl<'a> FromSql<'a> for Numeric {
             _ => return Err("bad sign in numeric".into()),
         }
 
-        let mut scale = (units as i16 - weight - 1) * 4;
+        let mut scale = (units - weight - 1) * 4;
 
         // Adjust scales
         if scale < 0 {
@@ -229,7 +241,8 @@ impl<'a> FromSql<'a> for Numeric {
     }
 }
 
-#[test]
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `decContextDefault` on OS `linux`
 fn test_to_from_sql_roundtrip() {
     fn inner(s: &str) {
         let mut cx = numeric::cx_datum();
@@ -273,7 +286,7 @@ fn test_to_from_sql_roundtrip() {
 
     // Test infinity, which is a valid value in aggregations over numeric
     let mut cx = numeric::cx_datum();
-    let v = vec![
+    let v = [
         cx.parse("-999999999999999999999999999999999999999")
             .unwrap(),
         cx.parse("-999999999999999999999999999999999999999")

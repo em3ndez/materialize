@@ -1,15 +1,23 @@
 [package]
-name = "metabase-smoketest"
+name = "mz-metabase-smoketest"
 description = "A simple smoke test for Metabase and Materialize."
 version = "0.0.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
-anyhow = "1.0.52"
-itertools = "0.10.3"
-log = "0.4.13"
-metabase = { path = "../../../src/metabase" }
-ore = { path = "../../../src/ore" }
-tokio = "1.15.0"
-tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
+anyhow = "1.0.66"
+itertools = "0.12.1"
+mz-metabase = { path = "../../../src/metabase" }
+mz-ore = { path = "../../../src/ore", features = ["network", "async", "test"] }
+tokio = { version = "1.38.0", features = ["macros"] }
+tokio-postgres = { version = "0.7.8" }
+tracing = "0.1.37"
+workspace-hack = { version = "0.0.0", path = "../../../src/workspace-hack" }
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["workspace-hack"]

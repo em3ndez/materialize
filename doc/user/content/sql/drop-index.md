@@ -3,98 +3,69 @@ title: "DROP INDEX"
 description: "DROP INDEX removes an index"
 menu:
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
 
-`DROP INDEX` removes an index from a materialized view. (Non-materialized views do not have any indexes.)
+`DROP INDEX` removes an index from Materialize.
 
 ## Syntax
 
-{{< diagram "drop-index.svg" >}}
+```mzsql
+DROP INDEX [IF EXISTS] <index_name> [ 'CASCADE' | 'RESTRICT' ];
+```
 
-Field | Use
+Option | Description
 ------|-----
-**IF EXISTS** | Do not return an error if the named index doesn't exist.
-_index&lowbar;name_ | The name of the index you want to remove.
+**IF EXISTS** | Do not return an error if the specified index does not exist.
 **CASCADE** | Remove the index and its dependent objects.
 **RESTRICT** |  Remove the index. _(Default.)_
 
-**Note:** Since indexes cannot currently have dependent objects, `DROP INDEX`, `DROP INDEX RESTRICT`, and `DROP INDEX CASCADE` all do the same thing.
+{{< note >}}
 
-## Details
+Since indexes do not have dependent objects, `DROP INDEX`, `DROP INDEX
+RESTRICT`, and `DROP INDEX CASCADE` are equivalent.
 
-### Indexes and materialized views
+{{< /note >}}
 
-### Primary indexes
+## Privileges
 
-By default, materialized views only have one index, which we call the "primary
-index", and which stores the result set of the materialized view's embedded `SELECT`
-statement. You can identify the primary index by its name, which follows the
-format `<view name>_primary_idx`.
+To execute the `DROP INDEX` statement, you need:
 
-This primary index doesn't follow the constraints for typical for primary indexes in traditional databases; it is simply the first index created on a view. Please keep in mind the following constraints:
-
-* If you remove the primary index, you will not be able to query any columns that are not included in another index for the view.
-* If the primary index is the **only** index on the view, you will not be able to query any columns at all and the materialized view will become a non-materialized view. For more details on non-materialized views, see [`CREATE
-VIEW`](../create-view).
-
-If you remove the primary index and want to recreate it:
-
-1. Retrieve the view's embedded `SELECT` statement with [`SHOW CREATE
-   VIEW`](../show-create-view).
-1. Re-create the view as a materialized view with [`CREATE OR REPLACE
-   MATERIALIZED VIEW`](../create-materialized-view).
-
-Alternatively, you can also [`CREATE INDEX`](../create-index) to materialize any
-view.
+- Ownership of the dropped index.
+- `USAGE` privileges on the containing schema.
 
 ## Examples
 
 ### Remove an index
 
-```sql
-SHOW VIEWS;
-```
-```nofmt
-+-----------------------------------+
-| VIEWS                             |
-|-----------------------------------|
-| ...                               |
-| q01                               |
-+-----------------------------------+
-```
-```sql
-SHOW INDEXES FROM q01;
-```
-```nofmt
-+------------------------+--------------------------------+-----
-| View                   | Key_name                       | ...
-|------------------------+--------------------------------+----
-| materialize.public.q01 | materialize.public.q01_geo_idx | ...
-+------------------------+--------------------------------+-----
+{{< tip >}}
+
+In the **Materialize Console**, you can view existing indexes in the [**Database
+object explorer**](/console/data/). Alternatively, you can use the
+[`SHOW INDEXES`](/sql/show-indexes) command.
+
+{{< /tip >}}
+
+Using the  `DROP INDEX` commands, the following example drops an index named `q01_geo_idx`.
+
+```mzsql
+DROP INDEX q01_geo_idx;
 ```
 
-You can use the unqualified index name (`q01_geo_idx`) rather the fully qualified name (`materialize.public.q01_geo_idx`).
+If the index `q01_geo_idx` does not exist, the above operation returns an error.
 
-You can remove an index with any of the following commands:
+### Remove an index without erroring if the index does not exist
 
-- ```sql
-  DROP INDEX q01_geo_idx;
-  ```
-- ```sql
-  DROP INDEX q01_geo_idx RESTRICT;
-  ```
-- ```sql
-  DROP INDEX q01_geo_idx CASCADE;
-  ```
+You can specify the `IF EXISTS` option so that the `DROP INDEX` command does
+not return an error if the index to drop does not exist.
 
-### Do not issue an error if attempting to remove a nonexistent index
-
-```sql
+```mzsql
 DROP INDEX IF EXISTS q01_geo_idx;
 ```
 
 ## Related pages
 
-- [`SHOW VIEWS`](../show-views)
-- [`SHOW INDEXES`](../show-indexes)
+- [`CREATE INDEX`](/sql/create-index)
+- [`SHOW VIEWS`](/sql/show-views)
+- [`SHOW INDEXES`](/sql/show-indexes)
+- [`DROP OWNED`](/sql/drop-owned)

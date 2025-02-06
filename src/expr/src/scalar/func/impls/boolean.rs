@@ -7,19 +7,23 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use repr::strconv;
+use mz_repr::strconv;
 
 sqlfunc!(
-    #[sqlname = "!"]
+    #[sqlname = "NOT"]
     #[preserves_uniqueness = true]
+    #[inverse = to_unary!(Not)]
+    #[is_monotone = true]
     fn not(a: bool) -> bool {
         !a
     }
 );
 
 sqlfunc!(
-    #[sqlname = "booltostr"]
+    #[sqlname = "boolean_to_text"]
     #[preserves_uniqueness = true]
+    #[inverse = to_unary!(super::CastStringToBool)]
+    #[is_monotone = true]
     fn cast_bool_to_string<'a>(a: bool) -> &'a str {
         match a {
             true => "true",
@@ -29,10 +33,12 @@ sqlfunc!(
 );
 
 sqlfunc!(
-    #[sqlname = "booltostrns"]
+    #[sqlname = "boolean_to_nonstandard_text"]
     #[preserves_uniqueness = true]
+    #[inverse = to_unary!(super::CastStringToBool)]
+    #[is_monotone = true]
     fn cast_bool_to_string_nonstandard<'a>(a: bool) -> &'a str {
-        // N.B. this function differs from `cast_bool_to_string_implicit` because
+        // N.B. this function differs from `cast_bool_to_string` because
         // the SQL specification requires `true` and `false` to be spelled out in
         // explicit casts, while PostgreSQL prefers its more concise `t` and `f`
         // representation in some contexts, for historical reasons.
@@ -41,9 +47,24 @@ sqlfunc!(
 );
 
 sqlfunc!(
-    #[sqlname = "booltoi32"]
+    #[sqlname = "boolean_to_integer"]
     #[preserves_uniqueness = true]
+    #[inverse = to_unary!(super::CastInt32ToBool)]
+    #[is_monotone = true]
     fn cast_bool_to_int32(a: bool) -> i32 {
+        match a {
+            true => 1,
+            false => 0,
+        }
+    }
+);
+
+sqlfunc!(
+    #[sqlname = "boolean_to_bigint"]
+    #[preserves_uniqueness = true]
+    #[inverse = to_unary!(super::CastInt64ToBool)]
+    #[is_monotone = true]
+    fn cast_bool_to_int64(a: bool) -> i64 {
         match a {
             true => 1,
             false => 0,

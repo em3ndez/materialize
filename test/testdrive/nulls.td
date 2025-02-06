@@ -7,43 +7,40 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 $ set foo-schema={
+    "name": "row",
     "type": "record",
-    "name": "envelope",
     "fields": [
-      {
-        "name": "before",
-        "type": [
-          {
-            "name": "row",
-            "type": "record",
-            "fields": [
-              {"name": "a", "type": ["null", "long"]}
-            ]
-          },
-          "null"
-        ]
-      },
-      { "name": "after", "type": ["row", "null"] }
+      {"name": "a", "type": ["null", "long"]}
     ]
   }
 
 $ kafka-create-topic topic=foo
 
 $ kafka-ingest format=avro topic=foo schema=${foo-schema} timestamp=1
-{"before": null, "after": {"row":{"a": {"long": 1}}}}
-{"before": null, "after": {"row":{"a": {"long": 2}}}}
-{"before": null, "after": {"row":{"a": null}}}
+{"a": {"long": 1}}
+{"a": {"long": 2}}
+{"a": null}
 
-$ kafka-ingest format=avro topic=foo schema=${foo-schema} timestamp=2
-{"before": null, "after": null}
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE SOURCE foo
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-foo-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${foo-schema}' ENVELOPE DEBEZIUM
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-foo-${testdrive.seed}')
+
+> CREATE TABLE foo_tbl FROM SOURCE foo (REFERENCE "testdrive-foo-${testdrive.seed}")
+  FORMAT AVRO USING SCHEMA '${foo-schema}'
+
+> SELECT * FROM foo_tbl;
+1
+2
+<null>
 
 > CREATE MATERIALIZED VIEW test1 AS
-  SELECT * FROM foo JOIN foo as foo2 USING (a);
+  SELECT * FROM foo_tbl JOIN foo_tbl as foo2 USING (a);
 
 > SELECT * FROM test1;
 a
@@ -59,11 +56,14 @@ $ kafka-ingest format=bytes key-format=bytes key-terminator=: topic=nullpayload 
 :
 :así
 
-> CREATE MATERIALIZED SOURCE nullpayload (col)
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-nullpayload-${testdrive.seed}'
+> CREATE SOURCE nullpayload
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-nullpayload-${testdrive.seed}')
+
+> CREATE TABLE nullpayload_tbl (col) FROM SOURCE nullpayload (REFERENCE "testdrive-nullpayload-${testdrive.seed}")
   FORMAT BYTES
 
-> SELECT col from nullpayload
+> SELECT col from nullpayload_tbl
 col
 ---
 "S\\xc3\\xa9"

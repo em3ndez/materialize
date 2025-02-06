@@ -3,10 +3,8 @@ title: "DEALLOCATE"
 description: "`DEALLOCATE` clears a prepared statement."
 menu:
   main:
-    parent: "sql"
+    parent: "commands"
 ---
-
-{{< version-added v0.9.7 />}}
 
 `DEALLOCATE` clears [prepared statements](../prepare) that have been created during the current session. Even without an explicit `DEALLOCATE` command, all prepared statements will be cleared at the end of a session.
 
@@ -22,7 +20,7 @@ Field | Use
 
 ## Example
 
-```sql
+```mzsql
 DEALLOCATE a;
 ```
 

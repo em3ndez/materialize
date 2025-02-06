@@ -1,12 +1,14 @@
 ---
-title: "Aggregate Function Filters"
+title: "Aggregate function filters"
 description: "Use FILTER to specify which rows are sent to an aggregate function"
 menu:
   main:
     parent: 'sql-functions'
 ---
 
-You can use a `FILTER` clause on an aggregate function to specify which rows are sent to an [aggregate function](../#aggregate-func). Rows for which the `filter_clause` evaluates to false are discarded.
+You can use a `FILTER` clause on an aggregate function to specify which rows are sent to an [aggregate function](/sql/functions/#aggregate-functions). Rows for which the `filter_clause` evaluates to true contribute to the aggregation.
+
+Temporal filters cannot be used in aggregate function filters.
 
 ## Syntax
 
@@ -14,9 +16,10 @@ You can use a `FILTER` clause on an aggregate function to specify which rows are
 
 ## Examples
 
-```sql
+```mzsql
 SELECT
     COUNT(*) AS unfiltered,
-    COUNT(*) FILTER (WHERE i < 5) AS filtered
+    -- The FILTER guards the evaluation which might otherwise error.
+    COUNT(1 / (5 - i)) FILTER (WHERE i < 5) AS filtered
 FROM generate_series(1,10) AS s(i)
 ```

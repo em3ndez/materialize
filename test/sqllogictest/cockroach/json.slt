@@ -19,6 +19,11 @@
 
 mode cockroach
 
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_table_keys = true
+----
+COMPLETE 0
+
 ## Basic creation
 
 query TT
@@ -189,7 +194,7 @@ SELECT bar FROM foo WHERE bar ?| ARRAY['a',null]
 ----
 {"a":"b"}
 
-# TODO(justin):#29355
+# TODO(justin):cockroach#29355
 # query T
 # SELECT bar FROM foo WHERE bar ?| ARRAY[null,null]::STRING[]
 # ----
@@ -711,7 +716,7 @@ SELECT '{"b":[],"c":{"a":"b"}}'::JSONB - array['a'];
 ----
 {"b":[],"c":{"a":"b"}}
 
-# Regression test for #34756.
+# Regression test for cockroach#34756.
 query T
 SELECT '{"b":[],"c":{"a":"b"}}'::JSONB - array['foo',NULL]
 ----

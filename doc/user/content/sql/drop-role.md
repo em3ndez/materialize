@@ -1,14 +1,12 @@
 ---
 title: "DROP ROLE"
-description: "`DROP ROLE` removes a role from your Materialize instance."
+description: "`DROP ROLE` removes a role from Materialize."
 menu:
   main:
-    parent: sql
+    parent: commands
 ---
 
-{{< version-added v0.7.0 />}}
-
-`DROP ROLE` removes a role from your Materialize instance.
+`DROP ROLE` removes a role from Materialize.
 
 ## Syntax
 
@@ -17,14 +15,25 @@ menu:
 Field | Use
 ------|-----
 **IF EXISTS** | Do not return an error if the specified role does not exist.
-_role_name_ | The role you want to drop. For available roles, see [`mz_roles`](../system-catalog#mz_roles).
+_role_name_ | The role you want to drop. For available roles, see [`mz_roles`](/sql/system-catalog/mz_catalog#mz_roles).
 
 ## Details
 
 You cannot drop the current role.
 
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `CREATEROLE` privileges on the system.
+
 ## Related pages
 
+- [ALTER ROLE](../alter-role)
 - [CREATE ROLE](../create-role)
-- [CREATE USER](../create-user)
 - [DROP USER](../drop-user)
+- [GRANT ROLE](../grant-role)
+- [REVOKE ROLE](../revoke-role)
+- [ALTER OWNER](../alter-owner)
+- [GRANT PRIVILEGE](../grant-privilege)
+- [REVOKE PRIVILEGE](../revoke-privilege)

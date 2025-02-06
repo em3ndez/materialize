@@ -7,22 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Canonicalizes MFPs and performs common sub-expression elimination.
+//! Canonicalizes MFPs, e.g., performs CSE on the scalar expressions, eliminates identity MFPs.
+//!
+//! Also calls `canonicalize_predicates` through `fusion::filter`.
 //!
 //! This transform takes a sequence of Maps, Filters, and Projects and
 //! canonicalizes it to a sequence like this:
-//! | Filter
 //! | Map
 //! | Filter
 //! | Project
-//! The filters before the map are those that can be
-//! pushed down through a map according the rules of
-//! [crate::projection_pushdown::ProjectionPushdown.push_filters_through_map()].
-//! TODO: It would be nice to canonicalize it to just an MFP, but currently
-//! putting a filter after instead of before a Map can result in the loss of
-//! nullability information.
 //!
-//! After canonicalizing, this transform looks at the Map-Filter-Project
+//! As part of canonicalizing, this transform looks at the Map-Filter-Project
 //! subsequence and identifies common `ScalarExpr` expressions across and within
 //! expressions that are arguments to the Map-Filter-Project. It reforms the
 //! `Map-Filter-Project` subsequence to build each distinct expression at most
@@ -33,66 +28,69 @@
 //! busywork and less efficiency, but the wins can be substantial when
 //! expressions re-use complex subexpressions.
 
-use crate::TransformArgs;
-use expr::canonicalize::canonicalize_predicates;
-use expr::MirRelationExpr;
+use mz_expr::visit::VisitChildren;
+use mz_expr::{MapFilterProject, MirRelationExpr};
+
+use crate::TransformCtx;
 
 /// Canonicalizes MFPs and performs common sub-expression elimination.
 #[derive(Debug)]
 pub struct CanonicalizeMfp;
 
 impl crate::Transform for CanonicalizeMfp {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "CanonicalizeMfp"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "canonicalize_mfp")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        self.action(relation)
+        let result = self.action(relation);
+        mz_repr::explain::trace_plan(&*relation);
+        result
     }
 }
 
 impl CanonicalizeMfp {
-    fn action(&self, relation: &mut MirRelationExpr) -> Result<(), crate::TransformError> {
-        let mut mfp = expr::MapFilterProject::extract_non_errors_from_expr_mut(relation);
-        relation.try_visit_mut_children(|e| self.action(e))?;
+    /// Extract and optimize MFPs.
+    pub fn action(&self, relation: &mut MirRelationExpr) -> Result<(), crate::TransformError> {
+        let mut mfp = MapFilterProject::extract_non_errors_from_expr_mut(relation);
+        // Optimize MFP, e.g., perform CSE Push MFPs through `Negate` operators,
+        // if encountered. This is a first steps toward a `CanonicalizeLinear`,
+        // which puts linear operators in a canonical representation.
         mfp.optimize();
-        if !mfp.is_identity() {
-            let (map, mut filter, project) = mfp.as_map_filter_project();
-            if !filter.is_empty() {
-                // Push down the predicates that can be pushed down, removing
-                // them from the mfp object to be optimized.
-                let mut relation_type = relation.typ();
-                for expr in map.iter() {
-                    relation_type.column_types.push(expr.typ(&relation_type));
-                }
-                canonicalize_predicates(&mut filter, &relation_type);
-                let all_errors = filter.iter().all(|p| p.is_literal_err());
-                let (retained, pushdown) = crate::predicate_pushdown::PredicatePushdown::default()
-                    .push_filters_through_map(&map, &mut filter, mfp.input_arity, all_errors);
-                if !pushdown.is_empty() {
-                    *relation = relation.take_dangerous().filter(pushdown);
-                }
-                mfp = expr::MapFilterProject::new(mfp.input_arity)
-                    .map(map)
-                    .filter(retained)
-                    .project(project);
-            }
-            mfp.optimize();
-            if !mfp.is_identity() {
-                let (map, filter, project) = mfp.as_map_filter_project();
-                let total_arity = mfp.input_arity + map.len();
-                if !map.is_empty() {
-                    *relation = relation.take_dangerous().map(map);
-                }
-                if !filter.is_empty() {
-                    *relation = relation.take_dangerous().filter(filter);
-                }
-                if project.len() != total_arity || !project.iter().enumerate().all(|(i, o)| i == *o)
-                {
-                    *relation = relation.take_dangerous().project(project);
-                }
-            }
+        if let MirRelationExpr::Negate { input } = relation {
+            Self::rebuild_mfp(mfp, &mut **input);
+            relation.try_visit_mut_children(|e| self.action(e))?;
+        } else {
+            relation.try_visit_mut_children(|e| self.action(e))?;
+            Self::rebuild_mfp(mfp, relation);
         }
         Ok(())
+    }
+
+    /// Canonicalize the MapFilterProject to Map-Filter-Project, in that order.
+    pub fn rebuild_mfp(mfp: MapFilterProject, relation: &mut MirRelationExpr) {
+        if !mfp.is_identity() {
+            let (map, filter, project) = mfp.as_map_filter_project();
+            let total_arity = mfp.input_arity + map.len();
+            if !map.is_empty() {
+                *relation = relation.take_dangerous().map(map);
+            }
+            if !filter.is_empty() {
+                *relation = relation.take_dangerous().filter(filter);
+                crate::fusion::filter::Filter::action(relation);
+            }
+            if project.len() != total_arity || !project.iter().enumerate().all(|(i, o)| i == *o) {
+                *relation = relation.take_dangerous().project(project);
+            }
+        }
     }
 }

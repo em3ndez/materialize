@@ -25,35 +25,34 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use digest::Digest;
 use itertools::Itertools;
-use log::{debug, warn};
+use mz_ore::assert_none;
 use regex::Regex;
-use serde::{
-    ser::{SerializeMap, SerializeSeq},
-    Serialize, Serializer,
-};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use serde_json::{self, Map, Value};
-use types::{DecimalValue, Value as AvroValue};
+use tracing::{debug, warn};
 
+use crate::decode::build_ts_value;
 use crate::error::Error as AvroError;
 use crate::reader::SchemaResolver;
-use crate::types;
-use crate::types::AvroMap;
-use crate::util::MapHelper;
+use crate::types::{self, DecimalValue, Value as AvroValue};
+use crate::util::{MapHelper, TsUnit};
 
 pub fn resolve_schemas(
     writer_schema: &Schema,
     reader_schema: &Schema,
 ) -> Result<Schema, AvroError> {
     let r_indices = reader_schema.indices.clone();
-    let (reader_to_writer_names, writer_to_reader_names): (HashMap<_, _>, HashMap<_, _>) =
+    let (reader_to_writer_names, writer_to_reader_names): (BTreeMap<_, _>, BTreeMap<_, _>) =
         writer_schema
             .indices
             .iter()
@@ -67,10 +66,12 @@ pub fn resolve_schemas(
         .indices
         .iter()
         .map(|(f, i)| (*i, f))
-        .collect::<HashMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
     let mut resolver = SchemaResolver {
         named: Default::default(),
         indices: Default::default(),
+        human_readable_field_path: Vec::new(),
+        current_human_readable_path_start: 0,
         writer_to_reader_names,
         reader_to_writer_names,
         reader_to_resolved_names: Default::default(),
@@ -140,7 +141,7 @@ impl SchemaPieceOrNamed {
     pub fn get_human_name(&self, root: &Schema) -> String {
         match self {
             Self::Piece(piece) => format!("{:?}", piece),
-            Self::Named(idx) => format!("{}", root.lookup(*idx).name),
+            Self::Named(idx) => format!("{:?}", root.lookup(*idx).name),
         }
     }
     #[inline(always)]
@@ -242,7 +243,7 @@ pub enum SchemaPiece {
     /// A value written as `float` and read as `double`
     ResolveFloatDouble,
     /// A concrete (i.e., non-`union`) type in the writer,
-    /// resolved against one specific variant of a `union` in the writer.
+    /// resolved against one specific variant of a `union` in the reader.
     ResolveConcreteUnion {
         /// The index of the variant in the reader
         index: usize,
@@ -275,7 +276,7 @@ pub enum SchemaPiece {
     Record {
         doc: Documentation,
         fields: Vec<RecordField>,
-        lookup: HashMap<String, usize>,
+        lookup: BTreeMap<String, usize>,
     },
     /// An `enum` Avro schema.
     Enum {
@@ -318,14 +319,32 @@ pub enum SchemaPiece {
 impl SchemaPiece {
     /// Returns whether the schema node is "underlyingly" an Int (but possibly a logicalType typedef)
     pub fn is_underlying_int(&self) -> bool {
-        matches!(self, SchemaPiece::Int | SchemaPiece::Date)
+        self.try_make_int_value(0).is_some()
     }
     /// Returns whether the schema node is "underlyingly" an Int64 (but possibly a logicalType typedef)
     pub fn is_underlying_long(&self) -> bool {
-        matches!(
-            self,
-            SchemaPiece::Long | SchemaPiece::TimestampMilli | SchemaPiece::TimestampMicro
-        )
+        self.try_make_long_value(0).is_some()
+    }
+    /// Constructs an `avro::Value` if this is of underlying int type.
+    /// Guaranteed to be `Some` when `is_underlying_int` is `true`.
+    pub fn try_make_int_value(&self, int: i32) -> Option<Result<AvroValue, AvroError>> {
+        match self {
+            SchemaPiece::Int => Some(Ok(AvroValue::Int(int))),
+            // TODO[btv] - should we bounds-check the date here? We
+            // don't elsewhere... maybe we should everywhere.
+            SchemaPiece::Date => Some(Ok(AvroValue::Date(int))),
+            _ => None,
+        }
+    }
+    /// Constructs an `avro::Value` if this is of underlying long type.
+    /// Guaranteed to be `Some` when `is_underlying_long` is `true`.
+    pub fn try_make_long_value(&self, long: i64) -> Option<Result<AvroValue, AvroError>> {
+        match self {
+            SchemaPiece::Long => Some(Ok(AvroValue::Long(long))),
+            SchemaPiece::TimestampMilli => Some(build_ts_value(long, TsUnit::Millis)),
+            SchemaPiece::TimestampMicro => Some(build_ts_value(long, TsUnit::Micros)),
+            _ => None,
+        }
     }
 }
 
@@ -335,7 +354,7 @@ impl SchemaPiece {
 #[derive(Clone, PartialEq)]
 pub struct Schema {
     pub(crate) named: Vec<NamedSchemaPiece>,
-    pub(crate) indices: HashMap<FullName, usize>,
+    pub(crate) indices: BTreeMap<FullName, usize>,
     pub top: SchemaPieceOrNamed,
 }
 
@@ -392,7 +411,7 @@ impl Schema {
 /// function that maps from `Discriminant<Schema> -> Discriminant<Value>`. Conversion into this
 /// intermediate type should be especially fast, as the number of enum variants is small, which
 /// _should_ compile into a jump-table for the conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SchemaKind {
     // Fixed-length types
     Null,
@@ -516,13 +535,14 @@ pub struct Name {
     pub aliases: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FullName {
     name: String,
     namespace: String,
 }
 
 impl FullName {
+    // [XXX] btv - what happens if `name` contains dots, _and_ `namespace` is `Some` ?
     pub fn from_parts(name: &str, namespace: Option<&str>, default_namespace: &str) -> FullName {
         if let Some(ns) = namespace {
             FullName {
@@ -543,9 +563,30 @@ impl FullName {
     pub fn base_name(&self) -> &str {
         &self.name
     }
+    pub fn human_name(&self) -> String {
+        if self.namespace.is_empty() {
+            return self.name.clone();
+        }
+        format!("{}.{}", self.namespace, self.name)
+    }
+    /// Get the shortest unambiguous synonym of this name
+    /// at a given point in the schema graph. If this name
+    /// is in the same namespace as the enclosing node, this
+    /// returns the short name; otherwise, it returns the fully qualified name.
+    pub fn short_name(&self, enclosing_ns: &str) -> Cow<'_, str> {
+        if enclosing_ns == &self.namespace {
+            Cow::Borrowed(&self.name)
+        } else {
+            Cow::Owned(format!("{}.{}", self.namespace, self.name))
+        }
+    }
+    /// Returns the namespace of the name
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
 }
 
-impl fmt::Display for FullName {
+impl fmt::Debug for FullName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.namespace, self.name)
     }
@@ -555,18 +596,61 @@ impl fmt::Display for FullName {
 pub type Documentation = Option<String>;
 
 impl Name {
-    /// Create a new `Name`.
-    /// No `namespace` nor `aliases` will be defined.
-    pub fn new(name: &str) -> Name {
-        Name {
-            name: name.to_owned(),
-            namespace: None,
-            aliases: None,
+    /// Reports whether the given string is a valid Avro name.
+    ///
+    /// See: <https://avro.apache.org/docs/1.11.1/specification/#names>
+    pub fn is_valid(name: &str) -> bool {
+        static MATCHER: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(^[A-Za-z_][A-Za-z0-9_]*)$").unwrap());
+        MATCHER.is_match(name)
+    }
+
+    /// Returns an error if the given name is invalid.
+    pub fn validate(name: &str) -> Result<(), AvroError> {
+        match Self::is_valid(name) {
+            true => Ok(()),
+            false => {
+                Err(ParseSchemaError::new(format!(
+                    "Invalid name. Must start with [A-Za-z_] and subsequently only contain [A-Za-z0-9_]. Found: {}",
+                    name
+                )).into())
+            }
         }
     }
 
-    /// Parse a `serde_json::Value` into a `Name`.
-    fn parse(complex: &Map<String, Value>) -> Result<Self, AvroError> {
+    /// Rewrites `name` to be valid.
+    ///
+    /// Any non alphanumeric characters are replaced with underscores. If the
+    /// name begins with a number, it is prefixed with `_`.
+    ///
+    /// `make_valid` is not injective. Multiple invalid names are mapped to the
+    /// the same valid name.
+    pub fn make_valid(name: &str) -> String {
+        let mut out = String::new();
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(ch @ ('a'..='z' | 'A'..='Z')) => out.push(ch),
+            Some(ch @ '0'..='9') => {
+                out.push('_');
+                out.push(ch);
+            }
+            _ => out.push('_'),
+        }
+        for ch in chars {
+            match ch {
+                '0'..='9' | 'a'..='z' | 'A'..='Z' => out.push(ch),
+                _ => out.push('_'),
+            }
+        }
+        debug_assert!(
+            Name::is_valid(&out),
+            "make_valid({name}) produced invalid name: {out}"
+        );
+        out
+    }
+
+    /// Parse a `serde_json::map::Map` into a `Name`.
+    pub fn parse(complex: &Map<String, Value>) -> Result<Self, AvroError> {
         let name = complex
             .name()
             .ok_or_else(|| ParseSchemaError::new("No `name` field"))?;
@@ -594,16 +678,7 @@ impl Name {
             (complex.string("namespace"), name)
         };
 
-        if !Regex::new(r"(^[A-Za-z_][A-Za-z0-9_]*)$")
-            .unwrap()
-            .is_match(&name)
-        {
-            return Err(ParseSchemaError::new(format!(
-                "Invalid name. Must start with [A-Za-z_] and subsequently only contain [A-Za-z0-9_]. Found: {}",
-                name
-            ))
-                .into());
-        }
+        Self::validate(&name)?;
 
         let aliases: Option<Vec<String>> = complex
             .get("aliases")
@@ -621,6 +696,13 @@ impl Name {
             namespace,
             aliases,
         })
+    }
+
+    /// Parses a name from a simple string.
+    pub fn parse_simple(name: &str) -> Result<Self, AvroError> {
+        let mut map = serde_json::map::Map::new();
+        map.insert("name".into(), serde_json::Value::String(name.into()));
+        Self::parse(&map)
     }
 
     /// Return the `fullname` of this `Name`
@@ -684,16 +766,16 @@ pub struct UnionSchema {
 
     // Used to ensure uniqueness of anonymous schema inputs, and provide constant time finding of the
     // schema index given a value.
-    anon_variant_index: HashMap<SchemaKind, usize>,
+    anon_variant_index: BTreeMap<SchemaKind, usize>,
 
     // Same as above, for named input references
-    named_variant_index: HashMap<usize, usize>,
+    named_variant_index: BTreeMap<usize, usize>,
 }
 
 impl UnionSchema {
     pub(crate) fn new(schemas: Vec<SchemaPieceOrNamed>) -> Result<Self, AvroError> {
-        let mut avindex = HashMap::new();
-        let mut nvindex = HashMap::new();
+        let mut avindex = BTreeMap::new();
+        let mut nvindex = BTreeMap::new();
         for (i, schema) in schemas.iter().enumerate() {
             match schema {
                 SchemaPieceOrNamed::Piece(sp) => {
@@ -745,7 +827,7 @@ impl UnionSchema {
     pub fn match_ref(
         &self,
         other: SchemaPieceRefOrNamed,
-        names_map: &HashMap<usize, usize>,
+        names_map: &BTreeMap<usize, usize>,
     ) -> Option<(usize, &SchemaPieceOrNamed)> {
         match other {
             SchemaPieceRefOrNamed::Piece(sp) => self.match_piece(sp),
@@ -760,7 +842,7 @@ impl UnionSchema {
     pub fn match_(
         &self,
         other: &SchemaPieceOrNamed,
-        names_map: &HashMap<usize, usize>,
+        names_map: &BTreeMap<usize, usize>,
     ) -> Option<(usize, &SchemaPieceOrNamed)> {
         self.match_ref(other.as_ref(), names_map)
     }
@@ -776,7 +858,7 @@ impl PartialEq for UnionSchema {
 #[derive(Default)]
 struct SchemaParser {
     named: Vec<Option<NamedSchemaPiece>>,
-    indices: HashMap<FullName, usize>,
+    indices: BTreeMap<FullName, usize>,
 }
 
 impl SchemaParser {
@@ -819,7 +901,7 @@ impl SchemaParser {
             Entry::Vacant(ve) => *ve.insert(self.named.len()),
             Entry::Occupied(oe) => {
                 return Err(ParseSchemaError::new(format!(
-                    "Sub-schema with name {} encountered multiple times",
+                    "Sub-schema with name {:?} encountered multiple times",
                     oe.key()
                 ))
                 .into())
@@ -830,7 +912,7 @@ impl SchemaParser {
     }
 
     fn insert(&mut self, index: usize, schema: NamedSchemaPiece) {
-        assert!(self.named[index].is_none());
+        assert_none!(self.named[index]);
         self.named[index] = Some(schema);
     }
 
@@ -908,7 +990,7 @@ impl SchemaParser {
                 }
             }),
             Some(&Value::Object(ref data)) => match data.get("type") {
-                Some(ref value) => self.parse_inner(default_namespace, value),
+                Some(value) => self.parse_inner(default_namespace, value),
                 None => Err(
                     ParseSchemaError::new(format!("Unknown complex type: {:?}", complex)).into(),
                 ),
@@ -924,7 +1006,7 @@ impl SchemaParser {
         default_namespace: &str,
         complex: &Map<String, Value>,
     ) -> Result<SchemaPiece, AvroError> {
-        let mut lookup = HashMap::new();
+        let mut lookup = BTreeMap::new();
 
         let fields: Vec<RecordField> = complex
             .get("fields")
@@ -963,6 +1045,8 @@ impl SchemaParser {
             .name()
             .ok_or_else(|| ParseSchemaError::new("No `name` in record field"))?;
 
+        Name::validate(&name)?;
+
         let schema = field
             .get("type")
             .ok_or_else(|| ParseSchemaError::new("No `type` in record field").into())
@@ -993,7 +1077,7 @@ impl SchemaParser {
 
     /// Parse a `serde_json::Value` representing a Avro enum type into a
     /// `Schema`.
-    fn parse_enum(&mut self, complex: &Map<String, Value>) -> Result<SchemaPiece, AvroError> {
+    fn parse_enum(&self, complex: &Map<String, Value>) -> Result<SchemaPiece, AvroError> {
         let symbols: Vec<String> = complex
             .get("symbols")
             .and_then(|v| v.as_array())
@@ -1006,7 +1090,7 @@ impl SchemaParser {
                     .ok_or_else(|| ParseSchemaError::new("Unable to parse `symbols` in enum"))
             })?;
 
-        let mut unique_symbols: HashSet<&String> = HashSet::new();
+        let mut unique_symbols: BTreeSet<&String> = BTreeSet::new();
         for symbol in symbols.iter() {
             if unique_symbols.contains(symbol) {
                 return Err(ParseSchemaError::new(format!(
@@ -1232,7 +1316,7 @@ impl SchemaParser {
     /// Parse a `serde_json::Value` representing a Avro fixed type into a
     /// `Schema`.
     fn parse_fixed(
-        &mut self,
+        &self,
         _default_namespace: &str,
         complex: &Map<String, Value>,
     ) -> Result<SchemaPiece, AvroError> {
@@ -1354,13 +1438,20 @@ pub struct SchemaNode<'a> {
     pub name: Option<&'a FullName>,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum SchemaPieceRefOrNamed<'a> {
     Piece(&'a SchemaPiece),
     Named(usize),
 }
 
 impl<'a> SchemaPieceRefOrNamed<'a> {
+    pub fn get_human_name(&self, root: &Schema) -> String {
+        match self {
+            Self::Piece(piece) => format!("{:?}", piece),
+            Self::Named(idx) => format!("{:?}", root.lookup(*idx).name),
+        }
+    }
+
     #[inline(always)]
     pub fn get_piece_and_name(self, root: &'a Schema) -> (&'a SchemaPiece, Option<&'a FullName>) {
         match self {
@@ -1373,7 +1464,7 @@ impl<'a> SchemaPieceRefOrNamed<'a> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct SchemaNodeOrNamed<'a> {
     pub root: &'a Schema,
     pub inner: SchemaPieceRefOrNamed<'a>,
@@ -1412,7 +1503,7 @@ impl<'a> SchemaNodeOrNamed<'a> {
         };
         let piece = cloner.clone_piece_or_named(self.inner);
         let named: Vec<NamedSchemaPiece> = cloner.named.into_iter().map(Option::unwrap).collect();
-        let indices: HashMap<FullName, usize> = named
+        let indices: BTreeMap<FullName, usize> = named
             .iter()
             .enumerate()
             .map(|(i, nsp)| (nsp.name.clone(), i))
@@ -1423,11 +1514,16 @@ impl<'a> SchemaNodeOrNamed<'a> {
             top: piece,
         }
     }
+
+    pub fn namespace(self) -> Option<&'a str> {
+        let SchemaNode { name, .. } = self.lookup();
+        name.map(|FullName { namespace, .. }| namespace.as_str())
+    }
 }
 
 struct SchemaSubtreeDeepCloner<'a> {
     old_root: &'a Schema,
-    old_to_new_names: HashMap<usize, usize>,
+    old_to_new_names: BTreeMap<usize, usize>,
     named: Vec<Option<NamedSchemaPiece>>,
 }
 
@@ -1630,41 +1726,47 @@ impl<'a> SchemaNode<'a> {
             },
             (Null, SchemaPiece::Null) => AvroValue::Null,
             (Bool(b), SchemaPiece::Boolean) => AvroValue::Boolean(*b),
-            (Number(n), piece) => match piece {
-                SchemaPiece::Int => {
-                    let i = n
-                        .as_i64()
-                        .and_then(|i| i32::try_from(i).ok())
-                        .ok_or_else(|| {
-                            ParseSchemaError(format!("{} is not a 32-bit integer", n))
+            (Number(n), piece) => {
+                match piece {
+                    piece if piece.is_underlying_int() => {
+                        let i =
+                            n.as_i64()
+                                .and_then(|i| i32::try_from(i).ok())
+                                .ok_or_else(|| {
+                                    ParseSchemaError(format!("{} is not a 32-bit integer", n))
+                                })?;
+                        piece.try_make_int_value(i).unwrap().map_err(|e| {
+                            ParseSchemaError(format!("invalid default int {i}: {e}"))
+                        })?
+                    }
+                    piece if piece.is_underlying_long() => {
+                        let i = n.as_i64().ok_or_else(|| {
+                            ParseSchemaError(format!("{} is not a 64-bit integer", n))
                         })?;
-                    AvroValue::Int(i)
+                        piece.try_make_long_value(i).unwrap().map_err(|e| {
+                            ParseSchemaError(format!("invalid default long {i}: {e}"))
+                        })?
+                    }
+                    SchemaPiece::Float => {
+                        let f = n.as_f64().ok_or_else(|| {
+                            ParseSchemaError(format!("{} is not a 32-bit float", n))
+                        })?;
+                        AvroValue::Float(f as f32)
+                    }
+                    SchemaPiece::Double => {
+                        let f = n.as_f64().ok_or_else(|| {
+                            ParseSchemaError(format!("{} is not a 64-bit float", n))
+                        })?;
+                        AvroValue::Double(f)
+                    }
+                    _ => {
+                        return Err(ParseSchemaError(format!(
+                            "Unexpected number in default: {}",
+                            n
+                        )))
+                    }
                 }
-                SchemaPiece::Long => {
-                    let i = n.as_i64().ok_or_else(|| {
-                        ParseSchemaError(format!("{} is not a 64-bit integer", n))
-                    })?;
-                    AvroValue::Long(i)
-                }
-                SchemaPiece::Float => {
-                    let f = n
-                        .as_f64()
-                        .ok_or_else(|| ParseSchemaError(format!("{} is not a 32-bit float", n)))?;
-                    AvroValue::Float(f as f32)
-                }
-                SchemaPiece::Double => {
-                    let f = n
-                        .as_f64()
-                        .ok_or_else(|| ParseSchemaError(format!("{} is not a 64-bit float", n)))?;
-                    AvroValue::Double(f)
-                }
-                _ => {
-                    return Err(ParseSchemaError(format!(
-                        "Unexpected number in default: {}",
-                        n
-                    )))
-                }
-            },
+            }
             (String(s), piece)
                 if s.eq_ignore_ascii_case("nan")
                     && (piece == &SchemaPiece::Float || piece == &SchemaPiece::Double) =>
@@ -1742,8 +1844,8 @@ impl<'a> SchemaNode<'a> {
                 let map = map
                     .iter()
                     .map(|(k, v)| node.json_to_value(v).map(|v| (k.clone(), v)))
-                    .collect::<Result<HashMap<_, _>, ParseSchemaError>>()?;
-                AvroValue::Map(AvroMap(map))
+                    .collect::<Result<BTreeMap<_, _>, ParseSchemaError>>()?;
+                AvroValue::Map(map)
             }
             (String(s), SchemaPiece::Fixed { size }) if s.len() == *size => {
                 AvroValue::Fixed(*size, s.clone().into_bytes())
@@ -1766,7 +1868,9 @@ struct SchemaSerContext<'a> {
     // it is only ever mutated in one stack frame at a time.
     // But AFAICT serde doesn't expose a way to
     // provide some mutable context to every node in the tree...
-    seen_named: Rc<RefCell<HashMap<usize, String>>>,
+    seen_named: Rc<RefCell<BTreeMap<usize, FullName>>>,
+    /// The namespace of this node's parent, or "" by default
+    enclosing_ns: &'a str,
 }
 
 #[derive(Clone)]
@@ -1777,9 +1881,11 @@ struct RecordFieldSerContext<'a> {
 
 impl<'a> SchemaSerContext<'a> {
     fn step(&'a self, next: SchemaPieceRefOrNamed<'a>) -> Self {
+        let ns = self.node.namespace().unwrap_or(self.enclosing_ns);
         Self {
             node: self.node.step_ref(next),
-            seen_named: self.seen_named.clone(),
+            seen_named: Rc::clone(&self.seen_named),
+            enclosing_ns: ns,
         }
     }
 }
@@ -1889,18 +1995,21 @@ impl<'a> Serialize for SchemaSerContext<'a> {
                 let mut map = self.seen_named.borrow_mut();
                 let named_piece = match map.get(&index) {
                     Some(name) => {
-                        return serializer.serialize_str(name.as_str());
+                        return serializer.serialize_str(&*name.short_name(self.enclosing_ns));
                     }
                     None => self.node.root.lookup(index),
                 };
-                let name = named_piece.name.to_string();
+                let name = &named_piece.name;
                 map.insert(index, name.clone());
                 std::mem::drop(map);
                 match &named_piece.piece {
                     SchemaPiece::Record { doc, fields, .. } => {
                         let mut map = serializer.serialize_map(None)?;
                         map.serialize_entry("type", "record")?;
-                        map.serialize_entry("name", &name)?;
+                        map.serialize_entry("name", &name.name)?;
+                        if self.enclosing_ns != &name.namespace {
+                            map.serialize_entry("namespace", &name.namespace)?;
+                        }
                         if let Some(ref docstr) = doc {
                             map.serialize_entry("doc", docstr)?;
                         }
@@ -1924,7 +2033,10 @@ impl<'a> Serialize for SchemaSerContext<'a> {
                     } => {
                         let mut map = serializer.serialize_map(None)?;
                         map.serialize_entry("type", "enum")?;
-                        map.serialize_entry("name", &name)?;
+                        map.serialize_entry("name", &name.name)?;
+                        if self.enclosing_ns != &name.namespace {
+                            map.serialize_entry("namespace", &name.namespace)?;
+                        }
                         map.serialize_entry("symbols", symbols)?;
                         if let Some(default_idx) = *default_idx {
                             assert!(default_idx < symbols.len());
@@ -1935,7 +2047,10 @@ impl<'a> Serialize for SchemaSerContext<'a> {
                     SchemaPiece::Fixed { size } => {
                         let mut map = serializer.serialize_map(None)?;
                         map.serialize_entry("type", "fixed")?;
-                        map.serialize_entry("name", &name)?;
+                        map.serialize_entry("name", &name.name)?;
+                        if self.enclosing_ns != &name.namespace {
+                            map.serialize_entry("namespace", &name.namespace)?;
+                        }
                         map.serialize_entry("size", size)?;
                         map.end()
                     }
@@ -1947,7 +2062,10 @@ impl<'a> Serialize for SchemaSerContext<'a> {
                         let mut map = serializer.serialize_map(Some(6))?;
                         map.serialize_entry("type", "fixed")?;
                         map.serialize_entry("logicalType", "decimal")?;
-                        map.serialize_entry("name", &name)?;
+                        map.serialize_entry("name", &name.name)?;
+                        if self.enclosing_ns != &name.namespace {
+                            map.serialize_entry("namespace", &name.namespace)?;
+                        }
                         map.serialize_entry("size", size)?;
                         map.serialize_entry("precision", precision)?;
                         map.serialize_entry("scale", scale)?;
@@ -2007,6 +2125,7 @@ impl Serialize for Schema {
                 inner: self.top.as_ref(),
             },
             seen_named: Rc::new(RefCell::new(Default::default())),
+            enclosing_ns: "",
         };
         ctx.serialize(serializer)
     }
@@ -2023,6 +2142,9 @@ impl<'a> Serialize for RecordFieldSerContext<'a> {
         if let Some(default) = &self.inner.default {
             map.serialize_entry("default", default)?;
         }
+        if let Some(doc) = &self.inner.doc {
+            map.serialize_entry("doc", doc)?;
+        }
         map.end()
     }
 }
@@ -2030,19 +2152,28 @@ impl<'a> Serialize for RecordFieldSerContext<'a> {
 /// Parses a **valid** avro schema into the Parsing Canonical Form.
 /// <https://avro.apache.org/docs/1.8.2/spec.html#Parsing+Canonical+Form+for+Schemas>
 fn parsing_canonical_form(schema: &serde_json::Value) -> String {
+    pcf(schema, "", false)
+}
+
+fn pcf(schema: &serde_json::Value, enclosing_ns: &str, in_fields: bool) -> String {
     match schema {
-        serde_json::Value::Object(map) => pcf_map(map),
+        serde_json::Value::Object(map) => pcf_map(map, enclosing_ns, in_fields),
         serde_json::Value::String(s) => pcf_string(s),
-        serde_json::Value::Array(v) => pcf_array(v),
+        serde_json::Value::Array(v) => pcf_array(v, enclosing_ns, in_fields),
         serde_json::Value::Number(n) => n.to_string(),
         _ => unreachable!("{:?} cannot yet be printed in canonical form", schema),
     }
 }
 
-fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
+fn pcf_map(schema: &Map<String, serde_json::Value>, enclosing_ns: &str, in_fields: bool) -> String {
     // Look for the namespace variant up front.
-    let ns = schema.get("namespace").and_then(|v| v.as_str());
+    let default_ns = schema
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or(enclosing_ns);
     let mut fields = Vec::new();
+    let mut found_next_ns = None;
+    let mut deferred_values = vec![];
     for (k, v) in schema {
         // Reduce primitive types to their simple form. ([PRIMITIVE] rule)
         if schema.len() == 1 && k == "type" {
@@ -2059,15 +2190,31 @@ fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
 
         // Fully qualify the name, if it isn't already ([FULLNAMES] rule).
         if k == "name" {
+            // The `fields` stanza needs special handling, as it has "name"
+            // fields that don't get canonicalized (since they are not type names).
+            if in_fields {
+                fields.push((
+                    k,
+                    format!("{}:{}", pcf_string(k), pcf_string(v.as_str().unwrap())),
+                ));
+                continue;
+            }
             // Invariant: Only valid schemas. Must be a string.
             let name = v.as_str().unwrap();
-            let n = match ns {
-                Some(namespace) if !name.contains('.') => {
-                    Cow::Owned(format!("{}.{}", namespace, name))
-                }
-                _ => Cow::Borrowed(name),
+            assert!(
+                found_next_ns.is_none(),
+                "`name` must not be specified multiple times"
+            );
+            let next_ns = match name.rsplit_once('.') {
+                None => default_ns,
+                Some((ns, _name)) => ns,
             };
-
+            found_next_ns = Some(next_ns);
+            let n = if next_ns.is_empty() {
+                Cow::Borrowed(name)
+            } else {
+                Cow::Owned(format!("{next_ns}.{name}"))
+            };
             fields.push((k, format!("{}:{}", pcf_string(k), pcf_string(&*n))));
             continue;
         }
@@ -2082,10 +2229,16 @@ fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
             continue;
         }
 
-        // For anything else, recursively process the result.
+        // For anything else, recursively process the result
+        // (deferred until we know the namespace)
+        deferred_values.push((k, v));
+    }
+
+    let next_ns = found_next_ns.unwrap_or(default_ns);
+    for (k, v) in deferred_values {
         fields.push((
             k,
-            format!("{}:{}", pcf_string(k), parsing_canonical_form(v)),
+            format!("{}:{}", pcf_string(k), pcf(v, next_ns, &*k == "fields")),
         ));
     }
 
@@ -2099,10 +2252,10 @@ fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
     format!("{{{}}}", inter)
 }
 
-fn pcf_array(arr: &[serde_json::Value]) -> String {
+fn pcf_array(arr: &[serde_json::Value], enclosing_ns: &str, in_fields: bool) -> String {
     let inter = arr
         .iter()
-        .map(parsing_canonical_form)
+        .map(|s| pcf(s, enclosing_ns, in_fields))
         .collect::<Vec<String>>()
         .join(",");
     format!("[{}]", inter)
@@ -2130,8 +2283,9 @@ fn field_ordering_position(field: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use types::Record;
-    use types::ToAvro;
+    use mz_ore::{assert_err, assert_ok};
+
+    use crate::types::{Record, ToAvro};
 
     use super::*;
 
@@ -2145,14 +2299,14 @@ mod tests {
         assert_eq!(&expected, schema.top_node().inner);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_primitive_schema() {
         check_schema("\"null\"", SchemaPiece::Null);
         check_schema("\"int\"", SchemaPiece::Int);
         check_schema("\"double\"", SchemaPiece::Double);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_array_schema() {
         check_schema(
             r#"{"type": "array", "items": "string"}"#,
@@ -2160,7 +2314,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_map_schema() {
         check_schema(
             r#"{"type": "map", "values": "double"}"#,
@@ -2168,7 +2322,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_union_schema() {
         check_schema(
             r#"["null", "int"]"#,
@@ -2182,10 +2336,10 @@ mod tests {
         );
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_multi_union_schema() {
         let schema = Schema::from_str(r#"["null", "int", "float", "string", "bytes"]"#);
-        assert!(schema.is_ok());
+        assert_ok!(schema);
         let schema = schema.unwrap();
         let node = schema.top_node();
         assert_eq!(SchemaKind::from(&schema), SchemaKind::Union);
@@ -2218,29 +2372,30 @@ mod tests {
         assert_eq!(variants.next(), None);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_record_schema() {
         let schema = r#"
                 {
                     "type": "record",
                     "name": "test",
+                    "doc": "record doc",
                     "fields": [
-                        {"name": "a", "type": "long", "default": 42},
-                        {"name": "b", "type": "string"}
+                        {"name": "a", "doc": "a doc", "type": "long", "default": 42},
+                        {"name": "b", "doc": "b doc", "type": "string"}
                     ]
                 }
             "#;
 
-        let mut lookup = HashMap::new();
+        let mut lookup = BTreeMap::new();
         lookup.insert("a".to_owned(), 0);
         lookup.insert("b".to_owned(), 1);
 
         let expected = SchemaPiece::Record {
-            doc: None,
+            doc: Some("record doc".to_string()),
             fields: vec![
                 RecordField {
                     name: "a".to_string(),
-                    doc: None,
+                    doc: Some("a doc".to_string()),
                     default: Some(Value::Number(42i64.into())),
                     schema: SchemaPiece::Long.into(),
                     order: RecordFieldOrder::Ascending,
@@ -2248,7 +2403,7 @@ mod tests {
                 },
                 RecordField {
                     name: "b".to_string(),
-                    doc: None,
+                    doc: Some("b doc".to_string()),
                     default: None,
                     schema: SchemaPiece::String.into(),
                     order: RecordFieldOrder::Ascending,
@@ -2261,7 +2416,7 @@ mod tests {
         check_schema(schema, expected);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_enum_schema() {
         let schema = r#"{"type": "enum", "name": "Suit", "symbols": ["diamonds", "spades", "jokers", "clubs", "hearts"], "default": "jokers"}"#;
 
@@ -2283,10 +2438,10 @@ mod tests {
             r#"{"type": "enum", "name": "Suit", "symbols": ["diamonds", "spades", "jokers", "clubs", "hearts"], "default": "blah"}"#,
         );
 
-        assert!(bad_schema.is_err());
+        assert_err!(bad_schema);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_fixed_schema() {
         let schema = r#"{"type": "fixed", "name": "test", "size": 16}"#;
 
@@ -2295,7 +2450,7 @@ mod tests {
         check_schema(schema, expected);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_date_schema() {
         let kinds = &[
             r#"{
@@ -2325,7 +2480,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[mz_ore::test]
     fn new_field_in_middle() {
         let reader = r#"{
             "type": "record",
@@ -2362,7 +2517,7 @@ mod tests {
         assert!(reader.is_empty()); // all bytes should have been consumed
     }
 
-    #[test]
+    #[mz_ore::test]
     fn new_field_at_end() {
         let reader = r#"{
             "type": "record",
@@ -2396,7 +2551,7 @@ mod tests {
         assert!(reader.is_empty()); // all bytes should have been consumed
     }
 
-    #[test]
+    #[mz_ore::test]
     fn default_non_nums() {
         let reader = r#"{
             "type": "record",
@@ -2470,7 +2625,7 @@ mod tests {
         assert!(reader.is_empty());
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_decimal_schemas() {
         let schema = r#"{
                 "type": "fixed",
@@ -2548,7 +2703,7 @@ mod tests {
         assert_eq!(resolved.top_node().inner, &expected);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_no_documentation() {
         let schema =
             Schema::from_str(r#"{"type": "enum", "name": "Coin", "symbols": ["heads", "tails"]}"#)
@@ -2559,10 +2714,10 @@ mod tests {
             _ => panic!(),
         };
 
-        assert!(doc.is_none());
+        assert_none!(doc);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_documentation() {
         let schema = Schema::from_str(
                 r#"{"type": "enum", "name": "Coin", "doc": "Some documentation", "symbols": ["heads", "tails"]}"#
@@ -2576,7 +2731,7 @@ mod tests {
         assert_eq!("Some documentation".to_owned(), doc.unwrap());
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_namespaces_and_names() {
         // When name and namespace specified, full name should contain both.
         let schema = Schema::from_str(
@@ -2781,7 +2936,7 @@ mod tests {
 
     // Tests to ensure Schema is Send + Sync. These tests don't need to _do_ anything, if they can
     // compile, they pass.
-    #[test]
+    #[mz_ore::test]
     fn test_schema_is_send() {
         fn send<S: Send>(_s: S) {}
 
@@ -2793,7 +2948,7 @@ mod tests {
         send(schema);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_schema_is_sync() {
         fn sync<S: Sync>(_s: S) {}
 
@@ -2806,9 +2961,9 @@ mod tests {
         sync(schema);
     }
 
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: inline assembly is not supported
     fn test_schema_fingerprint() {
-        use md5::Md5;
         use sha2::Sha256;
 
         let raw_schema = r#"
@@ -2821,16 +2976,55 @@ mod tests {
             ]
         }
     "#;
-
+        let expected_canonical = r#"{"name":"test","type":"record","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}"#;
         let schema = Schema::from_str(raw_schema).unwrap();
+        assert_eq!(&schema.canonical_form(), expected_canonical);
+        let expected_fingerprint = format!("{:02x}", Sha256::digest(expected_canonical));
         assert_eq!(
-            "5ecb2d1f0eaa647d409e6adbd5d70cd274d85802aa9167f5fe3b73ba70b32c76",
-            format!("{}", schema.fingerprint::<Sha256>())
+            format!("{}", schema.fingerprint::<Sha256>()),
+            expected_fingerprint
         );
 
+        let raw_schema = r#"
+{
+  "type": "record",
+  "name": "ns.r1",
+  "namespace": "ignored",
+  "fields": [
+    {
+      "name": "f1",
+      "type": {
+        "type": "fixed",
+        "name": "r2",
+        "size": 1
+      }
+    }
+  ]
+}
+"#;
+        let expected_canonical = r#"{"name":"ns.r1","type":"record","fields":[{"name":"f1","type":{"name":"ns.r2","type":"fixed","size":1}}]}"#;
+        let schema = Schema::from_str(raw_schema).unwrap();
+        assert_eq!(&schema.canonical_form(), expected_canonical);
+        let expected_fingerprint = format!("{:02x}", Sha256::digest(expected_canonical));
         assert_eq!(
-            "a2c99a3f40ea2eea32593d63b483e962",
-            format!("{}", schema.fingerprint::<Md5>())
+            format!("{}", schema.fingerprint::<Sha256>()),
+            expected_fingerprint
         );
+    }
+
+    #[mz_ore::test]
+    fn test_make_valid() {
+        for (input, expected) in [
+            ("foo", "foo"),
+            ("az99", "az99"),
+            ("99az", "_99az"),
+            ("is,bad", "is_bad"),
+            ("@#$%", "____"),
+            ("i-amMisBehaved!", "i_amMisBehaved_"),
+            ("", "_"),
+        ] {
+            let actual = Name::make_valid(input);
+            assert_eq!(expected, actual, "Name::make_valid({input})")
+        }
     }
 }

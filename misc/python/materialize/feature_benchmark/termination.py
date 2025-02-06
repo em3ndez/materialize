@@ -8,29 +8,31 @@
 # by the Apache License, Version 2.0.
 
 import statistics
-from typing import List, Optional
 
 import numpy as np
 from scipy import stats  # type: ignore
 
+from materialize.feature_benchmark.measurement import Measurement
+
 
 class TerminationCondition:
-    pass
+    def __init__(self, threshold: float) -> None:
+        self._threshold = threshold
+        self._data: list[float] = []
 
-    def terminate(self, measurement: float) -> bool:
-        assert False
+    def terminate(self, measurement: Measurement) -> bool:
+        raise NotImplementedError
 
 
 class NormalDistributionOverlap(TerminationCondition):
     """Signal termination if the overlap between the two distributions is above the threshold"""
 
     def __init__(self, threshold: float) -> None:
-        self._threshold = threshold
-        self._data: List[float] = []
-        self._last_fit: Optional[statistics.NormalDist] = None
+        self._last_fit: statistics.NormalDist | None = None
+        super().__init__(threshold=threshold)
 
-    def terminate(self, measurement: float) -> bool:
-        self._data.append(measurement)
+    def terminate(self, measurement: Measurement) -> bool:
+        self._data.append(measurement.value)
 
         if len(self._data) > 10:
             (mu, sigma) = stats.norm.fit(self._data)
@@ -51,12 +53,8 @@ class ProbForMin(TerminationCondition):
     has dropped below the threshold
     """
 
-    def __init__(self, threshold: float) -> None:
-        self._threshold = threshold
-        self._data: List[float] = []
-
-    def terminate(self, measurement: float) -> bool:
-        self._data.append(measurement)
+    def terminate(self, measurement: Measurement) -> bool:
+        self._data.append(measurement.value)
 
         if len(self._data) > 5:
             mean = np.mean(self._data)
@@ -70,3 +68,10 @@ class ProbForMin(TerminationCondition):
                 return False
         else:
             return False
+
+
+class RunAtMost(TerminationCondition):
+    def terminate(self, measurement: Measurement) -> bool:
+        self._data.append(measurement.value)
+
+        return len(self._data) >= self._threshold

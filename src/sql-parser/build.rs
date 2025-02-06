@@ -13,85 +13,114 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
-use std::fs;
 use std::path::PathBuf;
+use std::{env, fs};
 
-use anyhow::{bail, Context, Result};
-use uncased::UncasedStr;
-
-use ore::codegen::CodegenBuf;
+use anyhow::{Context, Result};
 
 const AST_DEFS_MOD: &str = "src/ast/defs.rs";
-const KEYWORDS_LIST: &str = "src/keywords.txt";
 
 fn main() -> Result<()> {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").context("Cannot read OUT_DIR env var")?);
-
-    // Generate keywords list and lookup table.
-    {
-        let file = fs::read_to_string(KEYWORDS_LIST)?;
-
-        let keywords: Vec<_> = file
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-            .collect();
-
-        // Enforce that the keywords file is kept sorted. This is purely
-        // cosmetic, but it cuts down on diff noise and merge conflicts.
-        if let Some([a, b]) = keywords.windows(2).find(|w| w[0] > w[1]) {
-            bail!("keywords list is not sorted: {:?} precedes {:?}", a, b);
-        }
-
-        let mut buf = CodegenBuf::new();
-
-        buf.writeln("#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]");
-        buf.start_block("pub enum Keyword");
-        for kw in &keywords {
-            buf.writeln(format!("{},", kw));
-        }
-        buf.end_block();
-
-        buf.start_block("impl Keyword");
-        buf.start_block("pub fn as_str(&self) -> &'static str");
-        buf.start_block("match self");
-        for kw in &keywords {
-            buf.writeln(format!("Keyword::{} => {:?},", kw, kw.to_uppercase()));
-        }
-        buf.end_block();
-        buf.end_block();
-        buf.end_block();
-
-        for kw in &keywords {
-            buf.writeln(format!(
-                "pub const {}: Keyword = Keyword::{};",
-                kw.to_uppercase(),
-                kw
-            ));
-        }
-
-        let mut phf = phf_codegen::Map::new();
-        for kw in &keywords {
-            phf.entry(UncasedStr::new(kw), &format!("Keyword::{}", kw));
-        }
-        buf.writeln(format!(
-            "static KEYWORDS: phf::Map<&'static UncasedStr, Keyword> = {};",
-            phf.build()
-        ));
-
-        fs::write(out_dir.join("keywords.rs"), buf.into_string())?;
-    }
+    let ir = mz_walkabout::load(AST_DEFS_MOD)?;
 
     // Generate AST visitors.
     {
-        let ir = walkabout::load(AST_DEFS_MOD)?;
-        let fold = walkabout::gen_fold(&ir);
-        let visit = walkabout::gen_visit(&ir);
-        let visit_mut = walkabout::gen_visit_mut(&ir);
+        let fold = mz_walkabout::gen_fold(&ir);
+        let visit = mz_walkabout::gen_visit(&ir);
+        let visit_mut = mz_walkabout::gen_visit_mut(&ir);
         fs::write(out_dir.join("fold.rs"), fold)?;
         fs::write(out_dir.join("visit.rs"), visit)?;
         fs::write(out_dir.join("visit_mut.rs"), visit_mut)?;
     }
+    // Generate derived items for AST types modelling simple option names.
+    {
+        let parse = simple_option_names::gen_parse(&ir);
+        let display = simple_option_names::gen_display(&ir);
+        fs::write(out_dir.join("parse.simple_options.rs"), parse)?;
+        fs::write(out_dir.join("display.simple_options.rs"), display)?;
+    }
 
     Ok(())
+}
+
+mod simple_option_names {
+    use mz_ore_build::codegen::CodegenBuf;
+    use mz_walkabout::ir;
+
+    // TODO: we might want to identify these enums using an attribute.
+    const ENUMS: [&str; 2] = ["ExplainPlanOptionName", "ClusterFeatureName"];
+
+    /// Generate `Parser` methods.
+    pub fn gen_display(ir: &ir::Ir) -> String {
+        let mut buf = CodegenBuf::new();
+        for enum_name in ENUMS {
+            if let Some(ir::Item::Enum(enum_item)) = ir.items.get(enum_name) {
+                write_ast_display(enum_name, enum_item, &mut buf)
+            }
+        }
+        buf.into_string()
+    }
+
+    fn write_ast_display(ident: &str, enum_item: &ir::Enum, buf: &mut CodegenBuf) {
+        let typ = ident.to_string();
+        let fn_fmt = "fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>)";
+        buf.write_block(format!("impl AstDisplay for {typ}"), |buf| {
+            buf.write_block(fn_fmt, |buf| {
+                buf.write_block("match self", |buf| {
+                    for v in enum_item.variants.iter().map(|v| &v.name) {
+                        let ts = separate_tokens(v, ' ').to_uppercase();
+                        buf.writeln(format!(r#"Self::{v} => f.write_str("{ts}"),"#));
+                    }
+                });
+            });
+        });
+        buf.end_line();
+    }
+
+    /// Generate `AstDisplay` implementations.
+    pub fn gen_parse(ir: &ir::Ir) -> String {
+        let mut buf = CodegenBuf::new();
+        buf.write_block("impl<'a> Parser<'a>", |buf| {
+            for enum_name in ENUMS {
+                if let Some(ir::Item::Enum(enum_item)) = ir.items.get(enum_name) {
+                    write_fn_parse(enum_name, enum_item, buf)
+                }
+            }
+        });
+        buf.into_string()
+    }
+
+    fn write_fn_parse(ident: &str, enum_item: &ir::Enum, buf: &mut CodegenBuf) {
+        let typ = ident.to_string();
+        let msg = separate_tokens(&typ, ' ').to_lowercase();
+        let fn_name = format!("parse_{}", separate_tokens(&typ, '_').to_lowercase());
+        let fn_type = format!("Result<{typ}, ParserError>");
+        buf.write_block(format!("fn {fn_name}(&mut self) -> {fn_type}"), |buf| {
+            for v in enum_item.variants.iter().map(|v| &v.name) {
+                let kws = separate_tokens(v, ',').to_uppercase();
+                buf.write_block(format!("if self.parse_keywords(&[{kws}])"), |buf| {
+                    buf.writeln(format!("return Ok({typ}::{v})"));
+                });
+            }
+            buf.write_block("", |buf| {
+                buf.writeln(format!(r#"let msg = "a valid {msg}".to_string();"#));
+                buf.writeln(r#"Err(self.error(self.peek_pos(), msg))"#);
+            });
+        });
+        buf.end_line();
+    }
+
+    fn separate_tokens(name: &str, sep: char) -> String {
+        let mut buf = String::new();
+        let mut prev = sep;
+        for ch in name.chars() {
+            if ch.is_uppercase() && prev != sep {
+                buf.push(sep);
+            }
+            buf.push(ch);
+            prev = ch;
+        }
+        buf
+    }
 }

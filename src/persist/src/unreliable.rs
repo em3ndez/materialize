@@ -9,17 +9,28 @@
 
 //! Test utilities for injecting latency and errors.
 
-use std::ops::Range;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::{Instant, UNIX_EPOCH};
 
+use anyhow::anyhow;
 use async_trait::async_trait;
+use bytes::Bytes;
+use mz_ore::bytes::SegmentedBytes;
+use rand::prelude::SmallRng;
+use rand::{Rng, SeedableRng};
+use tracing::trace;
 
-use crate::error::Error;
-use crate::storage::{Atomicity, Blob, BlobRead, LockInfo, Log, SeqNo};
+use crate::location::{
+    Blob, BlobMetadata, CaSResult, Consensus, Determinate, ExternalError, ResultStream, SeqNo,
+    VersionedData,
+};
 
 #[derive(Debug)]
 struct UnreliableCore {
-    unavailable: bool,
+    rng: SmallRng,
+    should_happen: f64,
+    should_timeout: f64,
     // TODO: Delays, what else?
 }
 
@@ -31,230 +42,265 @@ pub struct UnreliableHandle {
 
 impl Default for UnreliableHandle {
     fn default() -> Self {
-        UnreliableHandle {
-            core: Arc::new(Mutex::new(UnreliableCore { unavailable: false })),
-        }
+        let seed = UNIX_EPOCH
+            .elapsed()
+            .map_or(0, |x| u64::from(x.subsec_nanos()));
+        Self::new(seed, 0.95, 0.05)
     }
 }
 
 impl UnreliableHandle {
-    fn check_unavailable(&self, details: &str) -> Result<(), Error> {
-        let unavailable = self
-            .core
-            .lock()
-            .expect("never panics while holding lock")
-            .unavailable;
-        if unavailable {
-            Err(format!("unavailable: {}", details).into())
-        } else {
-            Ok(())
+    /// Returns a new [UnreliableHandle].
+    pub fn new(seed: u64, should_happen: f64, should_timeout: f64) -> Self {
+        assert!(should_happen >= 0.0);
+        assert!(should_happen <= 1.0);
+        assert!(should_timeout >= 0.0);
+        assert!(should_timeout <= 1.0);
+        let core = UnreliableCore {
+            rng: SmallRng::seed_from_u64(seed),
+            should_happen,
+            should_timeout,
+        };
+        UnreliableHandle {
+            core: Arc::new(Mutex::new(core)),
         }
     }
 
-    /// Cause all later operators to return an "unavailable" error.
-    pub fn make_unavailable(&mut self) -> &mut UnreliableHandle {
-        self.core
-            .lock()
-            .expect("never panics while holding lock")
-            .unavailable = true;
-        self
+    /// Cause all later calls to sometimes return an error.
+    pub fn partially_available(&self, should_happen: f64, should_timeout: f64) {
+        assert!(should_happen >= 0.0);
+        assert!(should_happen <= 1.0);
+        assert!(should_timeout >= 0.0);
+        assert!(should_timeout <= 1.0);
+        let mut core = self.core.lock().expect("mutex poisoned");
+        core.should_happen = should_happen;
+        core.should_timeout = should_timeout;
     }
 
-    /// Cause all later operators to succeed.
-    pub fn make_available(&mut self) -> &mut UnreliableHandle {
-        self.core
-            .lock()
-            .expect("never panics while holding lock")
-            .unavailable = false;
-        self
-    }
-}
-
-/// An unreliable delegate to [Log].
-#[derive(Debug)]
-pub struct UnreliableLog<L> {
-    handle: UnreliableHandle,
-    log: L,
-}
-
-impl<L: Log> UnreliableLog<L> {
-    /// Returns a new [UnreliableLog] and a handle for controlling it.
-    pub fn new(log: L) -> (Self, UnreliableHandle) {
-        let h = UnreliableHandle::default();
-        let log = Self::from_handle(log, h.clone());
-        (log, h)
+    /// Cause all later calls to return an error.
+    pub fn totally_unavailable(&self) {
+        self.partially_available(0.0, 1.0);
     }
 
-    /// Returns a new [UnreliableLog] sharing the given handle.
-    pub fn from_handle(log: L, handle: UnreliableHandle) -> Self {
-        UnreliableLog { handle, log }
-    }
-}
-
-impl<L: Log> Log for UnreliableLog<L> {
-    fn write_sync(&mut self, buf: Vec<u8>) -> Result<SeqNo, Error> {
-        self.handle.check_unavailable("log write")?;
-        self.log.write_sync(buf)
+    /// Cause all later calls to succeed.
+    pub fn totally_available(&self) {
+        self.partially_available(1.0, 0.0);
     }
 
-    fn snapshot<F>(&self, logic: F) -> Result<Range<SeqNo>, Error>
+    fn should_happen(&self) -> bool {
+        let mut core = self.core.lock().expect("mutex poisoned");
+        let should_happen = core.should_happen;
+        core.rng.gen_bool(should_happen)
+    }
+
+    fn should_timeout(&self) -> bool {
+        let mut core = self.core.lock().expect("mutex poisoned");
+        let should_timeout = core.should_timeout;
+        core.rng.gen_bool(should_timeout)
+    }
+
+    async fn run_op<R, F, WorkFn>(&self, name: &str, work_fn: WorkFn) -> Result<R, ExternalError>
     where
-        F: FnMut(SeqNo, &[u8]) -> Result<(), Error>,
+        F: Future<Output = Result<R, ExternalError>>,
+        WorkFn: FnOnce() -> F,
     {
-        self.handle.check_unavailable("log snapshot")?;
-        self.log.snapshot(logic)
+        let (should_happen, should_timeout) = (self.should_happen(), self.should_timeout());
+        trace!(
+            "unreliable {} should_happen={} should_timeout={}",
+            name,
+            should_happen,
+            should_timeout,
+        );
+        match (should_happen, should_timeout) {
+            (true, true) => {
+                let _res = work_fn().await;
+                Err(ExternalError::new_timeout(Instant::now()))
+            }
+            (true, false) => work_fn().await,
+            (false, true) => Err(ExternalError::new_timeout(Instant::now())),
+            (false, false) => Err(ExternalError::Determinate(Determinate::new(anyhow!(
+                "unreliable"
+            )))),
+        }
     }
-
-    fn truncate(&mut self, upper: SeqNo) -> Result<(), Error> {
-        self.handle.check_unavailable("log truncate")?;
-        self.log.truncate(upper)
-    }
-
-    fn close(&mut self) -> Result<bool, Error> {
-        // TODO: This check_unavailable is a different order from the others
-        // mostly for convenience in the nemesis tests. While we do want to
-        // prevent a normal read/write from going though when the storage is
-        // unavailable, it makes for a very uninteresting test if we can't clean
-        // up LOCK files. OTOH this feels like a smell, revisit.
-        let did_work = self.log.close()?;
-        self.handle.check_unavailable("log close")?;
-        Ok(did_work)
-    }
-}
-
-/// Configuration for opening an [UnreliableBlob].
-#[derive(Debug)]
-pub struct UnreliableBlobConfig<B: Blob> {
-    handle: UnreliableHandle,
-    blob: B::Config,
 }
 
 /// An unreliable delegate to [Blob].
 #[derive(Debug)]
-pub struct UnreliableBlob<B> {
+pub struct UnreliableBlob {
     handle: UnreliableHandle,
-    blob: B,
+    blob: Arc<dyn Blob>,
 }
 
-impl<B: BlobRead> UnreliableBlob<B> {
-    /// Returns a new [UnreliableBlob] and a handle for controlling it.
-    pub fn new(blob: B) -> (Self, UnreliableHandle) {
-        let h = UnreliableHandle::default();
-        let blob = Self::from_handle(blob, h.clone());
-        (blob, h)
-    }
-
-    /// Returns a new [UnreliableLog] sharing the given handle.
-    pub fn from_handle(blob: B, handle: UnreliableHandle) -> Self {
+impl UnreliableBlob {
+    /// Returns a new [UnreliableBlob].
+    pub fn new(blob: Arc<dyn Blob>, handle: UnreliableHandle) -> Self {
         UnreliableBlob { handle, blob }
     }
 }
 
 #[async_trait]
-impl<B: BlobRead + Sync> BlobRead for UnreliableBlob<B> {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
-        self.handle.check_unavailable("blob get")?;
-        self.blob.get(key).await
+impl Blob for UnreliableBlob {
+    async fn get(&self, key: &str) -> Result<Option<SegmentedBytes>, ExternalError> {
+        self.handle.run_op("get", || self.blob.get(key)).await
     }
 
-    async fn list_keys(&self) -> Result<Vec<String>, Error> {
-        self.handle.check_unavailable("blob list keys")?;
-        self.blob.list_keys().await
+    async fn list_keys_and_metadata(
+        &self,
+        key_prefix: &str,
+        f: &mut (dyn FnMut(BlobMetadata) + Send + Sync),
+    ) -> Result<(), ExternalError> {
+        self.handle
+            .run_op("list_keys", || {
+                self.blob.list_keys_and_metadata(key_prefix, f)
+            })
+            .await
     }
 
-    async fn close(&mut self) -> Result<bool, Error> {
-        // TODO: This check_unavailable is a different order from the others
-        // mostly for convenience in the nemesis tests. While we do want to
-        // prevent a normal read/write from going though when the storage is
-        // unavailable, it makes for a very uninteresting test if we can't clean
-        // up LOCK files. OTOH this feels like a smell, revisit.
-        let did_work = self.blob.close().await?;
-        self.handle.check_unavailable("blob close")?;
-        Ok(did_work)
+    async fn set(&self, key: &str, value: Bytes) -> Result<(), ExternalError> {
+        self.handle
+            .run_op("set", || self.blob.set(key, value))
+            .await
+    }
+
+    async fn delete(&self, key: &str) -> Result<Option<usize>, ExternalError> {
+        self.handle.run_op("delete", || self.blob.delete(key)).await
+    }
+
+    async fn restore(&self, key: &str) -> Result<(), ExternalError> {
+        self.handle
+            .run_op("restore", || self.blob.restore(key))
+            .await
+    }
+}
+
+/// An unreliable delegate to [Consensus].
+#[derive(Debug)]
+pub struct UnreliableConsensus {
+    handle: UnreliableHandle,
+    consensus: Arc<dyn Consensus>,
+}
+
+impl UnreliableConsensus {
+    /// Returns a new [UnreliableConsensus].
+    pub fn new(consensus: Arc<dyn Consensus>, handle: UnreliableHandle) -> Self {
+        UnreliableConsensus { consensus, handle }
     }
 }
 
 #[async_trait]
-impl<B> Blob for UnreliableBlob<B>
-where
-    B: Blob + Sync,
-    B::Read: Sync,
-{
-    type Config = UnreliableBlobConfig<B>;
-    type Read = UnreliableBlob<B::Read>;
-
-    fn open_exclusive(config: UnreliableBlobConfig<B>, lock_info: LockInfo) -> Result<Self, Error> {
-        let blob = B::open_exclusive(config.blob, lock_info)?;
-        Ok(UnreliableBlob {
-            blob,
-            handle: config.handle,
-        })
+impl Consensus for UnreliableConsensus {
+    fn list_keys(&self) -> ResultStream<String> {
+        // TODO: run_op for streams
+        self.consensus.list_keys()
     }
 
-    fn open_read(config: UnreliableBlobConfig<B>) -> Result<UnreliableBlob<B::Read>, Error> {
-        let blob = B::open_read(config.blob)?;
-        Ok(UnreliableBlob {
-            blob,
-            handle: config.handle,
-        })
+    async fn head(&self, key: &str) -> Result<Option<VersionedData>, ExternalError> {
+        self.handle
+            .run_op("head", || self.consensus.head(key))
+            .await
     }
 
-    async fn set(&mut self, key: &str, value: Vec<u8>, atomic: Atomicity) -> Result<(), Error> {
-        self.handle.check_unavailable("blob set")?;
-        self.blob.set(key, value, atomic).await
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<SeqNo>,
+        new: VersionedData,
+    ) -> Result<CaSResult, ExternalError> {
+        self.handle
+            .run_op("compare_and_set", || {
+                self.consensus.compare_and_set(key, expected, new)
+            })
+            .await
     }
 
-    async fn delete(&mut self, key: &str) -> Result<(), Error> {
-        self.handle.check_unavailable("blob delete")?;
-        self.blob.delete(key).await
+    async fn scan(
+        &self,
+        key: &str,
+        from: SeqNo,
+        limit: usize,
+    ) -> Result<Vec<VersionedData>, ExternalError> {
+        self.handle
+            .run_op("scan", || self.consensus.scan(key, from, limit))
+            .await
+    }
+
+    async fn truncate(&self, key: &str, seqno: SeqNo) -> Result<usize, ExternalError> {
+        self.handle
+            .run_op("truncate", || self.consensus.truncate(key, seqno))
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::mem::{MemBlob, MemLog};
-    use crate::storage::Atomicity::RequireAtomic;
+    use mz_ore::{assert_err, assert_ok};
+
+    use crate::mem::{MemBlob, MemBlobConfig, MemConsensus};
 
     use super::*;
 
-    #[test]
-    fn log() {
-        let (mut log, mut handle) = UnreliableLog::new(MemLog::new_no_reentrance("unreliable"));
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
+    async fn unreliable_blob() {
+        let blob = Arc::new(MemBlob::open(MemBlobConfig::default()));
+        let handle = UnreliableHandle::default();
+        let blob = UnreliableBlob::new(blob, handle.clone());
 
-        // Initially starts reliable.
-        assert!(log.write_sync(vec![]).is_ok());
-        assert!(log.snapshot(|_, _| { Ok(()) }).is_ok());
-        assert!(log.truncate(SeqNo(1)).is_ok());
+        // Use a fixed seed so this test doesn't flake.
+        {
+            (*handle.core.lock().expect("mutex poisoned")).rng = SmallRng::seed_from_u64(0);
+        }
 
-        // Setting it to unavailable causes all operations to fail.
-        handle.make_unavailable();
-        assert!(log.write_sync(vec![]).is_err());
-        assert!(log.snapshot(|_, _| { Ok(()) }).is_err());
-        assert!(log.truncate(SeqNo(1)).is_err());
+        // By default, it's partially reliable.
+        let mut succeeded = 0;
+        for _ in 0..100 {
+            if blob.get("a").await.is_ok() {
+                succeeded += 1;
+            }
+        }
+        // Intentionally have pretty loose bounds so this assertion doesn't
+        // become a maintenance burden if the rng impl changes.
+        assert!(succeeded > 50 && succeeded < 99, "succeeded={}", succeeded);
 
-        // Can be set back to working.
-        handle.make_available();
-        assert!(log.write_sync(vec![]).is_ok());
-        assert!(log.snapshot(|_, _| { Ok(()) }).is_ok());
-        assert!(log.truncate(SeqNo(2)).is_ok());
+        // Reliable doesn't error.
+        handle.totally_available();
+        assert_ok!(blob.get("a").await);
+
+        // Unreliable does error.
+        handle.totally_unavailable();
+        assert_err!(blob.get("a").await);
     }
 
-    #[tokio::test]
-    async fn blob() {
-        let (mut blob, mut handle) = UnreliableBlob::new(MemBlob::new_no_reentrance("unreliable"));
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
+    async fn unreliable_consensus() {
+        let consensus = Arc::new(MemConsensus::default());
+        let handle = UnreliableHandle::default();
+        let consensus = UnreliableConsensus::new(consensus, handle.clone());
 
-        // Initially starts reliable.
-        assert!(blob.set("a", b"1".to_vec(), RequireAtomic).await.is_ok());
-        assert!(blob.get("a").await.is_ok());
+        // Use a fixed seed so this test doesn't flake.
+        {
+            (*handle.core.lock().expect("mutex poisoned")).rng = SmallRng::seed_from_u64(0);
+        }
 
-        // Setting it to unavailable causes all operations to fail.
-        handle.make_unavailable();
-        assert!(blob.set("a", b"2".to_vec(), RequireAtomic).await.is_err());
-        assert!(blob.get("a").await.is_err());
+        // By default, it's partially reliable.
+        let mut succeeded = 0;
+        for _ in 0..100 {
+            if consensus.head("key").await.is_ok() {
+                succeeded += 1;
+            }
+        }
+        // Intentionally have pretty loose bounds so this assertion doesn't
+        // become a maintenance burden if the rng impl changes.
+        assert!(succeeded > 50 && succeeded < 99, "succeeded={}", succeeded);
 
-        // Can be set back to working.
-        handle.make_available();
-        assert!(blob.set("a", b"3".to_vec(), RequireAtomic).await.is_ok());
-        assert!(blob.get("a").await.is_ok());
+        // Reliable doesn't error.
+        handle.totally_available();
+        assert_ok!(consensus.head("key").await);
+
+        // Unreliable does error.
+        handle.totally_unavailable();
+        assert_err!(consensus.head("key").await);
     }
 }

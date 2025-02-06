@@ -6,12 +6,19 @@
 // As of the Change Date specified in that file, in accordance with
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 
+use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
+use mz_repr::{Datum, Row};
+use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::linear::proto_map_filter_project::ProtoPredicate;
+use crate::visit::Visit;
 use crate::{MirRelationExpr, MirScalarExpr};
-use repr::{Datum, Row};
+
+include!(concat!(env!("OUT_DIR"), "/mz_expr.linear.rs"));
 
 /// A compound operator that can be applied row-by-row.
 ///
@@ -27,7 +34,7 @@ use repr::{Datum, Row};
 /// expressions in `self.expressions`, even though this is not something
 /// we can directly evaluate. The plan creation methods will defensively
 /// ensure that the right thing happens.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, Ord, PartialOrd)]
 pub struct MapFilterProject {
     /// A sequence of expressions that should be appended to the row.
     ///
@@ -49,9 +56,90 @@ pub struct MapFilterProject {
     pub projection: Vec<usize>,
     /// The expected number of input columns.
     ///
-    /// This is needed to enure correct identification of newly formed
+    /// This is needed to ensure correct identification of newly formed
     /// columns in the output.
     pub input_arity: usize,
+}
+
+/// Use a custom [`Arbitrary`] implementation to cap the number of internal
+/// [`MirScalarExpr`] referenced by the generated [`MapFilterProject`]  instances.
+impl Arbitrary for MapFilterProject {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        (
+            prop::collection::vec(any::<MirScalarExpr>(), 0..10),
+            prop::collection::vec((any::<usize>(), any::<MirScalarExpr>()), 0..10),
+            prop::collection::vec(any::<usize>(), 0..10),
+            usize::arbitrary(),
+        )
+            .prop_map(
+                |(expressions, predicates, projection, input_arity)| MapFilterProject {
+                    expressions,
+                    predicates,
+                    projection,
+                    input_arity,
+                },
+            )
+            .boxed()
+    }
+}
+
+impl RustType<ProtoMapFilterProject> for MapFilterProject {
+    fn into_proto(&self) -> ProtoMapFilterProject {
+        ProtoMapFilterProject {
+            expressions: self.expressions.into_proto(),
+            predicates: self.predicates.into_proto(),
+            projection: self.projection.into_proto(),
+            input_arity: self.input_arity.into_proto(),
+        }
+    }
+
+    fn from_proto(proto: ProtoMapFilterProject) -> Result<Self, TryFromProtoError> {
+        Ok(MapFilterProject {
+            expressions: proto.expressions.into_rust()?,
+            predicates: proto.predicates.into_rust()?,
+            projection: proto.projection.into_rust()?,
+            input_arity: proto.input_arity.into_rust()?,
+        })
+    }
+}
+
+impl RustType<ProtoPredicate> for (usize, MirScalarExpr) {
+    fn into_proto(&self) -> ProtoPredicate {
+        ProtoPredicate {
+            column_to_apply: self.0.into_proto(),
+            predicate: Some(self.1.into_proto()),
+        }
+    }
+
+    fn from_proto(proto: ProtoPredicate) -> Result<Self, TryFromProtoError> {
+        Ok((
+            proto.column_to_apply.into_rust()?,
+            proto
+                .predicate
+                .into_rust_if_some("ProtoPredicate::predicate")?,
+        ))
+    }
+}
+
+impl Display for MapFilterProject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "MapFilterProject(")?;
+        writeln!(f, "  expressions:")?;
+        self.expressions
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, e)| writeln!(f, "    #{} <- {},", i + self.input_arity, e))?;
+        writeln!(f, "  predicates:")?;
+        self.predicates
+            .iter()
+            .try_for_each(|(before, p)| writeln!(f, "    <before: {}> {},", before, p))?;
+        writeln!(f, "  projection: {:?}", self.projection)?;
+        writeln!(f, "  input_arity: {}", self.input_arity)?;
+        writeln!(f, ")")
+    }
 }
 
 impl MapFilterProject {
@@ -63,6 +151,15 @@ impl MapFilterProject {
             projection: (0..input_arity).collect(),
             input_arity,
         }
+    }
+
+    /// Given two mfps, return an mfp that applies one
+    /// followed by the other.
+    /// Note that the arguments are in the opposite order
+    /// from how function composition is usually written in mathematics.
+    pub fn compose(before: Self, after: Self) -> Self {
+        let (m, f, p) = after.into_map_filter_project();
+        before.map(m).filter(f).project(p)
     }
 
     /// True if the operator describes the identity transformation.
@@ -143,19 +240,22 @@ impl MapFilterProject {
         self
     }
 
+    /// Like [`MapFilterProject::as_map_filter_project`], but consumes `self` rather than cloning.
+    pub fn into_map_filter_project(self) -> (Vec<MirScalarExpr>, Vec<MirScalarExpr>, Vec<usize>) {
+        let predicates = self
+            .predicates
+            .into_iter()
+            .map(|(_pos, predicate)| predicate)
+            .collect();
+        (self.expressions, predicates, self.projection)
+    }
+
     /// As the arguments to `Map`, `Filter`, and `Project` operators.
     ///
     /// In principle, this operator can be implemented as a sequence of
     /// more elemental operators, likely less efficiently.
     pub fn as_map_filter_project(&self) -> (Vec<MirScalarExpr>, Vec<MirScalarExpr>, Vec<usize>) {
-        let map = self.expressions.clone();
-        let filter = self
-            .predicates
-            .iter()
-            .map(|(_pos, predicate)| predicate.clone())
-            .collect::<Vec<_>>();
-        let project = self.projection.clone();
-        (map, filter, project)
+        self.clone().into_map_filter_project()
     }
 
     /// Determines if a scalar expression must be equal to a literal datum.
@@ -186,16 +286,17 @@ impl MapFilterProject {
     ///
     /// This method returns `None` on an empty `exprs`, which might be surprising, but
     /// seems to line up with its callers' expectations of that being a non-constraint.
-    /// The caller knows if `exprs` is empty, and can modify their behavior appopriately.
+    /// The caller knows if `exprs` is empty, and can modify their behavior appropriately.
     /// if they would rather have a literal empty row.
     pub fn literal_constraints(&self, exprs: &[MirScalarExpr]) -> Option<Row> {
         if exprs.is_empty() {
             return None;
         }
         let mut row = Row::default();
+        let mut packer = row.packer();
         for expr in exprs {
             if let Some(literal) = self.literal_constraint(expr) {
-                row.push(literal);
+                packer.push(literal);
             } else {
                 return None;
             }
@@ -206,7 +307,7 @@ impl MapFilterProject {
     /// Extracts any MapFilterProject at the root of the expression.
     ///
     /// The expression will be modified to extract any maps, filters, and
-    /// projections, which will be return as `Self`. If there are no maps,
+    /// projections, which will be returned as `Self`. If there are no maps,
     /// filters, or projections the method will return an identity operator.
     ///
     /// The extracted expressions may contain temporal predicates, and one
@@ -228,6 +329,8 @@ impl MapFilterProject {
                 let (mfp, expr) = Self::extract_from_expression(input);
                 (mfp.project(outputs.iter().cloned()), expr)
             }
+            // TODO: The recursion is quadratic in the number of Map/Filter/Project operators due to
+            // this call to `arity()`.
             x => (Self::new(x.arity()), x),
         }
     }
@@ -246,20 +349,58 @@ impl MapFilterProject {
             MirRelationExpr::Map { input, scalars }
                 if scalars.iter().all(|s| !s.is_literal_err()) =>
             {
-                let (mfp, expr) = Self::extract_from_expression(input);
+                let (mfp, expr) = Self::extract_non_errors_from_expr(input);
                 (mfp.map(scalars.iter().cloned()), expr)
             }
             MirRelationExpr::Filter { input, predicates }
                 if predicates.iter().all(|p| !p.is_literal_err()) =>
             {
-                let (mfp, expr) = Self::extract_from_expression(input);
+                let (mfp, expr) = Self::extract_non_errors_from_expr(input);
                 (mfp.filter(predicates.iter().cloned()), expr)
             }
             MirRelationExpr::Project { input, outputs } => {
-                let (mfp, expr) = Self::extract_from_expression(input);
+                let (mfp, expr) = Self::extract_non_errors_from_expr(input);
                 (mfp.project(outputs.iter().cloned()), expr)
             }
             x => (Self::new(x.arity()), x),
+        }
+    }
+
+    /// Extracts an error-free MapFilterProject at the root of the expression.
+    ///
+    /// Differs from [MapFilterProject::extract_non_errors_from_expr] by taking and returning a
+    /// mutable reference.
+    pub fn extract_non_errors_from_expr_ref_mut(
+        expr: &mut MirRelationExpr,
+    ) -> (Self, &mut MirRelationExpr) {
+        // This is essentially the same code as `extract_non_errors_from_expr`, except the seemingly
+        // superfluous outer if, which works around a borrow-checker issue:
+        // https://github.com/rust-lang/rust/issues/54663
+        if matches!(expr, MirRelationExpr::Map { input: _, scalars } if scalars.iter().all(|s| !s.is_literal_err()))
+            || matches!(expr, MirRelationExpr::Filter { input: _, predicates } if predicates.iter().all(|p| !p.is_literal_err()))
+            || matches!(expr, MirRelationExpr::Project { .. })
+        {
+            match expr {
+                MirRelationExpr::Map { input, scalars }
+                    if scalars.iter().all(|s| !s.is_literal_err()) =>
+                {
+                    let (mfp, expr) = Self::extract_non_errors_from_expr_ref_mut(input);
+                    (mfp.map(scalars.iter().cloned()), expr)
+                }
+                MirRelationExpr::Filter { input, predicates }
+                    if predicates.iter().all(|p| !p.is_literal_err()) =>
+                {
+                    let (mfp, expr) = Self::extract_non_errors_from_expr_ref_mut(input);
+                    (mfp.filter(predicates.iter().cloned()), expr)
+                }
+                MirRelationExpr::Project { input, outputs } => {
+                    let (mfp, expr) = Self::extract_non_errors_from_expr_ref_mut(input);
+                    (mfp.project(outputs.iter().cloned()), expr)
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            (Self::new(expr.arity()), expr)
         }
     }
 
@@ -332,14 +473,14 @@ impl MapFilterProject {
         });
 
         // Determine extended input columns used by temporal filters.
-        let mut support = HashSet::new();
+        let mut support = BTreeSet::new();
         for predicate in temporal_predicates.iter() {
             support.extend(predicate.support());
         }
 
         // Discover the locations of these columns after `self.projection`.
         let old_projection_len = self.projection.len();
-        let mut new_location = HashMap::with_capacity(support.len());
+        let mut new_location = BTreeMap::new();
         for original in support.iter() {
             if let Some(position) = self.projection.iter().position(|x| x == original) {
                 new_location.insert(*original, position);
@@ -357,6 +498,60 @@ impl MapFilterProject {
         Self::new(self.projection.len())
             .filter(temporal_predicates)
             .project(0..old_projection_len)
+    }
+
+    /// Extracts common expressions from multiple `Self` into a result `Self`.
+    ///
+    /// The argument `mfps` are mutated so that each are functionaly equivalent to their
+    /// corresponding input, when composed atop the resulting `Self`.
+    pub fn extract_common(mfps: &mut [&mut Self]) -> Self {
+        match mfps.len() {
+            0 => {
+                panic!("Cannot call method on empty arguments");
+            }
+            1 => {
+                let output_arity = mfps[0].projection.len();
+                std::mem::replace(mfps[0], MapFilterProject::new(output_arity))
+            }
+            _ => {
+                // Prepare a return `Self`.
+                let input_arity = mfps[0].input_arity;
+                let mut result_mfp = MapFilterProject::new(input_arity);
+
+                // Naive strategy:
+                // First, look for identical predicates and extract them.
+                // Then, look for unused columns and project them away.
+
+                // First, look for identical predicates and extract them.
+                // The trouble here is CSE, as predicates may not "look"
+                // identical despite being identical.
+                // unimplemented!()
+
+                // Then, look for unused columns and project them away.
+                let mut common_demand = BTreeSet::new();
+                for mfp in mfps.iter() {
+                    common_demand.extend(mfp.demand());
+                }
+                // columns in `common_demand` must be retained, but others
+                // may be discarded.
+                let common_demand = (0..input_arity)
+                    .filter(|x| common_demand.contains(x))
+                    .collect::<Vec<_>>();
+                let remap = common_demand
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(new, old)| (old, new))
+                    .collect::<BTreeMap<_, _>>();
+                for mfp in mfps.iter_mut() {
+                    mfp.permute_fn(|c| remap[&c], common_demand.len());
+                }
+                result_mfp = result_mfp.project(common_demand);
+
+                // Return the resulting MFP.
+                result_mfp
+            }
+        }
     }
 
     /// Returns `self`, and leaves behind an identity operator that acts on its output.
@@ -406,7 +601,7 @@ impl MapFilterProject {
     /// # Example
     ///
     /// ```rust
-    /// use expr::{BinaryFunc, MapFilterProject, MirScalarExpr};
+    /// use mz_expr::{BinaryFunc, MapFilterProject, MirScalarExpr};
     ///
     /// // imagine an action on columns (a, b, c, d).
     /// let original = MapFilterProject::new(4).map(vec![
@@ -420,7 +615,7 @@ impl MapFilterProject {
     /// // The `partition` method requires a map from *expected* input columns to *actual*
     /// // input columns. In the example above, the columns a, b, and c exist, and are at
     /// // locations 2, 0, and 4 respectively. We must construct a map to this effect.
-    /// let mut available_columns = std::collections::HashMap::new();
+    /// let mut available_columns = std::collections::BTreeMap::new();
     /// available_columns.insert(0, 2);
     /// available_columns.insert(1, 0);
     /// available_columns.insert(2, 4);
@@ -442,7 +637,7 @@ impl MapFilterProject {
     ///
     /// // To reconstruct `self`, we must introduce the columns that are not present,
     /// // and present them in the order intended by `self`. In this example, we must
-    /// // introduce colunm d and permute the columns so that they begin (a, b, c, d).
+    /// // introduce column d and permute the columns so that they begin (a, b, c, d).
     /// // The columns x and y must be projected away, and any columns introduced by
     /// // `begin` must be retained in their current order.
     ///
@@ -450,7 +645,7 @@ impl MapFilterProject {
     /// // may not need all inputs. The `demand()` and `permute()` methods can
     /// // optimize the representation.
     /// ```
-    pub fn partition(self, available: HashMap<usize, usize>, input_arity: usize) -> (Self, Self) {
+    pub fn partition(self, available: BTreeMap<usize, usize>, input_arity: usize) -> (Self, Self) {
         // Map expressions, filter predicates, and projections for `before` and `after`.
         let mut before_expr = Vec::new();
         let mut before_pred = Vec::new();
@@ -460,7 +655,7 @@ impl MapFilterProject {
         let mut after_proj = Vec::new();
 
         // Track which output columns must be preserved in the output of `before`.
-        let mut demanded = HashSet::new();
+        let mut demanded = BTreeSet::new();
         demanded.extend(0..self.input_arity);
         demanded.extend(self.projection.iter());
 
@@ -544,7 +739,7 @@ impl MapFilterProject {
         // This map is used to correct references in `after`.
         // The presumption is that `after` will be presented with all input columns,
         // followed by the output columns introduced by `before` in order.
-        let mut after_map = HashMap::new();
+        let mut after_map = BTreeMap::new();
         for index in 0..self.input_arity {
             after_map.insert(index, index);
         }
@@ -600,8 +795,8 @@ impl MapFilterProject {
     /// It is entirely appropriate to determine the demand of an instance
     /// and then both apply a projection to the subject of the instance and
     /// `self.permute` this instance.
-    pub fn demand(&self) -> HashSet<usize> {
-        let mut demanded = HashSet::new();
+    pub fn demand(&self) -> BTreeSet<usize> {
+        let mut demanded = BTreeSet::new();
         for (_index, pred) in self.predicates.iter() {
             demanded.extend(pred.support());
         }
@@ -621,23 +816,31 @@ impl MapFilterProject {
     /// with the expectation that `shuffle` describes all input columns, and so the
     /// intermediate results will be able to start at position `shuffle.len()`.
     ///
-    /// The supplied `shuffle` may not list columns that are not "demanded" by the
+    /// The supplied `shuffle` might not list columns that are not "demanded" by the
     /// instance, and so we should ensure that `self` is optimized to not reference
     /// columns that are not demanded.
-    pub fn permute(&mut self, mut shuffle: HashMap<usize, usize>, new_input_arity: usize) {
+    pub fn permute_fn<F>(&mut self, remap: F, new_input_arity: usize)
+    where
+        F: Fn(usize) -> usize,
+    {
         let (mut map, mut filter, mut project) = self.as_map_filter_project();
-        for index in 0..map.len() {
-            // Intermediate columns are just shifted.
-            shuffle.insert(self.input_arity + index, new_input_arity + index);
-        }
+        let map_len = map.len();
+        let action = |col: &mut usize| {
+            if self.input_arity <= *col && *col < self.input_arity + map_len {
+                *col = new_input_arity + (*col - self.input_arity);
+            } else {
+                *col = remap(*col);
+            }
+        };
         for expr in map.iter_mut() {
-            expr.permute_map(&shuffle);
+            expr.visit_columns(action);
         }
         for pred in filter.iter_mut() {
-            pred.permute_map(&shuffle);
+            pred.visit_columns(action);
         }
         for proj in project.iter_mut() {
-            *proj = shuffle[proj];
+            action(proj);
+            assert!(*proj < new_input_arity + map.len());
         }
         *self = Self::new(new_input_arity)
             .map(map)
@@ -669,7 +872,7 @@ impl MapFilterProject {
     /// along the optimization path.
     ///
     /// ```rust
-    /// use expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
+    /// use mz_expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
     /// // Demonstrate extraction of common expressions (here: parsing strings).
     /// let mut map_filter_project = MapFilterProject::new(5)
     ///     .map(vec![
@@ -695,21 +898,77 @@ impl MapFilterProject {
     /// );
     /// ```
     pub fn optimize(&mut self) {
-        // Optimization memoizes individual `ScalarExpr` expressions that
-        // are sure to be evaluated, canonicalizes references to the first
-        // occurrence of each, inlines expressions that have a reference
-        // count of one, and then removes any expressions that are not
-        // referenced.
-        self.memoize_expressions();
-        self.inline_expressions();
-        self.remove_undemanded();
+        // Track sizes and iterate as long as they decrease.
+        let mut prev_size = None;
+        let mut self_size = usize::max_value();
+        // Continue as long as strict improvements occur.
+        while prev_size.map(|p| self_size < p).unwrap_or(true) {
+            // Lock in current size.
+            prev_size = Some(self_size);
 
-        // Re-build `self` from parts to restore evaluation order invariants.
-        let (map, filter, project) = self.as_map_filter_project();
-        *self = Self::new(self.input_arity)
-            .map(map)
-            .filter(filter)
-            .project(project);
+            // We have an annoying pattern of mapping literals that already exist as columns (by filters).
+            // Try to identify this pattern, of a map that introduces an expression equated to a prior column,
+            // and then replace the mapped expression by a column reference.
+            //
+            // We think this is due to `LiteralLifting`, and we might investigate removing the introduciton in
+            // the first place. The tell-tale that we see when we fix is a diff that look likes
+            //
+            // - Project (#0, #2)
+            // -   Filter (#1 = 1)
+            // -     Map (1)
+            // -       Get l0
+            // + Filter (#1 = 1)
+            // +   Get l0
+            //
+            for (index, expr) in self.expressions.iter_mut().enumerate() {
+                // If `expr` matches a filter equating it to a column < index + input_arity, rewrite it
+                for (_, predicate) in self.predicates.iter() {
+                    if let MirScalarExpr::CallBinary {
+                        func: crate::BinaryFunc::Eq,
+                        expr1,
+                        expr2,
+                    } = predicate
+                    {
+                        if let MirScalarExpr::Column(c) = &**expr1 {
+                            if *c < index + self.input_arity && &**expr2 == expr {
+                                *expr = MirScalarExpr::Column(*c);
+                            }
+                        }
+                        if let MirScalarExpr::Column(c) = &**expr2 {
+                            if *c < index + self.input_arity && &**expr1 == expr {
+                                *expr = MirScalarExpr::Column(*c);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Optimization memoizes individual `ScalarExpr` expressions that
+            // are sure to be evaluated, canonicalizes references to the first
+            // occurrence of each, inlines expressions that have a reference
+            // count of one, and then removes any expressions that are not
+            // referenced.
+            self.memoize_expressions();
+            self.predicates.sort();
+            self.predicates.dedup();
+            self.inline_expressions();
+            self.remove_undemanded();
+
+            // Re-build `self` from parts to restore evaluation order invariants.
+            let (map, filter, project) = self.as_map_filter_project();
+            *self = Self::new(self.input_arity)
+                .map(map)
+                .filter(filter)
+                .project(project);
+
+            self_size = self.size();
+        }
+    }
+
+    /// Total expression sizes across all expressions.
+    pub fn size(&self) -> usize {
+        self.expressions.iter().map(|e| e.size()).sum::<usize>()
+            + self.predicates.iter().map(|(_, e)| e.size()).sum::<usize>()
     }
 
     /// Place each certainly evaluated expression in its own column.
@@ -718,7 +977,7 @@ impl MapFilterProject {
     /// in its own column, and deduplicates them so that all references to
     /// the same expression reference the same column.
     ///
-    /// This tranformation is restricted to expressions we are certain will
+    /// This transformation is restricted to expressions we are certain will
     /// be evaluated, which does not include expressions in `if` statements.
     ///
     /// # Example
@@ -727,10 +986,10 @@ impl MapFilterProject {
     /// that are used multiple times, and ensures that each are extracted
     /// into columns and then referenced by column. This pass does not try
     /// to minimize the occurrences of column references, which will happen
-    /// in inliniing.
+    /// in inlining.
     ///
     /// ```rust
-    /// use expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
+    /// use mz_expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
     /// // Demonstrate extraction of common expressions (here: parsing strings).
     /// let mut map_filter_project = MapFilterProject::new(5)
     ///     .map(vec![
@@ -764,7 +1023,7 @@ impl MapFilterProject {
     /// for example if they occur in conditional branches of a `MirScalarExpr::If`.
     ///
     /// ```rust
-    /// use expr::{MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
+    /// use mz_expr::{MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
     /// // Demonstrate extraction of unconditionally evaluated expressions, as well as
     /// // the non-extraction of common expressions guarded by conditions.
     /// let mut map_filter_project = MapFilterProject::new(2)
@@ -810,7 +1069,7 @@ impl MapFilterProject {
     pub fn memoize_expressions(&mut self) {
         // Record the mapping from starting column references to new column
         // references.
-        let mut remaps = HashMap::new();
+        let mut remaps = BTreeMap::new();
         for index in 0..self.input_arity {
             remaps.insert(index, index);
         }
@@ -858,6 +1117,11 @@ impl MapFilterProject {
         for proj in self.projection.iter_mut() {
             *proj = remaps[proj];
         }
+
+        // Restore predicate order invariants.
+        for (pos, pred) in self.predicates.iter_mut() {
+            *pos = pred.support().into_iter().max().map(|x| x + 1).unwrap_or(0);
+        }
     }
 
     /// This method inlines expressions with a single use.
@@ -866,7 +1130,7 @@ impl MapFilterProject {
     /// that are no longer referenced. The `remove_undemanded()` method does
     /// that, and should likely be used after this method.
     ///
-    /// Inlining replaces column references when the refered-to item is either
+    /// Inlining replaces column references when the referred-to item is either
     /// another column reference, or the only referrer of its referent. This
     /// is most common after memoization has atomized all expressions to seek
     /// out re-use: inlining re-assembles expressions that were not helpfully
@@ -882,7 +1146,7 @@ impl MapFilterProject {
     /// pass (the `remove_undemanded` method).
     ///
     /// ```rust
-    /// use expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
+    /// use mz_expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
     /// // Use the output from first `memoize_expression` example.
     /// let mut map_filter_project = MapFilterProject::new(5)
     ///     .map(vec![
@@ -923,14 +1187,18 @@ impl MapFilterProject {
         let mut reference_count = vec![0; input_arity + self.expressions.len()];
         // Increment reference counts for each use
         for expr in self.expressions.iter() {
-            for col in expr.support().into_iter() {
-                reference_count[col] += 1;
-            }
+            expr.visit_pre(|e| {
+                if let MirScalarExpr::Column(i) = e {
+                    reference_count[*i] += 1;
+                }
+            });
         }
         for (_, pred) in self.predicates.iter() {
-            for col in pred.support().into_iter() {
-                reference_count[col] += 1;
-            }
+            pred.visit_pre(|e| {
+                if let MirScalarExpr::Column(i) = e {
+                    reference_count[*i] += 1;
+                }
+            });
         }
         for proj in self.projection.iter() {
             reference_count[*proj] += 1;
@@ -963,26 +1231,7 @@ impl MapFilterProject {
             }
         }
         // Inline expressions per `should_inline`.
-        for index in 0..self.expressions.len() {
-            let (prior, expr) = self.expressions.split_at_mut(index);
-            expr[0].visit_mut_post(&mut |e| {
-                if let MirScalarExpr::Column(i) = e {
-                    if should_inline[*i] {
-                        *e = prior[*i - input_arity].clone();
-                    }
-                }
-            });
-        }
-        for (_index, pred) in self.predicates.iter_mut() {
-            let expressions = &self.expressions;
-            pred.visit_mut_post(&mut |e| {
-                if let MirScalarExpr::Column(i) = e {
-                    if should_inline[*i] {
-                        *e = expressions[*i - input_arity].clone();
-                    }
-                }
-            });
-        }
+        self.perform_inlining(should_inline);
         // We can only inline column references in `self.projection`, but we should.
         for proj in self.projection.iter_mut() {
             if *proj >= self.input_arity {
@@ -990,6 +1239,33 @@ impl MapFilterProject {
                     *proj = i;
                 }
             }
+        }
+    }
+
+    /// Inlines those expressions that are indicated by should_inline.
+    /// See `inline_expressions` for usage.
+    pub fn perform_inlining(&mut self, should_inline: Vec<bool>) {
+        for index in 0..self.expressions.len() {
+            let (prior, expr) = self.expressions.split_at_mut(index);
+            #[allow(deprecated)]
+            expr[0].visit_mut_post_nolimit(&mut |e| {
+                if let MirScalarExpr::Column(i) = e {
+                    if should_inline[*i] {
+                        *e = prior[*i - self.input_arity].clone();
+                    }
+                }
+            });
+        }
+        for (_index, pred) in self.predicates.iter_mut() {
+            let expressions = &self.expressions;
+            #[allow(deprecated)]
+            pred.visit_mut_post_nolimit(&mut |e| {
+                if let MirScalarExpr::Column(i) = e {
+                    if should_inline[*i] {
+                        *e = expressions[*i - self.input_arity].clone();
+                    }
+                }
+            });
         }
     }
 
@@ -1002,7 +1278,7 @@ impl MapFilterProject {
     /// # Example
     ///
     /// ```rust
-    /// use expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
+    /// use mz_expr::{func, MapFilterProject, MirScalarExpr, UnaryFunc, BinaryFunc};
     /// // Use the output from `inline_expression` example.
     /// let mut map_filter_project = MapFilterProject::new(5)
     ///     .map(vec![
@@ -1024,7 +1300,7 @@ impl MapFilterProject {
     ///     ])
     ///     .project(vec![3,4,6,7]);
     ///
-    /// // Remove undemandedd expressions, streamlining the work done..
+    /// // Remove undemanded expressions, streamlining the work done..
     /// map_filter_project.remove_undemanded();
     ///
     /// assert_eq!(
@@ -1034,7 +1310,7 @@ impl MapFilterProject {
     /// ```
     pub fn remove_undemanded(&mut self) {
         // Determine the demanded expressions to remove irrelevant ones.
-        let mut demand = std::collections::HashSet::new();
+        let mut demand = BTreeSet::new();
         for (_index, pred) in self.predicates.iter() {
             demand.extend(pred.support());
         }
@@ -1051,7 +1327,7 @@ impl MapFilterProject {
 
         // Maintain a map from initial column identifiers to locations
         // once we have removed undemanded expressions.
-        let mut remap = HashMap::new();
+        let mut remap = BTreeMap::new();
         // This map only needs to map elements of `demand` to a new location,
         // but the logic is easier if we include all input columns (as the
         // new position is then determined by the size of the map).
@@ -1097,7 +1373,8 @@ pub fn memoize_expr(
     memoized_parts: &mut Vec<MirScalarExpr>,
     input_arity: usize,
 ) {
-    expr.visit_mut_pre_post(
+    #[allow(deprecated)]
+    expr.visit_mut_pre_post_nolimit(
         &mut |e| {
             // We should not eagerly memoize `if` branches that might not be taken.
             // TODO: Memoize expressions in the intersection of `then` and `els`.
@@ -1108,8 +1385,17 @@ pub fn memoize_expr(
         },
         &mut |e| {
             match e {
-                MirScalarExpr::Column(_) | MirScalarExpr::Literal(_, _) => {
+                MirScalarExpr::Literal(_, _) => {
                     // Literals do not need to be memoized.
+                }
+                MirScalarExpr::Column(col) => {
+                    // Column references do not need to be memoized, but may need to be
+                    // updated if they reference a column reference themselves.
+                    if *col > input_arity {
+                        if let MirScalarExpr::Column(col2) = memoized_parts[*col - input_arity] {
+                            *col = col2;
+                        }
+                    }
                 }
                 _ => {
                     if let Some(position) = memoized_parts.iter().position(|e2| e2 == e) {
@@ -1131,50 +1417,141 @@ pub fn memoize_expr(
 }
 
 pub mod util {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    /// Takes a permutation represented as an array
-    /// (where the `i`th column being `j` implies that column `i` in the original row
-    ///  corresponds to column `j` in the permuted row; see `dataflow::render::Permutation`)
-    /// and converts it to a column map along with the arity of the permuted representation
-    pub fn permutation_to_map_and_new_arity(
-        permutation: &[usize],
-    ) -> (HashMap<usize, usize>, usize) {
-        (
-            permutation.iter().cloned().enumerate().collect(),
-            permutation
-                .iter()
-                .cloned()
-                .max()
-                .map(|x| x + 1)
-                .unwrap_or(0),
-        )
+    use crate::MirScalarExpr;
+
+    #[allow(dead_code)]
+    /// A triple of actions that map from rows to (key, val) pairs and back again.
+    struct KeyValRowMapping {
+        /// Expressions to apply to a row to produce key datums.
+        to_key: Vec<MirScalarExpr>,
+        /// Columns to project from a row to produce residual value datums.
+        to_val: Vec<usize>,
+        /// Columns to project from the concatenation of key and value to reconstruct the row.
+        to_row: Vec<usize>,
+    }
+
+    /// Derive supporting logic to support transforming rows to (key, val) pairs,
+    /// and back again.
+    ///
+    /// We are given as input a list of key expressions and an input arity, and the
+    /// requirement the produced key should be the application of the key expressions.
+    /// To produce the `val` output, we will identify those input columns not found in
+    /// the key expressions, and name all other columns.
+    /// To reconstitute the original row, we identify the sequence of columns from the
+    /// concatenation of key and val which would reconstruct the original row.
+    ///
+    /// The output is a pair of column sequences, the first used to reconstruct a row
+    /// from the concatenation of key and value, and the second to identify the columns
+    /// of a row that should become the value associated with its key.
+    ///
+    /// The permutations and thinning expressions generated here will be tracked in
+    /// `dataflow::plan::AvailableCollections`; see the
+    /// documentation there for more details.
+    pub fn permutation_for_arrangement(
+        key: &[MirScalarExpr],
+        unthinned_arity: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let columns_in_key: BTreeMap<_, _> = key
+            .iter()
+            .enumerate()
+            .filter_map(|(i, key_col)| key_col.as_column().map(|c| (c, i)))
+            .collect();
+        let mut input_cursor = key.len();
+        let permutation = (0..unthinned_arity)
+            .map(|c| {
+                if let Some(c) = columns_in_key.get(&c) {
+                    // Column is in key (and thus gone from the value
+                    // of the thinned representation)
+                    *c
+                } else {
+                    // Column remains in value of the thinned representation
+                    input_cursor += 1;
+                    input_cursor - 1
+                }
+            })
+            .collect();
+        let thinning = (0..unthinned_arity)
+            .filter(|c| !columns_in_key.contains_key(c))
+            .collect();
+        (permutation, thinning)
+    }
+
+    /// Given the permutations (see [`permutation_for_arrangement`] and
+    /// (`dataflow::plan::AvailableCollections`) corresponding to two
+    /// collections with the same key arity,
+    /// computes the permutation for the result of joining them.
+    pub fn join_permutations(
+        key_arity: usize,
+        stream_permutation: Vec<usize>,
+        thinned_stream_arity: usize,
+        lookup_permutation: Vec<usize>,
+    ) -> BTreeMap<usize, usize> {
+        let stream_arity = stream_permutation.len();
+        let lookup_arity = lookup_permutation.len();
+
+        (0..stream_arity + lookup_arity)
+            .map(|i| {
+                let location = if i < stream_arity {
+                    stream_permutation[i]
+                } else {
+                    let location_in_lookup = lookup_permutation[i - stream_arity];
+                    if location_in_lookup < key_arity {
+                        location_in_lookup
+                    } else {
+                        location_in_lookup + thinned_stream_arity
+                    }
+                };
+                (i, location)
+            })
+            .collect()
     }
 }
 
 pub mod plan {
+    use std::iter;
 
-    use std::collections::HashMap;
-
+    use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
+    use mz_repr::{Datum, Diff, Row, RowArena};
+    use proptest::prelude::*;
+    use proptest_derive::Arbitrary;
     use serde::{Deserialize, Serialize};
 
     use crate::{
-        func, BinaryFunc, EvalError, MapFilterProject, MirScalarExpr, NullaryFunc, UnaryFunc,
+        func, BinaryFunc, EvalError, MapFilterProject, MirScalarExpr, ProtoMfpPlan,
+        ProtoSafeMfpPlan, UnaryFunc, UnmaterializableFunc,
     };
-    use repr::adt::numeric::Numeric;
-    use repr::{Datum, Diff, Row, RowArena, ScalarType};
-
-    use super::util::permutation_to_map_and_new_arity;
 
     /// A wrapper type which indicates it is safe to simply evaluate all expressions.
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Arbitrary, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
     pub struct SafeMfpPlan {
-        mfp: MapFilterProject,
+        pub(crate) mfp: MapFilterProject,
+    }
+
+    impl RustType<ProtoSafeMfpPlan> for SafeMfpPlan {
+        fn into_proto(&self) -> ProtoSafeMfpPlan {
+            ProtoSafeMfpPlan {
+                mfp: Some(self.mfp.into_proto()),
+            }
+        }
+
+        fn from_proto(proto: ProtoSafeMfpPlan) -> Result<Self, TryFromProtoError> {
+            Ok(SafeMfpPlan {
+                mfp: proto.mfp.into_rust_if_some("ProtoSafeMfpPlan::mfp")?,
+            })
+        }
     }
 
     impl SafeMfpPlan {
-        pub fn permute(&mut self, map: HashMap<usize, usize>, new_arity: usize) {
-            self.mfp.permute(map, new_arity);
+        /// Remaps references to input columns according to `remap`.
+        ///
+        /// Leaves other column references, e.g. to newly mapped columns, unchanged.
+        pub fn permute_fn<F>(&mut self, remap: F, new_arity: usize)
+        where
+            F: Fn(usize) -> usize,
+        {
+            self.mfp.permute_fn(remap, new_arity);
         }
         /// Evaluates the linear operator on a supplied list of datums.
         ///
@@ -1192,19 +1569,20 @@ pub mod plan {
         /// The `row` is not cleared first, but emptied if the function
         /// returns `Ok(Some(row)).
         #[inline(always)]
-        pub fn evaluate_into<'a>(
+        pub fn evaluate_into<'a, 'row>(
             &'a self,
             datums: &mut Vec<Datum<'a>>,
             arena: &'a RowArena,
-            row: &'a mut Row,
+            row_buf: &'row mut Row,
         ) -> Result<Option<Row>, EvalError> {
             let passed_predicates = self.evaluate_inner(datums, arena)?;
             if !passed_predicates {
                 Ok(None)
             } else {
-                row.clear();
-                row.extend(self.mfp.projection.iter().map(|c| datums[*c]));
-                Ok(Some(row.finish_and_reuse()))
+                row_buf
+                    .packer()
+                    .extend(self.mfp.projection.iter().map(|c| datums[*c]));
+                Ok(Some(row_buf.clone()))
             }
         }
 
@@ -1238,18 +1616,29 @@ pub mod plan {
             let mut expression = 0;
             for (support, predicate) in self.mfp.predicates.iter() {
                 while self.mfp.input_arity + expression < *support {
-                    datums.push(self.mfp.expressions[expression].eval(&datums[..], &arena)?);
+                    datums.push(self.mfp.expressions[expression].eval(&datums[..], arena)?);
                     expression += 1;
                 }
-                if predicate.eval(&datums[..], &arena)? != Datum::True {
+                if predicate.eval(&datums[..], arena)? != Datum::True {
                     return Ok(false);
                 }
             }
             while expression < self.mfp.expressions.len() {
-                datums.push(self.mfp.expressions[expression].eval(&datums[..], &arena)?);
+                datums.push(self.mfp.expressions[expression].eval(&datums[..], arena)?);
                 expression += 1;
             }
             Ok(true)
+        }
+
+        /// Returns true if evaluation could introduce an error on non-error inputs.
+        pub fn could_error(&self) -> bool {
+            self.mfp.predicates.iter().any(|(_pos, e)| e.could_error())
+                || self.mfp.expressions.iter().any(|e| e.could_error())
+        }
+
+        /// Returns true when `Self` is the identity.
+        pub fn is_identity(&self) -> bool {
+            self.mfp.is_identity()
         }
     }
 
@@ -1266,52 +1655,54 @@ pub mod plan {
     /// structure, and it is best to do that once and re-use the results.
     ///
     /// There are restrictions on the temporal predicates we currently support.
-    /// They must directly constrain `MzLogicalTimestamp` from below or above,
-    /// by expressions that do not themselves contain `MzLogicalTimestamp`.
+    /// They must directly constrain `MzNow` from below or above,
+    /// by expressions that do not themselves contain `MzNow`.
     /// Conjunctions of such constraints are also ok.
-    #[derive(Clone, Debug)]
+    #[derive(Arbitrary, Clone, Debug, PartialEq)]
     pub struct MfpPlan {
         /// Normal predicates to evaluate on `&[Datum]` and expect `Ok(Datum::True)`.
-        mfp: SafeMfpPlan,
-        /// Expressions that when evaluated lower-bound `MzLogicalTimestamp`.
-        lower_bounds: Vec<MirScalarExpr>,
-        /// Expressions that when evaluated upper-bound `MzLogicalTimestamp`.
-        upper_bounds: Vec<MirScalarExpr>,
+        pub(crate) mfp: SafeMfpPlan,
+        /// Expressions that when evaluated lower-bound `MzNow`.
+        #[proptest(strategy = "prop::collection::vec(any::<MirScalarExpr>(), 0..2)")]
+        pub(crate) lower_bounds: Vec<MirScalarExpr>,
+        /// Expressions that when evaluated upper-bound `MzNow`.
+        #[proptest(strategy = "prop::collection::vec(any::<MirScalarExpr>(), 0..2)")]
+        pub(crate) upper_bounds: Vec<MirScalarExpr>,
+    }
+
+    impl RustType<ProtoMfpPlan> for MfpPlan {
+        fn into_proto(&self) -> ProtoMfpPlan {
+            ProtoMfpPlan {
+                mfp: Some(self.mfp.into_proto()),
+                lower_bounds: self.lower_bounds.into_proto(),
+                upper_bounds: self.upper_bounds.into_proto(),
+            }
+        }
+
+        fn from_proto(proto: ProtoMfpPlan) -> Result<Self, TryFromProtoError> {
+            Ok(MfpPlan {
+                mfp: proto.mfp.into_rust_if_some("ProtoMfpPlan::mfp")?,
+                lower_bounds: proto.lower_bounds.into_rust()?,
+                upper_bounds: proto.upper_bounds.into_rust()?,
+            })
+        }
     }
 
     impl MfpPlan {
-        /// Prepares `self` to act on permuted input, according to the permutation array
-        /// `permutation` (see for example the documentation on `util::permutation_to_map_and_new_arity`
-        /// for a description of the input).
-        pub fn permute(&mut self, permutation: &[usize]) {
-            let (map, new_arity) = permutation_to_map_and_new_arity(permutation);
-            self.mfp.mfp.permute(map, new_arity);
-            let permutation = permutation
-                .iter()
-                .cloned()
-                .chain(new_arity..(new_arity + self.mfp.mfp.expressions.len()))
-                .collect::<Vec<_>>();
-            for lb in &mut self.lower_bounds {
-                lb.permute(&permutation);
-            }
-            for ub in &mut self.upper_bounds {
-                ub.permute(&permutation);
-            }
-        }
         /// Partitions `predicates` into non-temporal, and lower and upper temporal bounds.
         ///
-        /// The first returned list is of predicates that do not contain `mz_logical_timestamp`.
+        /// The first returned list is of predicates that do not contain `mz_now`.
         /// The second and third returned lists contain expressions that, once evaluated, lower
         /// and upper bound the validity interval of a record, respectively. These second two
-        /// lists are populared only by binary expressions of the form
+        /// lists are populated only by binary expressions of the form
         /// ```ignore
-        /// mz_logical_timestamp cmp_op expr
+        /// mz_now cmp_op expr
         /// ```
-        /// where `cmp_op` is a comparison operator and `expr` does not contain `mz_logical_timestamp`.
+        /// where `cmp_op` is a comparison operator and `expr` does not contain `mz_now`.
         ///
-        /// If any unsupported expression is found, for example one that uses `mz_logical_timestamp`
+        /// If any unsupported expression is found, for example one that uses `mz_now`
         /// in an unsupported position, an error is returned.
-        pub(crate) fn create_from(mut mfp: MapFilterProject) -> Result<Self, String> {
+        pub fn create_from(mut mfp: MapFilterProject) -> Result<Self, String> {
             let mut lower_bounds = Vec::new();
             let mut upper_bounds = Vec::new();
 
@@ -1337,9 +1728,10 @@ pub mod plan {
                     mut expr2,
                 } = predicate
                 {
-                    // Attempt to put `MzLogicalTimestamp` in the first argument position.
+                    // Attempt to put `LogicalTimestamp` in the first argument position.
                     if !expr1.contains_temporal()
-                        && *expr2 == MirScalarExpr::CallNullary(NullaryFunc::MzLogicalTimestamp)
+                        && *expr2
+                            == MirScalarExpr::CallUnmaterializable(UnmaterializableFunc::MzNow)
                     {
                         std::mem::swap(&mut expr1, &mut expr2);
                         func = match func {
@@ -1357,50 +1749,40 @@ pub mod plan {
                         };
                     }
 
-                    // Error if MLT is referenced in an unsuppported position.
+                    // Error if MLT is referenced in an unsupported position.
                     if expr2.contains_temporal()
-                        || *expr1 != MirScalarExpr::CallNullary(NullaryFunc::MzLogicalTimestamp)
+                        || *expr1
+                            != MirScalarExpr::CallUnmaterializable(UnmaterializableFunc::MzNow)
                     {
                         return Err(format!(
-                            "Unsupported temporal predicate. Note: `mz_logical_timestamp()` must be directly compared to a numeric non-temporal expression; if it is compared to a non-numeric type, consider casting that type to numeric. Expression found: {:?}",
+                            "Unsupported temporal predicate. Note: `mz_now()` must be directly compared to a mz_timestamp-castable expression. Expression found: {}",
                             MirScalarExpr::CallBinary { func, expr1, expr2 },
                             ));
                     }
 
-                    // We'll need to use this a fair bit.
-                    let decimal_one = MirScalarExpr::literal_ok(
-                        Datum::from(Numeric::from(1)),
-                        ScalarType::Numeric { scale: None },
-                    );
-
-                    // TODO(#7611): Truncate any significant fractional digits
-                    // from positive values of `expr2`, while keeping the sign
-                    // of negative values intact. (Negative values are never
-                    // chosen as valid bounds, so their resultant values matter
-                    // little, but we do want to know they were negative.)
-                    let expr2_floor = expr2.call_unary(UnaryFunc::FloorNumeric(func::FloorNumeric));
-
-                    // MzLogicalTimestamp <OP> <EXPR2> for several supported operators.
+                    // LogicalTimestamp <OP> <EXPR2> for several supported operators.
                     match func {
                         BinaryFunc::Eq => {
-                            // Lower bound of expr, upper bound of expr+1
-                            lower_bounds.push((expr2_floor).clone());
-                            upper_bounds
-                                .push(expr2_floor.call_binary(decimal_one, BinaryFunc::AddNumeric));
+                            lower_bounds.push(*expr2.clone());
+                            upper_bounds.push(
+                                expr2.call_unary(UnaryFunc::StepMzTimestamp(func::StepMzTimestamp)),
+                            );
                         }
                         BinaryFunc::Lt => {
-                            upper_bounds.push(expr2_floor);
+                            upper_bounds.push(*expr2.clone());
                         }
                         BinaryFunc::Lte => {
-                            upper_bounds
-                                .push(expr2_floor.call_binary(decimal_one, BinaryFunc::AddNumeric));
+                            upper_bounds.push(
+                                expr2.call_unary(UnaryFunc::StepMzTimestamp(func::StepMzTimestamp)),
+                            );
                         }
                         BinaryFunc::Gt => {
-                            lower_bounds
-                                .push(expr2_floor.call_binary(decimal_one, BinaryFunc::AddNumeric));
+                            lower_bounds.push(
+                                expr2.call_unary(UnaryFunc::StepMzTimestamp(func::StepMzTimestamp)),
+                            );
                         }
                         BinaryFunc::Gte => {
-                            lower_bounds.push(expr2_floor);
+                            lower_bounds.push(*expr2.clone());
                         }
                         _ => {
                             return Err(format!(
@@ -1411,7 +1793,7 @@ pub mod plan {
                     }
                 } else {
                     return Err(format!(
-                        "Unsupported temporal predicate. Note: `mz_logical_timestamp()` must be directly compared to a numeric non-temporal expression; if it is compared to a non-numeric type, consider casting that type to numeric. Expression found: {:?}",
+                        "Unsupported temporal predicate. Note: `mz_now()` must be directly compared to a non-temporal expression of mz_timestamp-castable type. Expression found: {}",
                         predicate,
                         ));
                 }
@@ -1431,15 +1813,41 @@ pub mod plan {
                 && self.upper_bounds.is_empty()
         }
 
+        /// Returns `self`, and leaves behind an identity operator that acts on its output.
+        pub fn take(&mut self) -> Self {
+            let mut identity = Self {
+                mfp: SafeMfpPlan {
+                    mfp: MapFilterProject::new(self.mfp.projection.len()),
+                },
+                lower_bounds: Default::default(),
+                upper_bounds: Default::default(),
+            };
+            std::mem::swap(self, &mut identity);
+            identity
+        }
+
         /// Attempt to convert self into a non-temporal MapFilterProject plan.
         ///
         /// If that is not possible, the original instance is returned as an error.
+        #[allow(clippy::result_large_err)]
         pub fn into_nontemporal(self) -> Result<SafeMfpPlan, Self> {
             if self.lower_bounds.is_empty() && self.upper_bounds.is_empty() {
                 Ok(self.mfp)
             } else {
                 Err(self)
             }
+        }
+
+        /// Returns an iterator over mutable references to all non-temporal
+        /// scalar expressions in the plan.
+        ///
+        /// The order of iteration is unspecified.
+        pub fn iter_nontemporal_exprs(&mut self) -> impl Iterator<Item = &mut MirScalarExpr> {
+            iter::empty()
+                .chain(self.mfp.mfp.predicates.iter_mut().map(|(_, expr)| expr))
+                .chain(&mut self.mfp.mfp.expressions)
+                .chain(&mut self.lower_bounds)
+                .chain(&mut self.upper_bounds)
         }
 
         /// Evaluate the predicates, temporal and non-, and return times and differences for `data`.
@@ -1450,30 +1858,28 @@ pub mod plan {
         ///
         /// The `row_builder` is not cleared first, but emptied if the function
         /// returns an iterator with any `Ok(_)` element.
-        pub fn evaluate<'b, 'a: 'b, E: From<EvalError>>(
+        pub fn evaluate<'b, 'a: 'b, E: From<EvalError>, V: Fn(&mz_repr::Timestamp) -> bool>(
             &'a self,
             datums: &'b mut Vec<Datum<'a>>,
             arena: &'a RowArena,
-            time: repr::Timestamp,
+            time: mz_repr::Timestamp,
             diff: Diff,
+            valid_time: V,
             row_builder: &mut Row,
-        ) -> impl Iterator<Item = Result<(Row, repr::Timestamp, Diff), (E, repr::Timestamp, Diff)>>
+        ) -> impl Iterator<Item = Result<(Row, mz_repr::Timestamp, Diff), (E, mz_repr::Timestamp, Diff)>>
         {
-            match self.mfp.evaluate_inner(datums, &arena) {
+            match self.mfp.evaluate_inner(datums, arena) {
                 Err(e) => {
-                    return Some(Err((e.into(), time, diff)))
-                        .into_iter()
-                        .chain(None.into_iter());
+                    return Some(Err((e.into(), time, diff))).into_iter().chain(None);
                 }
                 Ok(true) => {}
                 Ok(false) => {
-                    return None.into_iter().chain(None.into_iter());
+                    return None.into_iter().chain(None);
                 }
             }
 
-            // Lower and upper bounds. If set, the value indicates the respective
-            // bound. If not set, indicates "larger than `u64::MAX`".
-            let mut lower_bound = Some(time);
+            // Lower and upper bounds.
+            let mut lower_bound = time;
             let mut upper_bound = None;
 
             // Track whether we have seen a null in either bound, as this should
@@ -1483,116 +1889,124 @@ pub mod plan {
             // Advance our lower bound to be at least the result of any lower bound
             // expressions.
             for l in self.lower_bounds.iter() {
-                // If the lower bound already exceeds a `u64`, we needn't check more.
-                if lower_bound.is_some() {
-                    match l.eval(datums, &arena) {
-                        Err(e) => {
-                            return Some(Err((e.into(), time, diff)))
-                                .into_iter()
-                                .chain(None.into_iter());
-                        }
-                        Ok(Datum::Numeric(d)) => {
-                            // If the number is negative, it cannot improve the initial
-                            // value of `Some(time)`.
-                            if !d.0.is_negative() {
-                                // An `Ok` conversion is a valid upper bound, and an `Err` error
-                                // indicates a value above `u64::MAX`. The `ok()` method does the
-                                // conversion we want to an `Option<u64>`.
-                                let v = u64::try_from(d.0).ok();
-                                // Update `lower_bound` to be the maximum with `v`, where a `None`
-                                // value is treated as larger than `Some(_)` values.
-                                lower_bound = match (lower_bound, v) {
-                                    (None, _) => None,
-                                    (_, None) => None,
-                                    (x, y) => x.max(y),
-                                };
-                            }
-                        }
-                        Ok(Datum::Null) => {
-                            null_eval = true;
-                        }
-                        x => {
-                            panic!("Non-decimal value in temporal predicate: {:?}", x);
-                        }
+                match l.eval(datums, arena) {
+                    Err(e) => {
+                        return Some(Err((e.into(), time, diff)))
+                            .into_iter()
+                            .chain(None.into_iter());
+                    }
+                    Ok(Datum::MzTimestamp(d)) => {
+                        lower_bound = lower_bound.max(d);
+                    }
+                    Ok(Datum::Null) => {
+                        null_eval = true;
+                    }
+                    x => {
+                        panic!("Non-mz_timestamp value in temporal predicate: {:?}", x);
                     }
                 }
             }
 
-            // If the lower bound exceeds `u64::MAX` the update cannot appear in the output.
-            if lower_bound.is_none() {
-                return None.into_iter().chain(None.into_iter());
+            // If the lower bound exceeds our `until` frontier, it should not appear in the output.
+            if !valid_time(&lower_bound) {
+                return None.into_iter().chain(None);
             }
 
             // If there are any upper bounds, determine the minimum upper bound.
             for u in self.upper_bounds.iter() {
                 // We can cease as soon as the lower and upper bounds match,
                 // as the update will certainly not be produced in that case.
-                if upper_bound != lower_bound {
-                    match u.eval(datums, &arena) {
+                if upper_bound != Some(lower_bound) {
+                    match u.eval(datums, arena) {
                         Err(e) => {
                             return Some(Err((e.into(), time, diff)))
                                 .into_iter()
                                 .chain(None.into_iter());
                         }
-                        Ok(Datum::Numeric(d)) => {
-                            // If the upper bound is negative, it is impossible to satisfy.
-                            // We set the upper bound to the lower bound to indicate this.
-                            if d.0.is_negative() {
-                                upper_bound = lower_bound;
+                        Ok(Datum::MzTimestamp(d)) => {
+                            if let Some(upper) = upper_bound {
+                                upper_bound = Some(upper.min(d));
                             } else {
-                                // An `Ok` conversion is a valid upper bound, and an `Err` error
-                                // indicates a value above `u64::MAX`. The `ok()` method does the
-                                // conversion we want to an `Option<u64>`.
-                                let v = u64::try_from(d.0).ok();
-                                // Update `upper_bound` to be the minimum with `v`, where a `None`
-                                // value is treated as larger than `Some(_)` values.
-                                upper_bound = match (upper_bound, v) {
-                                    (None, x) => x,
-                                    (x, None) => x,
-                                    (x, y) => x.min(y),
-                                };
-                                // Force the upper bound to be at least the lower bound.
-                                // The `is_some()` test is required as `None < Some(_)`,
-                                // and we do not want to set `None` to `Some(_)`.
-                                if upper_bound.is_some() && upper_bound < lower_bound {
-                                    upper_bound = lower_bound;
-                                }
+                                upper_bound = Some(d);
+                            };
+                            // Force the upper bound to be at least the lower
+                            // bound. The `is_some()` test should always be true
+                            // due to the above block, but maintain it here in
+                            // case that changes. It's hopefully optimized away.
+                            if upper_bound.is_some() && upper_bound < Some(lower_bound) {
+                                upper_bound = Some(lower_bound);
                             }
                         }
                         Ok(Datum::Null) => {
                             null_eval = true;
                         }
                         x => {
-                            panic!("Non-decimal value in temporal predicate: {:?}", x);
+                            panic!("Non-mz_timestamp value in temporal predicate: {:?}", x);
                         }
                     }
                 }
             }
 
+            // If the upper bound exceeds our `until` frontier, it should not appear in the output.
+            if let Some(upper) = &mut upper_bound {
+                if !valid_time(upper) {
+                    upper_bound = None;
+                }
+            }
+
             // Produce an output only if the upper bound exceeds the lower bound,
             // and if we did not encounter a `null` in our evaluation.
-            if lower_bound != upper_bound && !null_eval {
-                row_builder.clear();
-                row_builder.extend(self.mfp.mfp.projection.iter().map(|c| datums[*c]));
-                let (lower_opt, upper_opt) = match (lower_bound, upper_bound) {
-                    (Some(lower_bound), Some(upper_bound)) => (
-                        Some(Ok((row_builder.clone(), lower_bound, diff))),
-                        Some(Ok((row_builder.finish_and_reuse(), upper_bound, -diff))),
-                    ),
-                    (Some(lower_bound), None) => (
-                        Some(Ok((row_builder.finish_and_reuse(), lower_bound, diff))),
-                        None,
-                    ),
-                    (None, Some(upper_bound)) => (
-                        None,
-                        Some(Ok((row_builder.finish_and_reuse(), upper_bound, -diff))),
-                    ),
-                    _ => (None, None),
-                };
-                lower_opt.into_iter().chain(upper_opt.into_iter())
+            if Some(lower_bound) != upper_bound && !null_eval {
+                row_builder
+                    .packer()
+                    .extend(self.mfp.mfp.projection.iter().map(|c| datums[*c]));
+                let upper_opt =
+                    upper_bound.map(|upper_bound| Ok((row_builder.clone(), upper_bound, -diff)));
+                let lower = Some(Ok((row_builder.clone(), lower_bound, diff)));
+                lower.into_iter().chain(upper_opt)
             } else {
-                None.into_iter().chain(None.into_iter())
+                None.into_iter().chain(None)
             }
+        }
+
+        /// Returns true if evaluation could introduce an error on non-error inputs.
+        pub fn could_error(&self) -> bool {
+            self.mfp.could_error()
+                || self.lower_bounds.iter().any(|e| e.could_error())
+                || self.upper_bounds.iter().any(|e| e.could_error())
+        }
+
+        /// Indicates that `Self` ignores its input to the extent that it can be evaluated on `&[]`.
+        ///
+        /// At the moment, this is only true if it projects away all columns and applies no filters,
+        /// but it could be extended to plans that produce literals independent of the input.
+        pub fn ignores_input(&self) -> bool {
+            self.lower_bounds.is_empty()
+                && self.upper_bounds.is_empty()
+                && self.mfp.mfp.projection.is_empty()
+                && self.mfp.mfp.predicates.is_empty()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mz_ore::assert_ok;
+    use mz_proto::protobuf_roundtrip;
+
+    use crate::linear::plan::*;
+
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)] // too slow
+        fn mfp_plan_protobuf_roundtrip(expect in any::<MfpPlan>()) {
+            let actual = protobuf_roundtrip::<_, ProtoMfpPlan>(&expect);
+            assert_ok!(actual);
+            assert_eq!(actual.unwrap(), expect);
         }
     }
 }

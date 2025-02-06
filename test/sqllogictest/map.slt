@@ -18,29 +18,26 @@ mode cockroach
 # we just convert everything to `text`.
 
 # Test basic string to map casts.
-query error value_type parameter required
-CREATE TYPE custom AS MAP (key_type=text)
+query error VALUE TYPE option is required
+CREATE TYPE custom AS MAP (KEY TYPE = text)
 
-query error key_type parameter required
-CREATE TYPE custom AS MAP (value_type=bool)
+query error KEY TYPE option is required
+CREATE TYPE custom AS MAP (VALUE TYPE = bool)
 
-query error unknown catalog item 'customthing'
-CREATE TYPE custom AS MAP (key_type=text, value_type=bool, extra_type=customthing)
+query error Expected one of KEY or VALUE, found identifier "extra_type"
+CREATE TYPE custom AS MAP (KEY TYPE = text, VALUE TYPE = bool, extra_type=customthing)
 
-query error key_type must be of class type, but received pg_catalog.pg_enum which is of class view
-CREATE TYPE tbl_map AS MAP (key_type=pg_enum, value_type=text)
+query error type "pg_enum" does not exist
+CREATE TYPE tbl_map AS MAP (KEY TYPE = pg_enum, VALUE TYPE = text)
 
-query error value_type must be of class type, but received pg_catalog.pg_enum which is of class view
-CREATE TYPE tbl_map AS MAP (key_type=text, value_type=pg_enum)
+query error type "pg_enum" does not exist
+CREATE TYPE tbl_map AS MAP (KEY TYPE = text, VALUE TYPE = pg_enum)
 
-query error CREATE TYPE ... AS MAP option "value_type" cannot accept type modifier on numeric, you must use the default type
-CREATE TYPE typ_mod_map AS MAP (key_type=text, value_type=numeric(38,0))
+query error CREATE TYPE ... AS MAP option VALUE TYPE can only use named data types, but found unnamed data type pg_catalog.int4 list. Use CREATE TYPE to create a named type first
+CREATE TYPE unnamed_element_map AS MAP (KEY TYPE = text, VALUE TYPE = int4 list)
 
-query error CREATE TYPE ... AS LIST option "value_type" can only use named data types, but found unnamed data type int4 list. Use CREATE TYPE to create a named type first
-CREATE TYPE unnamed_element_map AS MAP (key_type=text, value_type=int4 list)
-
-query error CREATE TYPE not yet supported
-CREATE TYPE custom AS MAP (key_type=text, value_type=bool)
+statement ok
+CREATE TYPE custom AS MAP (KEY TYPE = text, VALUE TYPE = bool)
 
 query error expected '\{', found a: "a=>1"
 SELECT ('a=>1'::map[text=>int])::text
@@ -145,9 +142,152 @@ SELECT ('{hello=>{\{\}=>\"\"}}'::map[text=>map[text=>text]])::text
 ----
 {hello=>{"{}"=>"\"\""}}
 
+# Test MAP literals.
+
+query T
+SELECT MAP['a' => 1]::text
+----
+{a=>1}
+
+query T
+SELECT MAP['a' => 1 + 1]::text
+----
+{a=>2}
+
+query T
+SELECT MAP['a' => 2 * 1 + 1]::text
+----
+{a=>3}
+
+query T
+SELECT MAP['a' => 2 * 1 + 2 / 2]::text
+----
+{a=>3}
+
+query T
+SELECT MAP['a' => 2 * (1 + 1) / 2]::text
+----
+{a=>2}
+
+query T
+SELECT MAP['a' || 'b' => 1]::text
+----
+{ab=>1}
+
+query T
+SELECT MAP['a' || 'b' => 1 + 1]::text
+----
+{ab=>2}
+
+query T
+SELECT MAP['a' => 1, 'a' => 2]::text
+----
+{a=>2}
+
+query T
+SELECT MAP['a' => 1, 'b' => 2, 'a' => 3]::text
+----
+{a=>3,b=>2}
+
+query T
+SELECT MAP['a' => MAP['b' => 'c']]::text
+----
+{a=>{b=>c}}
+
+query T
+SELECT MAP['a' => ['b' => 'c']]::text
+----
+{a=>{b=>c}}
+
+query T
+SELECT MAP['a' => list[[1], [2]]]::text
+----
+{a=>{{1},{2}}}
+
+query T
+SELECT MAP['a' => ['b' => list[[1], [2]]]]::text
+----
+{a=>{b=>{{1},{2}}}}
+
+query T
+SELECT MAP[column1 => column2]::text FROM (VALUES ('a', 1), ('b', 2), ('c', 3))
+----
+{a=>1}
+{b=>2}
+{c=>3}
+
+query error cannot determine type of empty map
+SELECT MAP[]::text
+
+query T
+SELECT MAP[]::map[text => text]::text
+----
+{}
+
+statement ok
+CREATE TABLE mlt(t text, y int)
+
+statement ok
+INSERT INTO mlt VALUES ('a', 6), ('b', 8), ('c', 10), ('c', 11)
+
+query T
+SELECT MAP(SELECT * FROM mlt WHERE t > 'a' ORDER BY y DESC)::text;
+----
+{b=>8,c=>10}
+
+query T
+SELECT MAP(SELECT * FROM mlt WHERE mlt.t > mlt_outer.t)::text
+FROM mlt AS mlt_outer;
+----
+{}
+{}
+{c=>11}
+{b=>8,c=>11}
+
+query TII
+SELECT list_agg(t)::text, min(y), max(y)
+FROM mlt AS mlt_outer
+GROUP BY MAP(SELECT * FROM mlt WHERE mlt.t < mlt_outer.t);
+----
+{a}  6  6
+{b}  8  8
+{c,c}  10  11
+
+query T
+SELECT MAP(SELECT * FROM mlt WHERE t < 'a')::text
+----
+{}
+
+# Test MAP subqueries.
+
+query T
+SELECT MAP(VALUES ('a', 1), ('b', 2), ('c', 3))::text
+----
+{a=>1,b=>2,c=>3}
+
+query T
+SELECT MAP(VALUES ('a', 1), ('a', 2) ORDER BY 2)::text
+----
+{a=>2}
+
+query T
+SELECT MAP(VALUES ('a', 1), ('a', 2) ORDER BY 2 DESC)::text
+----
+{a=>1}
+
+query error cannot build map from subquery because first column is not of type text
+SELECT MAP(VALUES (1, 1))
+
+query error expected map subquery to return 2 columns, got 1 columns
+SELECT MAP(VALUES (1))
+
+query error expected map subquery to return 2 columns, got 3 columns
+SELECT MAP(VALUES (1, 2, 3))
+
 # Test map operators.
 
 ## ?
+
 query T
 SELECT '{a=>1, b=>2}'::map[text=>int] ? 'a'
 ----
@@ -163,7 +303,7 @@ SELECT '{a=>1, b=>2}'::map[text=>int] ? 'c'
 ----
 false
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>integer\] \? integer
 SELECT '{a=>1, b=>2}'::map[text=>int] ? 1
 
 query T
@@ -177,19 +317,30 @@ SELECT '{""=>1}'::map[text=>int] ? ''
 true
 
 query T
+SELECT '{"1" => NULL}'::map[text=>text] ? ''
+----
+false
+
+query T
 SELECT '{hello=>{world=>false}}'::map[text=>map[text=>bool]] -> 'hello'::text ? 'world'::text
 ----
 true
 
+query error operator is not unique: unknown \? unknown
+SELECT NULL ? 'a'
+
 ## ?&
-query error malformed array literal: missing opening left brace
+query error invalid input syntax for type array: Array value must start with "\{": "a"
 SELECT '{a=>1, b=>2}'::map[text=>int] ?& 'a'
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>integer\] \?\& integer\[\]
 SELECT '{a=>1, b=>2}'::map[text=>int] ?& ARRAY[1]
 
 query error cannot determine type of empty array
 SELECT '{a=>1, b=>2}'::map[text=>int] ?& ARRAY[]
+
+query error could not determine polymorphic type because input has type unknown
+SELECT NULL ?& 'a'
 
 query T
 SELECT '{a=>1, b=>2}'::map[text=>int] ?& ARRAY[NULL]
@@ -216,7 +367,7 @@ SELECT '{a=>1, b=>2}'::map[text=>int] ?& ARRAY['c', 'b']
 ----
 false
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>boolean\] \?\& integer\[\]
 SELECT '{1=>t, 2=>f}'::map[text=>bool] ?& ARRAY[1]
 
 query T
@@ -245,11 +396,14 @@ SELECT '{hello=>{world=>1293}}'::map[text=>map[text=>smallint]] -> 'hello'::text
 false
 
 ## ?|
-query error malformed array literal: missing opening left brace
+query error invalid input syntax for type array: Array value must start with "\{": "a"
 SELECT '{a=>1, b=>2}'::map[text=>int] ?| 'a'
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>integer\] \?\| integer\[\]
 SELECT '{a=>1, b=>2}'::map[text=>int] ?| ARRAY[1]
+
+query error could not determine polymorphic type because input has type unknown
+SELECT NULL ?| 'a'
 
 query T
 SELECT '{a=>1, b=>2}'::map[text=>int] ?| ARRAY[NULL]
@@ -276,7 +430,7 @@ SELECT '{a=>1, b=>2}'::map[text=>int] ?| ARRAY['c', 'd', '1']
 ----
 false
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>boolean\] \?\| integer\[\]
 SELECT '{1=>t, 2=>f}'::map[text=>bool] ?| ARRAY[1]
 
 query T
@@ -298,13 +452,13 @@ false
 query error invalid input syntax for type map: expected '\{', found c: "c"
 SELECT '{a=>1, b=>2}'::map[text=>int] @> 'c'
 
-query error  arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>integer\] @> text
 SELECT '{a=>1, b=>2}'::map[text=>int] @> 'a'::text
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>integer\] @> integer\[\]
 SELECT '{a=>1, b=>2}'::map[text=>int] @> ARRAY[1]
 
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit cast
+query error operator does not exist: map\[text=>integer\] @> map\[text=>boolean\]
 SELECT '{a=>1, b=>2}'::map[text=>int] @> '{a=>t}'::map[text=>bool]
 ----
 false
@@ -329,7 +483,7 @@ SELECT '{a=>1, b=>2}'::map[text=>int] @> '{a=>1, b=>2, c=>3}'::map[text=>int]
 ----
 false
 
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error operator does not exist: map\[text=>map\[text=>bytea\]\] @> map\[text=>text\]
 SELECT '{hello=>{world=>nested}}'::map[text=>map[text=>bytea]] @> '{hello=>world}'::map[text=>text]
 ----
 false
@@ -345,7 +499,7 @@ SELECT '{hello=>{world=>nested}}'::map[text=>map[text=>text]] @> '{hello=>{world
 false
 
 ## <@
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error operator does not exist: map\[text=>integer\] <@ map\[text=>boolean\]
 SELECT '{a=>1, b=>2}'::map[text=>int] <@ '{a=>t}'::map[text=>bool]
 ----
 false
@@ -370,7 +524,7 @@ SELECT '{a=>1, b=>2}'::map[text=>int] <@ '{a=>1, b=>2, c=>3}'::map[text=>int]
 ----
 true
 
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error CAST does not support casting from map\[text=>map\[text=>character\]\] to map\[text=>map\[text=>character\]\]
 SELECT '{hello=>{world=>a}}'::map[text=>map[text=>char]] <@ '{hello=>c}'::map[text=>char]
 ----
 false
@@ -406,38 +560,13 @@ SELECT '{a=>1, b=>2}'::map[text=>int] -> 'c'
 ----
 NULL
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error operator does not exist: map\[text=>integer\] \-> integer
 SELECT '{a=>1, b=>2}'::map[text=>int] -> 1
 
 query T
 SELECT '{a=>true, b=>false}'::map[text=>bool] -> 'b'
 ----
 false
-
-query T
-SELECT ('{a=>true, b=>false}'::map[text=>bool] -> ARRAY[]::text[])::text
-----
-{}
-
-query T
-SELECT ('{a=>true, b=>false}'::map[text=>bool] -> ARRAY['']::text[])::text
-----
-{NULL}
-
-query T
-SELECT ('{a=>1, b=>2}'::map[text=>int] -> ARRAY['a'])::text
-----
-{1}
-
-query T
-SELECT ('{a=>1, b=>2}'::map[text=>int] -> ARRAY['b', 'a'])::text
-----
-{2,1}
-
-query T
-SELECT ('{a=>1, b=>2}'::map[text=>int] -> ARRAY['b', 'a', 'c'])::text
-----
-{2,1,NULL}
 
 query T
 SELECT ('{hello=>{world=>nested}, another=>{map=>here}}'::map[text=>map[text=>text]] -> 'missing'::text)::text
@@ -454,10 +583,13 @@ SELECT '{hello=>{world=>nested}, another=>{map=>here}}'::map[text=>map[text=>tex
 ----
 nested
 
+query error operator is not unique: unknown \-> text
+SELECT NULL -> 'hello'::text
+
 # 🔬 CREATE TYPE .. AS MAP
 
 statement ok
-CREATE TYPE int4_map AS MAP (key_type=text, value_type=int4);
+CREATE TYPE int4_map AS MAP (KEY TYPE = text, VALUE TYPE = int4);
 
 query T
 SELECT '{a=>1,b=>2}'::int4_map::text;
@@ -472,7 +604,7 @@ int4_map
 # 🔬🔬 Check each valid value type
 
 statement ok
-CREATE TYPE bool_map_c AS MAP (key_type=text, value_type=bool);
+CREATE TYPE bool_map_c AS MAP (KEY TYPE = text, VALUE TYPE = bool);
 
 query T
 SELECT '{a=>true}'::bool_map_c::text
@@ -480,7 +612,7 @@ SELECT '{a=>true}'::bool_map_c::text
 {a=>t}
 
 statement ok
-CREATE TYPE int8_map_c AS MAP (key_type=text, value_type=int8);
+CREATE TYPE int8_map_c AS MAP (KEY TYPE = text, VALUE TYPE = int8);
 
 query T
 SELECT '{a=>1}'::int8_map_c::text
@@ -488,7 +620,7 @@ SELECT '{a=>1}'::int8_map_c::text
 {a=>1}
 
 statement ok
-CREATE TYPE int4_map_c AS MAP (key_type=text, value_type=int4);
+CREATE TYPE int4_map_c AS MAP (KEY TYPE = text, VALUE TYPE = int4);
 
 query T
 SELECT '{a=>1}'::int4_map_c::text
@@ -496,7 +628,7 @@ SELECT '{a=>1}'::int4_map_c::text
 {a=>1}
 
 statement ok
-CREATE TYPE text_map_c AS MAP (key_type=text, value_type=text);
+CREATE TYPE text_map_c AS MAP (KEY TYPE = text, VALUE TYPE = text);
 
 query T
 SELECT '{a=>a}'::text_map_c::text
@@ -504,7 +636,7 @@ SELECT '{a=>a}'::text_map_c::text
 {a=>a}
 
 statement ok
-CREATE TYPE float4_map_c AS MAP (key_type=text, value_type=float4);
+CREATE TYPE float4_map_c AS MAP (KEY TYPE = text, VALUE TYPE = float4);
 
 query T
 SELECT '{a=>1.2}'::float4_map_c::text
@@ -512,7 +644,7 @@ SELECT '{a=>1.2}'::float4_map_c::text
 {a=>1.2}
 
 statement ok
-CREATE TYPE float8_map_c AS MAP (key_type=text, value_type=float8);
+CREATE TYPE float8_map_c AS MAP (KEY TYPE = text, VALUE TYPE = float8);
 
 query T
 SELECT '{a=>1.2}'::float8_map_c::text
@@ -520,7 +652,7 @@ SELECT '{a=>1.2}'::float8_map_c::text
 {a=>1.2}
 
 statement ok
-CREATE TYPE date_map_c AS MAP (key_type=text, value_type=date);
+CREATE TYPE date_map_c AS MAP (KEY TYPE = text, VALUE TYPE = date);
 
 query T
 SELECT '{a=>2001-01-01}'::date_map_c::text
@@ -528,7 +660,7 @@ SELECT '{a=>2001-01-01}'::date_map_c::text
 {a=>2001-01-01}
 
 statement ok
-CREATE TYPE time_map_c AS MAP (key_type=text, value_type=time);
+CREATE TYPE time_map_c AS MAP (KEY TYPE = text, VALUE TYPE = time);
 
 query T
 SELECT '{a=>12:34:56}'::time_map_c::text
@@ -536,7 +668,7 @@ SELECT '{a=>12:34:56}'::time_map_c::text
 {a=>12:34:56}
 
 statement ok
-CREATE TYPE timestamp_map_c AS MAP (key_type=text, value_type=timestamp);
+CREATE TYPE timestamp_map_c AS MAP (KEY TYPE = text, VALUE TYPE = timestamp);
 
 query T
 SELECT '{a=>2001-01-01 12:34:56}'::timestamp_map_c::text
@@ -544,7 +676,7 @@ SELECT '{a=>2001-01-01 12:34:56}'::timestamp_map_c::text
 {a=>"2001-01-01 12:34:56"}
 
 statement ok
-CREATE TYPE timestamptz_map_c AS MAP (key_type=text, value_type=timestamptz);
+CREATE TYPE timestamptz_map_c AS MAP (KEY TYPE = text, VALUE TYPE = timestamptz);
 
 query T
 SELECT '{a=>2001-01-01 12:34:56}'::timestamptz_map_c::text
@@ -552,7 +684,7 @@ SELECT '{a=>2001-01-01 12:34:56}'::timestamptz_map_c::text
 {a=>"2001-01-01 12:34:56+00"}
 
 statement ok
-CREATE TYPE interval_map_c AS MAP (key_type=text, value_type=interval);
+CREATE TYPE interval_map_c AS MAP (KEY TYPE = text, VALUE TYPE = interval);
 
 query T
 SELECT '{a=>1y 2d 3h 4m}'::interval_map_c::text
@@ -560,7 +692,7 @@ SELECT '{a=>1y 2d 3h 4m}'::interval_map_c::text
 {a=>"1 year 2 days 03:04:00"}
 
 statement ok
-CREATE TYPE numeric_map_c AS MAP (key_type=text, value_type=numeric);
+CREATE TYPE numeric_map_c AS MAP (KEY TYPE = text, VALUE TYPE = numeric);
 
 query T
 SELECT '{a=>1.23}'::numeric_map_c::text
@@ -568,7 +700,7 @@ SELECT '{a=>1.23}'::numeric_map_c::text
 {a=>1.23}
 
 statement ok
-CREATE TYPE jsonb_map_c AS MAP (key_type=text, value_type=jsonb);
+CREATE TYPE jsonb_map_c AS MAP (KEY TYPE = text, VALUE TYPE = jsonb);
 
 query T
 SELECT '{a=>\{\"1\":2\}}'::jsonb_map_c::text;
@@ -578,7 +710,7 @@ SELECT '{a=>\{\"1\":2\}}'::jsonb_map_c::text;
 # 🔬🔬 Check custom type name resolution
 
 statement ok
-CREATE TYPE bool AS MAP (key_type=text, value_type=int4)
+CREATE TYPE bool AS MAP (KEY TYPE = text, VALUE TYPE = int4)
 
 query error invalid input syntax for type boolean: "\{a=>1\}"
 SELECT '{a=>1}'::bool;
@@ -592,11 +724,263 @@ SELECT '{a=>1}'::public.bool::text;
 
 # Supports qualified subtypes
 statement ok
-CREATE TYPE qualified_int4_map AS MAP (key_type=pg_catalog.text, value_type=pg_catalog.int4)
+CREATE TYPE qualified_int4_map AS MAP (KEY TYPE = pg_catalog.text, VALUE TYPE = pg_catalog.int4)
 
 statement ok
-CREATE TYPE qualified_qualified_int4_map AS MAP (key_type=pg_catalog.text, value_type=public.qualified_int4_map)
+CREATE TYPE qualified_qualified_int4_map AS MAP (KEY TYPE = pg_catalog.text, VALUE TYPE = public.qualified_int4_map)
 
 # Supports type aliases
 statement ok
-CREATE TYPE int_map AS MAP (key_type=pg_catalog.text, value_type=int)
+CREATE TYPE int_map AS MAP (KEY TYPE = pg_catalog.text, VALUE TYPE = int)
+
+# `map_length`
+query T
+SELECT map_length('{}'::map[text=>int])
+----
+0
+
+query T
+SELECT map_length('{a=>1}'::map[text=>int])
+----
+1
+
+query T
+SELECT map_length('{a=>1, b=>2}'::map[text=>int])
+----
+2
+
+query T
+SELECT map_length(NULL::map[text=>int])
+----
+NULL
+
+# map_build
+
+query T
+SELECT map_build(LIST[ROW('a', 1), ROW('b', 2)])::TEXT;
+----
+{a=>1,b=>2}
+
+query error LIST could not convert type record\(f1: text,f2: integer\) to text
+SELECT map_build(LIST[ROW('a', 1), ROW('b')])::TEXT;
+
+query error function map_build\(record\(f1: integer,f2: integer\) list\) does not exist
+SELECT map_build(LIST[ROW(1, 1), ROW(2, 2)])::TEXT;
+
+statement ok
+CREATE TYPE r AS (f1 TEXT, f2 INT);
+
+query T
+SELECT map_build(LIST[ROW('a', 1), ROW('b', 2)::r])::TEXT;
+----
+{a=>1,b=>2}
+
+query T
+SELECT map_build(LIST[ROW('a', 1), ROW('b', 2)]::r list)::TEXT;
+----
+{a=>1,b=>2}
+
+query T
+SELECT map_build(LIST[ROW('a', 1), ROW('a', 2)]::r list)::TEXT;
+----
+{a=>2}
+
+query T
+SELECT map_build(LIST[ROW('a', 2), ROW('a', 1)]::r list)::TEXT;
+----
+{a=>1}
+
+# skip null keys
+query T
+SELECT map_build(LIST[ROW('a', 1), ROW(NULL, 2)]::r list)::TEXT;
+----
+{a=>1}
+
+query T
+SELECT map_build(LIST[NULL]::r list)::TEXT;
+----
+{}
+
+query T
+SELECT map_build(LIST[ROW('a', 1), NULL]::r list)::TEXT;
+----
+{a=>1}
+
+query T
+SELECT map_build(LIST[NULL, ROW('a', 1)]::r list)::TEXT;
+----
+{a=>1}
+
+query T
+SELECT map_build(LIST[ROW('a', 9), NULL, ROW('a', 1)]::r list)::TEXT;
+----
+{a=>1}
+
+query error could not determine polymorphic type because input has type unknown
+SELECT map_build(NULL)::TEXT;
+
+query T
+SELECT map_build(NULL::r list)::TEXT;
+----
+NULL
+
+statement ok
+CREATE TYPE int_list AS LIST (ELEMENT TYPE = int4);
+
+statement ok
+CREATE TYPE l AS (f1 TEXT, f2 int_list);
+
+query T
+SELECT map_build(LIST[ROW('a', LIST[1]), ROW('a', LIST[2])]::l list)::TEXT;
+----
+{a=>{2}}
+
+query T
+SELECT map_build(LIST[ROW('a', LIST[2]), ROW('a', LIST[1])]::l list)::TEXT;
+----
+{a=>{1}}
+
+statement ok
+CREATE TYPE int_key AS (f1 INT, f2 INT);
+
+query error db error: ERROR: function map_build\(int_key list\) does not exist
+SELECT map_build(LIST[ROW(1, 1), ROW(1, 2)]::int_key list)::TEXT;
+
+statement ok
+CREATE TYPE missing_value AS (f1 TEXT);
+
+query error db error: ERROR: function map_build\(missing_value list\) does not exist
+SELECT map_build(LIST[ROW('a'), ROW('a')]::missing_value list)::TEXT;
+
+query error db error: ERROR: function map_build\(integer\) does not exist
+SELECT map_build(1)::TEXT;
+
+query error db error: ERROR: function map_build\(integer list\) does not exist
+SELECT map_build(LIST[1])::TEXT;
+
+# map_agg
+
+statement ok
+CREATE TABLE t1 (a int)
+
+statement ok
+INSERT INTO t1 VALUES (1), (2), (3), (NULL)
+
+query error db error: ERROR: function map_agg\(integer, integer\) does not exist
+SELECT map_agg(k, v)::TEXT FROM (SELECT 1 AS k, 2 AS V WHERE false)
+
+query T
+SELECT map_agg(k, v)::TEXT FROM (SELECT 1::TEXT AS k, 2 AS V WHERE false)
+----
+NULL
+
+query T
+SELECT map_agg('one', 2)::TEXT
+----
+{one=>2}
+
+query error db error: ERROR: function map_agg\(integer, integer\) does not exist
+SELECT map_agg(1, 2)
+
+query T
+SELECT map_agg(k, v)::TEXT FROM (SELECT (a - 1)::TEXT AS k, a AS v FROM t1 WHERE a IS NOT NULL)
+----
+{0=>1,1=>2,2=>3}
+
+query T
+SELECT map_agg(column1, column2)::TEXT FROM (VALUES ('a', null), ('b', 1))
+----
+{a=>NULL,b=>1}
+
+query T
+SELECT map_agg(column1, column2)::TEXT FROM (VALUES ('b', 2), ('a', 1))
+----
+{a=>1,b=>2}
+
+query T
+SELECT map_agg(column1, column2)::TEXT FROM (VALUES ('a', 1), ('a', 2))
+----
+{a=>2}
+
+query T
+SELECT map_agg(column1, column2)::TEXT FROM (VALUES ('a', 2), ('a', 1))
+----
+{a=>2}
+
+query T
+SELECT map_agg(a, b ORDER BY b DESC)::TEXT FROM (VALUES ('a', 2), ('a', 1)) AS t (a, b);
+----
+{a=>1}
+
+query T
+SELECT map_agg(a, b ORDER BY b ASC)::TEXT FROM (VALUES ('a', 2), ('a', 1)) AS t (a, b);
+----
+{a=>2}
+
+query T
+SELECT map_agg(null, null)::TEXT
+----
+{}
+
+query T
+SELECT map_agg(null, null)::TEXT
+----
+{}
+
+query T
+SELECT map_agg(null, 1)::TEXT
+----
+{}
+
+query T
+SELECT (map_agg(a::TEXT, a) FILTER (WHERE a IS NOT NULL))::TEXT FROM t1
+----
+{1=>1,2=>2,3=>3}
+
+query T
+SELECT map_agg(a::TEXT, a)::TEXT FROM t1
+----
+{1=>1,2=>2,3=>3}
+
+query T
+SELECT (map_agg(a::TEXT, a) FILTER (WHERE a = 1))::TEXT FROM t1
+----
+{1=>1}
+
+# unnest
+
+query TT colnames
+SELECT key, value FROM unnest('{a=>NULL}'::map[text=>int4]);
+----
+key value
+a   NULL
+
+query TT
+SELECT upper(key), value * 100 FROM unnest('{a=>1}'::map[text=>int4]);
+----
+A   100
+
+query T
+WITH v (a) AS (
+    SELECT '{a=>1}'::map[text=>int]
+),
+unnest (key, value) AS (
+    SELECT (a).key, (a).value FROM (
+        SELECT unnest(a) FROM v
+    ) AS u (a)
+),
+manipulate (key, value) AS (
+    SELECT upper(key), value * 100 FROM unnest
+)
+SELECT map_agg(key, value)::TEXT FROM manipulate;
+----
+{A=>100}
+
+query T
+SELECT unnest(NULL::map[text=>int4]);
+----
+
+query T
+SELECT unnest('{a=>NULL}'::map[text=>int4]);
+----
+(a,)

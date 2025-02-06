@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # Test INSERT INTO...SELECT. This must be a testdrive test to avoid symbiosis
 # in sqllogictest.
 
@@ -33,26 +35,17 @@
     VALUES (9.1::numeric, 10, 'e')
   );
 
-> SELECT * FROM t ORDER BY i
-1 2 a
-3 4 b
-5 6 c
-7 8 d
-9 10 e
-
 ! INSERT INTO t SELECT * FROM (
     VALUES ('11', '12', 'f')
   );
-column "i" is of type integer but expression is of type text
+contains:column "i" is of type integer but expression is of type text
 
 > BEGIN
 
 > INSERT INTO t VALUES (11, 12, 'f')
 
-! INSERT INTO t SELECT * FROM (
-    VALUES (13, 14, 'g')
-  );
-cannot be run inside a transaction block
+! INSERT INTO t SELECT * FROM t;
+contains:cannot be run inside a transaction block
 
 > COMMIT
 
@@ -65,26 +58,68 @@ cannot be run inside a transaction block
 
 > BEGIN
 
-! INSERT INTO t SELECT * FROM (
-    VALUES (11, 12, 'f')
+> INSERT INTO t SELECT * FROM (
+    VALUES (17, 18, 'i')
   );
-cannot be run inside a transaction block
 
 > COMMIT
 
 > CREATE MATERIALIZED VIEW v (a, b, c) AS SELECT 11, 12::real, 'f';
 
-! INSERT INTO t SELECT * FROM v;
-invalid selection
+> INSERT INTO t (i, f, t) SELECT a, b, c FROM v;
 
 # Table check descends into select targets
-! INSERT INTO t (i, f, t) SELECT column1, column2, column3
-    FROM ( VALUES (11, 12, 'f') )
+> INSERT INTO t (i, f, t) SELECT column1, column2, column3
+    FROM ( VALUES (13, 14, 'g') )
     LEFT JOIN (
         SELECT a, b, c FROM v
     ) AS y
     ON y.a = column1
-invalid selection
+
+$ set schema={
+    "type": "record",
+    "name": "row",
+    "fields": [
+      {"name": "a", "type": "long"},
+      {"name": "b", "type": "float"},
+      {"name": "c", "type": "string"}
+    ]
+  }
+
+$ kafka-create-topic topic=data
+
+$ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
+{"a": 15, "b": 16, "c": "h"}
+
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE source_data
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+
+> CREATE TABLE source_data_tbl
+  FROM SOURCE source_data (REFERENCE "testdrive-data-${testdrive.seed}")
+  FORMAT AVRO USING SCHEMA '${schema}'
+
+! INSERT INTO source_data_tbl VALUES (100, 200, 'x');
+contains:cannot insert into non-writeable table 'materialize.public.source_data_tbl'
+
+> CREATE MATERIALIZED VIEW source_data_mat_view AS
+  SELECT * FROM source_data_tbl;
+
+! INSERT INTO t SELECT * FROM source_data_mat_view;
+contains:invalid selection
+
+> SELECT * FROM t ORDER BY i
+1 2 a
+3 4 b
+5 6 c
+7 8 d
+9 10 e
+11 12 f
+13 14 g
+17 18 i
 
 # Multiple connections
 
@@ -93,14 +128,13 @@ invalid selection
 
 > CREATE TABLE s (a int);
 
-$ postgres-connect name=writer url=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-connect name=writer url=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 
 # In-flight txns don't affect updates/deletes, and vice versa
 
 $ postgres-execute connection=writer
 BEGIN;
 INSERT INTO s VALUES (2);
-INSERT INTO c VALUES (3);
 
 > INSERT INTO c SELECT * FROM s;
 
@@ -109,7 +143,7 @@ INSERT INTO c VALUES (3);
 
 $ postgres-execute connection=writer
 
-INSERT INTO s VALUES (4);
+INSERT INTO s VALUES (3);
 COMMIT;
 
 > INSERT INTO c SELECT * FROM s;
@@ -118,14 +152,12 @@ COMMIT;
 1
 2
 3
-4
 
 > BEGIN;
 > SELECT a FROM c
 1
 2
 3
-4
 
 $ postgres-execute connection=writer
 INSERT INTO c SELECT * FROM s;
@@ -134,19 +166,32 @@ INSERT INTO c SELECT * FROM s;
 1
 2
 3
-4
 
 > COMMIT;
 
 # Every value from s should be duplicated in c
 > SELECT a FROM s
 2
-4
+3
 
 > SELECT a FROM c;
 1
 2
 2
 3
-4
-4
+3
+
+# Test DELETE and INSERT INTO SELECT in Serializable mode.
+
+> SET TRANSACTION_ISOLATION TO 'SERIALIZABLE';
+
+> DELETE FROM t
+
+> SELECT * FROM t
+
+> INSERT INTO t (i, f, t) SELECT a, b, c FROM v;
+
+> SELECT * FROM t
+11 12 f
+
+> SET TRANSACTION_ISOLATION TO 'STRICT SERIALIZABLE';

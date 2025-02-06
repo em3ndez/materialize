@@ -15,8 +15,9 @@ import os
 import shlex
 import sys
 import time
+from collections.abc import AsyncGenerator, Callable, Generator, Iterable
 from contextlib import contextmanager
-from typing import Any, AsyncGenerator, Callable, Generator, Iterable, Optional
+from typing import Any
 
 from colored import attr, fg
 
@@ -27,7 +28,7 @@ class Verbosity:
     quiet: bool = False
 
     @classmethod
-    def init_from_env(cls, explicit: Optional[bool]) -> None:
+    def init_from_env(cls, explicit: bool | None) -> None:
         """Set to quiet based on MZ_QUIET being set to almost any value
 
         The only values that this gets set to false for are the empty string, 0, or no
@@ -58,6 +59,7 @@ def speaker(prefix: str) -> Callable[..., None]:
 
 
 header = speaker("==> ")
+section = speaker("--- ")
 say = speaker("")
 
 
@@ -72,9 +74,7 @@ def confirm(question: str) -> bool:
     return response.lower() in ("y", "yes")
 
 
-def progress(
-    msg: str = "", prefix: Optional[str] = None, *, finish: bool = False
-) -> None:
+def progress(msg: str = "", prefix: str | None = None, *, finish: bool = False) -> None:
     """Print a progress message to stderr, using the same prefix format as speaker"""
     if prefix is not None:
         msg = f"{prefix}> {msg}"
@@ -82,7 +82,7 @@ def progress(
     print(msg, file=sys.stderr, flush=True, end=end)
 
 
-def timeout_loop(timeout: int, tick: int = 1) -> Generator[float, None, None]:
+def timeout_loop(timeout: int, tick: float = 1.0) -> Generator[float, None, None]:
     """Loop until timeout, optionally sleeping until tick
 
     Always iterates at least once
@@ -106,7 +106,7 @@ def timeout_loop(timeout: int, tick: int = 1) -> Generator[float, None, None]:
 
 
 async def async_timeout_loop(
-    timeout: int, tick: int = 1
+    timeout: int, tick: float = 1.0
 ) -> AsyncGenerator[float, None]:
     """Loop until timeout, asynchronously sleeping until tick
 
@@ -149,11 +149,11 @@ def shell_quote(args: Iterable[Any]) -> str:
     return " ".join(shlex.quote(str(arg)) for arg in args)
 
 
-def env_is_truthy(env_var: str) -> bool:
-    """Return true if `env_var` is set and is not one of: 0, '', no"""
-    env = os.getenv(env_var)
+def env_is_truthy(env_var: str, default: str = "0") -> bool:
+    """Return true if `env_var` is set and is not one of: 0, '', no, false"""
+    env = os.getenv(env_var, default)
     if env is not None:
-        return env not in ("", "0", "no")
+        return env not in ("", "0", "no", "false")
     return False
 
 
@@ -169,7 +169,7 @@ class UIError(Exception):
         hint: An optional hint to display alongside the error message.
     """
 
-    def __init__(self, message: str, hint: Optional[str] = None):
+    def __init__(self, message: str, hint: str | None = None):
         super().__init__(message)
         self.hint = hint
 
@@ -179,6 +179,25 @@ class UIError(Exception):
         This method will overwrite the existing hint, if any.
         """
         self.hint = hint
+
+
+class CommandFailureCausedUIError(UIError):
+    """
+    An UIError that is caused by executing a command.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        cmd: list[str],
+        stdout: str | None = None,
+        stderr: str | None = None,
+        hint: str | None = None,
+    ):
+        super().__init__(message, hint)
+        self.cmd = cmd
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 @contextmanager

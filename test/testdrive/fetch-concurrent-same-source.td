@@ -7,19 +7,28 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Make sure that FETCH-ing using multiple cursors from the same source works as expected
 #
 
-$ set-regex match=\d{13} replacement=<TIMESTAMP>
+$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+ALTER SYSTEM SET min_timestamp_interval = '10ms'
 
 $ set int={"type": "record", "name": "field_int", "fields": [ {"name": "f1", "type": "int"} ] }
 
 $ kafka-create-topic topic=fetch-concurrent-same-source
 
-> CREATE MATERIALIZED SOURCE fetch_concurrent_same_source
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-fetch-concurrent-same-source-${testdrive.seed}'
-  WITH( timestamp_frequency_ms = 10 )
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE fetch_concurrent_same_source
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-fetch-concurrent-same-source-${testdrive.seed}')
+  WITH (TIMESTAMP INTERVAL '10ms')
+
+> CREATE TABLE fetch_concurrent_same_source_tbl FROM SOURCE fetch_concurrent_same_source (REFERENCE "testdrive-fetch-concurrent-same-source-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE
 
@@ -28,14 +37,14 @@ $ kafka-ingest format=avro topic=fetch-concurrent-same-source schema=${int} time
 {"f1": 234}
 {"f1": 345}
 
-> SELECT COUNT(*) = 3 FROM fetch_concurrent_same_source;
-true
+> SELECT COUNT(*) FROM fetch_concurrent_same_source_tbl;
+3
 
 > BEGIN
 
-> DECLARE c1 CURSOR FOR SELECT * FROM fetch_concurrent_same_source;
+> DECLARE c1 CURSOR FOR SELECT * FROM fetch_concurrent_same_source_tbl;
 
-> DECLARE c2 CURSOR FOR SELECT * FROM fetch_concurrent_same_source;
+> DECLARE c2 CURSOR FOR SELECT * FROM fetch_concurrent_same_source_tbl;
 
 > FETCH ALL c1;
 123
@@ -47,7 +56,7 @@ true
 234
 345
 
-> DECLARE c3 CURSOR FOR SELECT * FROM fetch_concurrent_same_source;
+> DECLARE c3 CURSOR FOR SELECT * FROM fetch_concurrent_same_source_tbl;
 
 > FETCH ALL c3;
 123

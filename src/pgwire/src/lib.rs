@@ -28,6 +28,6 @@ mod metrics;
 mod protocol;
 mod server;
 
-pub use metrics::Metrics;
+pub use metrics::MetricsConfig;
 pub use protocol::match_handshake;
-pub use server::{Config, Server, TlsConfig, TlsMode};
+pub use server::{Config, Server};

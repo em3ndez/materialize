@@ -15,9 +15,9 @@ from materialize import scratch
 def main() -> None:
     desc = scratch.MachineDesc(
         name="chbench monthly",
-        launch_script="MZ_WORKERS=4 bin/mzcompose --preserve-ports --find chbench run load-test",
+        launch_script="bin/mzcompose --preserve-ports --find chbench run load-test",
         instance_type="r5ad.4xlarge",
-        ami="ami-0b29b6e62f2343b46",
+        ami="ami-0aeb7c931a5a61206",
         tags={
             "scrape_benchmark_numbers": "true",
             "lt_name": "monthly-chbench",
@@ -31,7 +31,7 @@ def main() -> None:
     now = datetime.datetime.utcnow()
     scratch.launch_cluster(
         [desc],
-        nonce=now.replace(tzinfo=datetime.timezone.utc).isoformat(),
+        nonce=now.replace(tzinfo=datetime.UTC).isoformat(),
         # Keep alive for at least a day.
         delete_after=datetime.datetime.utcnow() + datetime.timedelta(days=1),
     )

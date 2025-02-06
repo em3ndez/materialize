@@ -19,10 +19,6 @@ pub struct BuildInfo {
     pub version: &'static str,
     /// The 40-character SHA-1 hash identifying the Git commit of the build.
     pub sha: &'static str,
-    /// The time of the build in UTC as an ISO 8601-compliant string.
-    pub time: &'static str,
-    /// The target triple of the platform.
-    pub target_triple: &'static str,
 }
 
 /// Dummy build information.
@@ -32,14 +28,24 @@ pub struct BuildInfo {
 pub const DUMMY_BUILD_INFO: BuildInfo = BuildInfo {
     version: "0.0.0+dummy",
     sha: "0000000000000000000000000000000000000000",
-    time: "",
-    target_triple: "",
 };
+
+/// The target triple of the platform.
+pub const TARGET_TRIPLE: &str = env!("TARGET_TRIPLE");
 
 impl BuildInfo {
     /// Constructs a human-readable version string.
-    pub fn human_version(&self) -> String {
-        format!("v{} ({})", self.version, &self.sha[..9])
+    pub fn human_version(&self, helm_chart_version: Option<String>) -> String {
+        if let Some(ref helm_chart_version) = helm_chart_version {
+            format!(
+                "v{} ({}, helm chart: {})",
+                self.version,
+                &self.sha[..9],
+                helm_chart_version
+            )
+        } else {
+            format!("v{} ({})", self.version, &self.sha[..9])
+        }
     }
 
     /// Returns the version as a rich [semantic version][semver].
@@ -56,5 +62,131 @@ impl BuildInfo {
         self.version
             .parse()
             .expect("build version is not valid semver")
+    }
+
+    /// The same as [`Self::semver_version`], but includes build metadata in the returned version,
+    /// if build metadata is available on the compiled platform.
+    #[cfg(feature = "semver")]
+    pub fn semver_version_build(&self) -> Option<semver::Version> {
+        let build_id = buildid::build_id()?;
+        let build_id = hex::encode(build_id);
+        let version = format!("{}+{}", self.version, build_id)
+            .parse()
+            .expect("build version is not valid semver");
+        Some(version)
+    }
+
+    /// Returns the version as an integer along the lines of Pg's server_version_num
+    #[cfg(feature = "semver")]
+    pub fn version_num(&self) -> i32 {
+        let semver: semver::Version = self
+            .version
+            .parse()
+            .expect("build version is not a valid semver");
+        let ver_string = format!(
+            "{:0>2}{:0>3}{:0>2}",
+            semver.major, semver.minor, semver.patch
+        );
+        ver_string.parse::<i32>().unwrap()
+    }
+
+    /// Returns whether the version is a development version
+    pub fn is_dev(&self) -> bool {
+        self.version.contains("dev")
+    }
+}
+
+/// Generates an appropriate [`BuildInfo`] instance.
+///
+/// This macro should be invoked at the leaf of the crate graph, usually in the
+/// final binary, and the resulting `BuildInfo` struct plumbed into whatever
+/// libraries require it. Invoking the macro in intermediate crates may result
+/// in a build info with stale, cached values for the build SHA and time.
+#[macro_export]
+macro_rules! build_info {
+    () => {
+        $crate::BuildInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            sha: $crate::__git_sha_internal!(),
+        }
+    };
+}
+
+#[cfg(all(bazel, stamped))]
+#[macro_export]
+macro_rules! __git_sha_internal {
+    () => {
+        $crate::private::bazel_variables::GIT_COMMIT_HASH
+    };
+}
+
+// To improve the effectiveness of remote caching we only stamp "release" builds
+// and otherwise side-channel git status through a known file.
+//
+// See: <https://github.com/bazelbuild/bazel/issues/10075>
+#[cfg(all(bazel, not(stamped)))]
+#[macro_export]
+macro_rules! __git_sha_internal {
+    () => {
+        $crate::private::run_command_str!(
+            "sh",
+            "-c",
+            r#"if [ -f /tmp/mz_git_hash.txt ]; then
+                    cat /tmp/mz_git_hash.txt
+                else
+                    echo "0000000000000000000000000000000000000000"
+                fi"#
+        )
+    };
+}
+
+#[cfg(not(bazel))]
+#[macro_export]
+macro_rules! __git_sha_internal {
+    () => {
+        $crate::private::run_command_str!(
+            "sh",
+            "-c",
+            r#"if [ -n "$MZ_DEV_BUILD_SHA" ]; then
+                    echo "$MZ_DEV_BUILD_SHA"
+                else
+                    # Unfortunately we need to suppress error messages from `git`, as
+                    # run_command_str will display no error message at all if we print
+                    # more than one line of output to stderr.
+                    git rev-parse --verify HEAD 2>/dev/null || {
+                        printf "error: unable to determine Git SHA; " >&2
+                        printf "either build from working Git clone " >&2
+                        printf "(see https://materialize.com/docs/install/#build-from-source), " >&2
+                        printf "or specify SHA manually by setting MZ_DEV_BUILD_SHA environment variable" >&2
+                        printf "If you are using git worktrees, you must be in the primary worktree" >&2
+                        printf "for automatic detection to work." >&2
+                        exit 1
+                    }
+                fi"#
+        )
+    }
+}
+
+#[doc(hidden)]
+pub mod private {
+    pub use compile_time_run::run_command_str;
+
+    // Bazel has a "workspace status" feature that allows us to collect info from
+    // the workspace (e.g. git hash) at build time. These values get incleded via
+    // a generated file.
+    #[cfg(all(bazel, stamped))]
+    #[allow(unused)]
+    pub mod bazel_variables {
+        include!(std::env!("BAZEL_GEN_BUILD_INFO"));
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test] // allow(test-attribute)
+    fn smoketest_build_info() {
+        let build_info = crate::build_info!();
+
+        assert_eq!(build_info.sha.len(), 40);
     }
 }

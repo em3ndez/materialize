@@ -16,13 +16,22 @@
 //! determining the orders of collections, lifting predicates if useful arrangements exist,
 //! and identifying opportunities to use indexes to replace filters.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-use crate::TransformArgs;
-use expr::{
-    Id, JoinInputMapper, MapFilterProject, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT,
+use mz_expr::visit::{Visit, VisitChildren};
+use mz_expr::JoinImplementation::{Differential, IndexedFilter, Unimplemented};
+use mz_expr::{
+    FilterCharacteristics, Id, JoinInputCharacteristics, JoinInputMapper, MapFilterProject,
+    MirRelationExpr, MirScalarExpr, RECURSION_LIMIT,
 };
-use ore::stack::{CheckedRecursion, RecursionGuard};
+use mz_ore::stack::{CheckedRecursion, RecursionGuard};
+use mz_ore::{soft_assert_or_log, soft_panic_or_log};
+use mz_repr::optimize::OptimizerFeatures;
+
+use crate::analysis::{Cardinality, DerivedBuilder};
+use crate::join_implementation::index_map::IndexMap;
+use crate::predicate_pushdown::PredicatePushdown;
+use crate::{StatisticsOracle, TransformCtx, TransformError};
 
 /// Determines the join implementation for join operators.
 #[derive(Debug)]
@@ -47,17 +56,28 @@ impl CheckedRecursion for JoinImplementation {
 }
 
 impl crate::Transform for JoinImplementation {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "JoinImplementation"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "join_implementation")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        args: TransformArgs,
-    ) -> Result<(), crate::TransformError> {
-        let mut arranged = HashMap::new();
-        for (on_id, idxs) in args.indexes {
-            let keys = idxs.iter().map(|(_id, keys)| keys.clone()).collect();
-            arranged.insert(Id::Global(*on_id), keys);
-        }
-        self.action_recursive(relation, &mut arranged)
+        ctx: &mut TransformCtx,
+    ) -> Result<(), TransformError> {
+        let result = self.action_recursive(
+            relation,
+            &mut IndexMap::new(ctx.indexes),
+            ctx.stats,
+            ctx.features,
+        );
+        mz_repr::explain::trace_plan(&*relation);
+        result
     }
 }
 
@@ -69,48 +89,96 @@ impl JoinImplementation {
     pub fn action_recursive(
         &self,
         relation: &mut MirRelationExpr,
-        arranged: &mut HashMap<Id, Vec<Vec<MirScalarExpr>>>,
-    ) -> Result<(), crate::TransformError> {
-        if let MirRelationExpr::Let { id, value, body } = relation {
-            self.action_recursive(value, arranged)?;
-            match &**value {
-                MirRelationExpr::ArrangeBy { keys, .. } => {
-                    arranged.insert(Id::Local(*id), keys.clone());
+        indexes: &mut IndexMap,
+        stats: &dyn StatisticsOracle,
+        features: &OptimizerFeatures,
+    ) -> Result<(), TransformError> {
+        self.checked_recur(|_| {
+            if let MirRelationExpr::Let { id, value, body } = relation {
+                self.action_recursive(value, indexes, stats, features)?;
+                match &**value {
+                    MirRelationExpr::ArrangeBy { keys, .. } => {
+                        for key in keys {
+                            indexes.add_local(*id, key.clone());
+                        }
+                    }
+                    MirRelationExpr::Reduce { group_key, .. } => {
+                        indexes.add_local(
+                            *id,
+                            (0..group_key.len()).map(MirScalarExpr::Column).collect(),
+                        );
+                    }
+                    _ => {}
                 }
-                MirRelationExpr::Reduce { group_key, .. } => {
-                    arranged.insert(
-                        Id::Local(*id),
-                        vec![(0..group_key.len()).map(MirScalarExpr::Column).collect()],
-                    );
-                }
-                _ => {}
+                self.action_recursive(body, indexes, stats, features)?;
+                indexes.remove_local(*id);
+                Ok(())
+            } else {
+                let (mfp, mfp_input) =
+                    MapFilterProject::extract_non_errors_from_expr_ref_mut(relation);
+                mfp_input.try_visit_mut_children(|e| {
+                    self.action_recursive(e, indexes, stats, features)
+                })?;
+                self.action(mfp_input, mfp, indexes, stats, features)?;
+                Ok(())
             }
-            self.action_recursive(body, arranged)?;
-            arranged.remove(&Id::Local(*id));
-            Ok(())
-        } else {
-            relation.try_visit_mut_children(|e| self.action_recursive(e, arranged))?;
-            self.action(relation, arranged);
-            Ok(())
-        }
+        })
     }
 
     /// Determines the join implementation for join operators.
     pub fn action(
         &self,
         relation: &mut MirRelationExpr,
-        indexes: &HashMap<Id, Vec<Vec<MirScalarExpr>>>,
-    ) {
+        mfp_above: MapFilterProject,
+        indexes: &IndexMap,
+        stats: &dyn StatisticsOracle,
+        features: &OptimizerFeatures,
+    ) -> Result<(), TransformError> {
         if let MirRelationExpr::Join {
             inputs,
             equivalences,
-            ..
+            // (Note that `JoinImplementation` runs in a fixpoint loop.)
+            // If the current implementation is
+            //  - Unimplemented, then we need to come up with an implementation.
+            //  - Differential, then we consider switching to a Delta join, because we might have
+            //    inserted some ArrangeBys that create new arrangements when we came up with the
+            //    Differential plan, in which case a Delta join might have become viable.
+            //  - Delta, then we are good already.
+            //  - IndexedFilter, then we just leave that alone, because those are out of scope
+            //    for JoinImplementation (they are created by `LiteralConstraints`).
+            // We don't want to change from a Differential plan to an other Differential plan, or
+            // from a Delta plan to an other Delta plan, because the second run cannot distinguish
+            // between an ArrangeBy that marks an already existing arrangement and an ArrangeBy
+            // that was inserted by a previous run of JoinImplementation. (We should eventually
+            // refactor this to make ArrangeBy unambiguous somehow. Maybe move JoinImplementation
+            // to the lowering.)
+            implementation: implementation @ (Unimplemented | Differential(..)),
         } = relation
         {
+            // If we eagerly plan delta joins, we don't need the second run to "pick up" delta joins
+            // that could be planned with the arrangements from a differential. If such a delta
+            // join were viable, we'd have already planned it the first time.
+            if features.enable_eager_delta_joins && !matches!(implementation, Unimplemented) {
+                return Ok(());
+            }
+
             let input_types = inputs.iter().map(|i| i.typ()).collect::<Vec<_>>();
 
             // Canonicalize the equivalence classes
-            expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
+            if matches!(implementation, Unimplemented) {
+                // Let's do this only if it's the first run of JoinImplementation, in which case we
+                // are guaranteed to produce a new plan, which will be compatible with the modified
+                // equivalences from the below call. Otherwise, if we already have a Differential or
+                // a Delta join, then we might discard the new plan and go with the old plan, which
+                // was created previously for the old equivalences, and might be invalid for the
+                // modified equivalences from the below call. Note that this issue can arise only if
+                // `canonicalize_equivalences` is not idempotent, which unfortunately seems to be
+                // the case.
+                mz_expr::canonicalize::canonicalize_equivalences(
+                    equivalences,
+                    input_types.iter().map(|t| &t.column_types),
+                );
+            }
 
             // Common information of broad utility.
             let input_mapper = JoinInputMapper::new_from_input_types(&input_types);
@@ -118,39 +186,139 @@ impl JoinImplementation {
             // The first fundamental question is whether we should employ a delta query or not.
             //
             // Here we conservatively use the rule that if sufficient arrangements exist we will
-            // use a delta query. An arrangement is considered available if it is a global get
-            // with columns present in `indexes`, if it is an `ArrangeBy` with the columns present,
-            // or a filter wrapped around either of these.
+            // use a delta query (except for 2-input joins). (With eager delta joins, we will
+            // settle for fewer arrangements in the delta join than in the differential join.)
+            //
+            // An arrangement is considered available for an input
+            // - if it is a `Get` with columns present in `indexes`,
+            //   - or the same wrapped by an IndexedFilter,
+            // - if it is an `ArrangeBy` with the columns present (note that the ArrangeBy might
+            //   have been inserted by a previous run of JoinImplementation),
+            // - if it is a `Reduce` whose output is arranged the right way,
+            // - if it is a filter wrapped around either of these (see the mfp extraction).
+            //
+            // The `IndexedFilter` case above is to avoid losing some Delta joins
+            // due to `IndexedFilter` on a join input. This means that in the absolute worst
+            // case (when the `IndexedFilter` doesn't filter out anything), we will fully
+            // re-create some arrangements that we already have for that input. This worst case
+            // is still better than what can happen if we lose a Delta join: Differential joins
+            // will create several new arrangements that doesn't even have a size bound, i.e.,
+            // they might be larger than any user-created index.
 
             let unique_keys = input_types
                 .into_iter()
                 .map(|typ| typ.keys)
                 .collect::<Vec<_>>();
             let mut available_arrangements = vec![Vec::new(); inputs.len()];
+            let mut filters = Vec::with_capacity(inputs.len());
+            let mut cardinalities = Vec::with_capacity(inputs.len());
+
+            // We figure out what predicates from mfp_above could be pushed to which input.
+            // We won't actually push these down now; this just informs FilterCharacteristics.
+            let (map, mut filter, _) = mfp_above.as_map_filter_project();
+            let all_errors = filter.iter().all(|p| p.is_literal_err());
+            let (_, pushed_through_map) = PredicatePushdown::push_filters_through_map(
+                &map,
+                &mut filter,
+                mfp_above.input_arity,
+                all_errors,
+            )?;
+            let (_, push_downs) = PredicatePushdown::push_filters_through_join(
+                &input_mapper,
+                equivalences,
+                pushed_through_map,
+            );
+
             for index in 0..inputs.len() {
                 // We can work around mfps, as we can lift the mfps into the join execution.
                 let (mfp, input) = MapFilterProject::extract_non_errors_from_expr(&inputs[index]);
-                let (_, _, project) = mfp.as_map_filter_project();
-                // Get and ArrangeBy expressions contribute arrangements.
-                match input {
-                    MirRelationExpr::Get { id, typ: _ } => {
-                        if let Some(keys) = indexes.get(id) {
-                            available_arrangements[index].extend(keys.clone());
+                let (_, filter, project) = mfp.as_map_filter_project();
+
+                // We gather filter characteristics:
+                // - From the filter that is directly at the top mfp of the input.
+                // - IndexedFilter joins are constructed from literal equality filters.
+                // - If the input is an ArrangeBy, then we gather filter characteristics from
+                //   the mfp below the ArrangeBy. (JoinImplementation often inserts ArrangeBys.)
+                // - From filters that could be pushed down from above the join to this input.
+                //   (In LIR, these will be executed right after the join path executes the join
+                //   for this input.)
+                // - (No need to look behind Gets, see the inline_mfp argument of RelationCSE.)
+                let mut characteristics = FilterCharacteristics::filter_characteristics(&filter)?;
+                if matches!(
+                    input,
+                    MirRelationExpr::Join {
+                        implementation: IndexedFilter(..),
+                        ..
+                    }
+                ) {
+                    characteristics.add_literal_equality();
+                }
+                if let MirRelationExpr::ArrangeBy {
+                    input: arrange_by_input,
+                    ..
+                } = input
+                {
+                    let (mfp, input) =
+                        MapFilterProject::extract_non_errors_from_expr(arrange_by_input);
+                    let (_, filter, _) = mfp.as_map_filter_project();
+                    characteristics |= FilterCharacteristics::filter_characteristics(&filter)?;
+                    if matches!(
+                        input,
+                        MirRelationExpr::Join {
+                            implementation: IndexedFilter(..),
+                            ..
                         }
+                    ) {
+                        characteristics.add_literal_equality();
+                    }
+                }
+                let push_down_characteristics =
+                    FilterCharacteristics::filter_characteristics(&push_downs[index])?;
+                let push_down_factor = push_down_characteristics.worst_case_scaling_factor();
+                characteristics |= push_down_characteristics;
+
+                // Estimate cardinality
+                if features.enable_cardinality_estimates {
+                    let mut builder = DerivedBuilder::new(features);
+                    // TODO(mgree): it would be good to not have to copy the statistics here
+                    builder.require(Cardinality::with_stats(stats.as_map()));
+                    let derived = builder.visit(input);
+
+                    let estimate = *derived.as_view().value::<Cardinality>().unwrap();
+                    // we've already accounted for the filters _in_ the term; these capture the ones above
+                    let scaled = estimate * push_down_factor;
+                    cardinalities.push(scaled.rounded());
+                } else {
+                    cardinalities.push(None);
+                }
+
+                filters.push(characteristics);
+
+                // Collect available arrangements on this input.
+                match input {
+                    MirRelationExpr::Get { id, typ: _, .. } => {
+                        available_arrangements[index]
+                            .extend(indexes.get(*id).map(|key| key.to_vec()));
                     }
                     MirRelationExpr::ArrangeBy { input, keys } => {
                         // We may use any presented arrangement keys.
                         available_arrangements[index].extend(keys.clone());
-                        if let MirRelationExpr::Get { id, typ: _ } = &**input {
-                            if let Some(keys) = indexes.get(id) {
-                                available_arrangements[index].extend(keys.clone());
-                            }
+                        if let MirRelationExpr::Get { id, typ: _, .. } = &**input {
+                            available_arrangements[index]
+                                .extend(indexes.get(*id).map(|key| key.to_vec()));
                         }
                     }
                     MirRelationExpr::Reduce { group_key, .. } => {
-                        // The first `keys.len()` columns form an arrangement key.
+                        // The first `group_key.len()` columns form an arrangement key.
                         available_arrangements[index]
                             .push((0..group_key.len()).map(MirScalarExpr::Column).collect());
+                    }
+                    MirRelationExpr::Join {
+                        implementation: IndexedFilter(id, ..),
+                        ..
+                    } => {
+                        available_arrangements[index]
+                            .extend(indexes.get(Id::Global(id.clone())).map(|key| key.to_vec()));
                     }
                     _ => {}
                 }
@@ -160,21 +328,21 @@ impl JoinImplementation {
                     .into_iter()
                     .enumerate()
                     .map(|(i, c)| (c, i))
-                    .collect::<HashMap<_, _>>();
-                // Eliminate arrangements refering to columns that have been
+                    .collect::<BTreeMap<_, _>>();
+                // Eliminate arrangements referring to columns that have been
                 // projected away by surrounding MFPs.
                 available_arrangements[index].retain(|key| {
                     key.iter()
                         .all(|k| k.support().iter().all(|c| reverse_project.contains_key(c)))
                 });
                 // Permute arrangements so columns reference what is after the MFP.
-                for key_set in available_arrangements[index].iter_mut() {
-                    for key in key_set.iter_mut() {
-                        key.permute_map(&reverse_project);
+                for key in available_arrangements[index].iter_mut() {
+                    for k in key.iter_mut() {
+                        k.permute_map(&reverse_project);
                     }
                 }
                 // Currently we only support using arrangements all of whose
-                // keys can be found in some equivalence.
+                // key components can be found in some equivalence.
                 // Note: because `order_input` currently only finds arrangements
                 // with exact key matches, the code below can be removed with no
                 // change in behavior, but this is being kept for a future
@@ -189,42 +357,241 @@ impl JoinImplementation {
                 });
             }
 
-            // Determine if we can perform delta queries with the existing arrangements.
-            // We could defer the execution if we are sure we know we want one input,
-            // but we could imagine wanting the best from each and then comparing the two.
-            let delta_query_plan = delta_queries::plan(
-                relation,
-                &input_mapper,
-                &available_arrangements,
-                &unique_keys,
-            );
-            let differential_plan = differential::plan(
-                relation,
-                &input_mapper,
-                &available_arrangements,
-                &unique_keys,
-            );
+            let old_implementation = implementation.clone();
+            let num_inputs = inputs.len();
+            // We've already planned a differential join... should we replace it with a delta join?
+            //
+            // This code path is only active when `eager_delta_joins` is false.
+            if matches!(old_implementation, Differential(..)) {
+                soft_assert_or_log!(
+                    !features.enable_eager_delta_joins,
+                    "eager delta joins run join implementation just once"
+                );
 
-            *relation = delta_query_plan
-                .or(differential_plan)
-                .expect("Failed to produce a join plan");
+                // Binary joins can't be delta joins---give up.
+                if inputs.len() <= 2 {
+                    return Ok(());
+                }
+
+                // Only plan a delta join if it's no new arrangements (beyond what differential planned).
+                if let Ok((delta_query_plan, 0)) = delta_queries::plan(
+                    relation,
+                    &input_mapper,
+                    &available_arrangements,
+                    &unique_keys,
+                    &cardinalities,
+                    &filters,
+                ) {
+                    tracing::debug!(plan = ?delta_query_plan, "replacing differential join with delta join");
+                    *relation = delta_query_plan;
+                }
+
+                return Ok(());
+            }
+
+            // To have reached here, we must be in our first run of join planning.
+            //
+            // We plan a differential join first.
+            let (differential_query_plan, differential_new_arrangements) = differential::plan(
+                relation,
+                &input_mapper,
+                &available_arrangements,
+                &unique_keys,
+                &cardinalities,
+                &filters,
+            )
+            .expect("Failed to produce a differential join plan");
+
+            // Binary joins _must_ be differential. We won't plan a delta join.
+            if num_inputs <= 2 {
+                // if inputs.len() == 0 then something is very wrong.
+                soft_assert_or_log!(num_inputs != 0, "join with no inputs");
+                // if inputs.len() == 1:
+                // Single input joins are filters and should be planned as
+                // differential plans instead of delta queries. Because a
+                // a filter gets converted into a single input join only when
+                // there are existing arrangements, without this early return,
+                // filters will always be planned as delta queries.
+                // Note: This can actually occur, see github-24511.slt.
+                //
+                // if inputs.len() == 2:
+                // We decided to always plan this as a differential join for now, because the usual
+                // advantage of a Delta join avoiding intermediate arrangements doesn't apply.
+                // See more details here:
+                // https://github.com/MaterializeInc/materialize/pull/16099#issuecomment-1316857374
+                // https://github.com/MaterializeInc/materialize/pull/17708#discussion_r1112848747
+                *relation = differential_query_plan;
+
+                return Ok(());
+            }
+
+            // We are planning a multiway join for the first time.
+            //
+            // We compare the delta and differential join plans.
+            //
+            // A delta query requires that, for every path, there is an arrangement for every
+            // input except for the starting one. Such queries are viable when:
+            //
+            //   (a) all the arrangements already exist, or
+            //   (b) both:
+            //       (i) we wouldn't create more arrangements than a differential join would
+            //       (ii) `enable_eager_delta_joins` is on
+            //
+            // A differential join of k relations requires k-2 arrangements of intermediate
+            // results (plus k arrangements of the inputs).
+            //
+            // Consider A ⨝ B ⨝ C ⨝ D. If planned as a differential join, we might have:
+            //          A » B » C » D
+            // This corresponds to the tree:
+            //
+            // A   B
+            //  \ /
+            //   ⨝   C
+            //    \ /
+            //     ⨝   D
+            //      \ /
+            //       ⨝
+            //
+            // At the two internal joins, the differential join will need two new arrangements.
+            //
+            // TODO(mgree): with this refactoring, we should compute `orders` once---both joins
+            //              call `optimize_orders` and we can save some work.
+            match delta_queries::plan(
+                relation,
+                &input_mapper,
+                &available_arrangements,
+                &unique_keys,
+                &cardinalities,
+                &filters,
+            ) {
+                // If delta plan's inputs need no new arrangements, pick the delta plan.
+                Ok((delta_query_plan, 0)) => {
+                    soft_assert_or_log!(
+                        matches!(old_implementation, Unimplemented | Differential(..)),
+                        "delta query plans should not be planned twice"
+                    );
+                    tracing::debug!(
+                        plan = ?delta_query_plan,
+                        differential_new_arrangements = differential_new_arrangements,
+                        "picking delta query plan (no new arrangements)");
+                    *relation = delta_query_plan;
+                }
+                // If the delta plan needs new arrangements, compare with the differential plan.
+                Ok((delta_query_plan, delta_new_arrangements)) => {
+                    tracing::debug!(
+                        delta_new_arrangements = delta_new_arrangements,
+                        differential_new_arrangements = differential_new_arrangements,
+                        "comparing delta and differential joins",
+                    );
+
+                    if features.enable_eager_delta_joins
+                        && delta_new_arrangements <= differential_new_arrangements
+                    {
+                        // If we're eagerly planning delta joins, pick the delta plan if it's more economical.
+                        tracing::debug!(
+                            plan = ?delta_query_plan,
+                            "picking delta query plan");
+                        *relation = delta_query_plan;
+                    } else if let Unimplemented = old_implementation {
+                        // If we haven't planned the join yet, use the differential plan.
+                        tracing::debug!(
+                            plan = ?differential_query_plan,
+                            "picking differential query plan");
+                        *relation = differential_query_plan;
+                    } else {
+                        // But don't replace an existing differential plan.
+                        tracing::debug!(plan = ?old_implementation, "keeping old plan");
+                        soft_assert_or_log!(
+                            matches!(old_implementation, Differential(..)),
+                            "implemented plan in second run of join implementation should be differential \
+                             if the delta plan is not viable")
+                    }
+                }
+                // If we can't plan a delta join, plan a differential join.
+                Err(err) => {
+                    soft_panic_or_log!("delta planning failed: {err}");
+                    tracing::debug!(
+                        plan = ?differential_query_plan,
+                        "picking differential query plan (delta planning failed)");
+                    *relation = differential_query_plan;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+mod index_map {
+    use std::collections::BTreeMap;
+
+    use mz_expr::{Id, LocalId, MirScalarExpr};
+
+    use crate::IndexOracle;
+
+    /// Keeps track of local and global indexes available while descending
+    /// a `MirRelationExpr`.
+    #[derive(Debug)]
+    pub struct IndexMap<'a> {
+        local: BTreeMap<LocalId, Vec<Vec<MirScalarExpr>>>,
+        global: &'a dyn IndexOracle,
+    }
+
+    impl IndexMap<'_> {
+        /// Creates a new index map with knowledge of the provided global indexes.
+        pub fn new(global: &dyn IndexOracle) -> IndexMap {
+            IndexMap {
+                local: BTreeMap::new(),
+                global,
+            }
+        }
+
+        /// Adds a local index on the specified collection with the specified key.
+        pub fn add_local(&mut self, id: LocalId, key: Vec<MirScalarExpr>) {
+            self.local.entry(id).or_default().push(key)
+        }
+
+        /// Removes all local indexes on the specified collection.
+        pub fn remove_local(&mut self, id: LocalId) {
+            self.local.remove(&id);
+        }
+
+        pub fn get(&self, id: Id) -> Box<dyn Iterator<Item = &[MirScalarExpr]> + '_> {
+            match id {
+                Id::Global(id) => Box::new(self.global.indexes_on(id).map(|(_idx_id, key)| key)),
+                Id::Local(id) => Box::new(
+                    self.local
+                        .get(&id)
+                        .into_iter()
+                        .flatten()
+                        .map(|x| x.as_slice()),
+                ),
+            }
         }
     }
 }
 
 mod delta_queries {
 
-    use expr::{JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr};
+    use std::collections::BTreeSet;
+
+    use mz_expr::{
+        FilterCharacteristics, JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr,
+    };
+
+    use crate::TransformError;
 
     /// Creates a delta query plan, and any predicates that need to be lifted.
+    /// It also returns the number of new arrangements necessary for this plan.
     ///
-    /// The method returns `None` if it fails to find a sufficiently pleasing plan.
+    /// The method returns `Err` if any errors occur during planning.
     pub fn plan(
         join: &MirRelationExpr,
         input_mapper: &JoinInputMapper,
         available: &[Vec<Vec<MirScalarExpr>>],
         unique_keys: &[Vec<Vec<usize>>],
-    ) -> Option<MirRelationExpr> {
+        cardinalities: &[Option<usize>],
+        filters: &[FilterCharacteristics],
+    ) -> Result<(MirRelationExpr, usize), TransformError> {
         let mut new_join = join.clone();
 
         if let MirRelationExpr::Join {
@@ -233,66 +600,86 @@ mod delta_queries {
             implementation,
         } = &mut new_join
         {
-            if inputs.len() < 2 {
-                // Single input joins are filters and should be planned as
-                // differential plans instead of delta queries. Because a
-                // a filter gets converted into a single input join only when
-                // there are existing arrangements, without this early return,
-                // filters will always be planned as delta queries.
-                return None;
-            }
+            // Determine a viable order for each relation, or return `Err` if none found.
+            let orders = super::optimize_orders(
+                equivalences,
+                available,
+                unique_keys,
+                cardinalities,
+                filters,
+                input_mapper,
+            )?;
 
-            // Determine a viable order for each relation, or return `None` if none found.
-            let orders = super::optimize_orders(equivalences, available, unique_keys, input_mapper);
+            // Count new arrangements.
+            let new_arrangements: usize =
+                orders
+                    .iter()
+                    .flat_map(|o| {
+                        o.iter().skip(1).filter_map(|(c, key, input)| {
+                            if c.arranged {
+                                None
+                            } else {
+                                Some((input, key))
+                            }
+                        })
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .len();
 
-            // A viable delta query requires that, for every order,
-            // there is an arrangement for every input except for
-            // the starting one.
-            if !orders
-                .iter()
-                .all(|o| o.iter().skip(1).all(|(c, _, _)| c.arranged))
-            {
-                return None;
-            }
-
-            // Convert the order information into specific (input, keys) information.
-            let orders = orders
+            // Convert the order information into specific (input, key, characteristics) information.
+            let mut orders = orders
                 .into_iter()
                 .map(|o| {
                     o.into_iter()
                         .skip(1)
-                        .map(|(_c, k, r)| (r, k))
+                        .map(|(c, key, r)| (r, key, Some(c)))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
 
             // Implement arrangements in each of the inputs.
-            let lifted_mfp =
+            let (lifted_mfp, lifted_projections) =
                 super::implement_arrangements(inputs, available, orders.iter().flatten());
+
+            // Permute `order` to compensate for projections being lifted as part of
+            // the mfp lifting in `implement_arrangements`.
+            orders
+                .iter_mut()
+                .for_each(|order| super::permute_order(order, &lifted_projections));
 
             *implementation = JoinImplementation::DeltaQuery(orders);
 
-            super::install_lifted_mfp(&mut new_join, lifted_mfp);
+            super::install_lifted_mfp(&mut new_join, lifted_mfp)?;
 
             // Hooray done!
-            Some(new_join)
+            Ok((new_join, new_arrangements))
         } else {
-            panic!("delta_queries::plan call on non-join expression.")
+            Err(TransformError::Internal(String::from(
+                "delta_queries::plan call on non-join expression",
+            )))
         }
     }
 }
 
 mod differential {
+    use std::collections::BTreeSet;
 
-    use expr::{JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr};
+    use mz_expr::{JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr};
+    use mz_ore::soft_assert_eq_or_log;
+
+    use crate::join_implementation::{FilterCharacteristics, JoinInputCharacteristics};
+    use crate::TransformError;
 
     /// Creates a linear differential plan, and any predicates that need to be lifted.
+    /// It also returns the number of new arrangements necessary for this plan.
     pub fn plan(
         join: &MirRelationExpr,
         input_mapper: &JoinInputMapper,
         available: &[Vec<Vec<MirScalarExpr>>],
         unique_keys: &[Vec<Vec<usize>>],
-    ) -> Option<MirRelationExpr> {
+        cardinalities: &[Option<usize>],
+        filters: &[FilterCharacteristics],
+    ) -> Result<(MirRelationExpr, usize), TransformError> {
         let mut new_join = join.clone();
 
         if let MirRelationExpr::Join {
@@ -301,72 +688,132 @@ mod differential {
             implementation,
         } = &mut new_join
         {
-            // We prefer a starting point based on the characteristics of the other input arrangements.
+            // We compute one order for each possible starting point, and we will choose one from
+            // these.
+            //
+            // It is an invariant that the orders are in input order: the ith order begins with the ith input.
+            //
             // We could change this preference at any point, but the list of orders should still inform.
             // Important, we should choose something stable under re-ordering, to converge under fixed
             // point iteration; we choose to start with the first input optimizing our criteria, which
             // should remain stable even when promoted to the first position.
-            let mut orders =
-                super::optimize_orders(equivalences, available, unique_keys, input_mapper);
+            let mut orders = super::optimize_orders(
+                equivalences,
+                available,
+                unique_keys,
+                cardinalities,
+                filters,
+                input_mapper,
+            )?;
 
-            // For differential join, it is not as important for the starting
-            // input to have good characteristics because the other ones
-            // determine whether intermediate results blow up. Thus, we do not
-            // include the starting input when max-minning.
+            // Count new arrangements.
+            //
+            // We collect the count for each input, to be used to calculate `new_arrangements` below.
+            let new_input_arrangements: Vec<usize> = orders
+                .iter()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(c, key, input)| {
+                            if c.arranged {
+                                None
+                            } else {
+                                Some((*input, key.clone()))
+                            }
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                })
+                .collect();
+
+            // Inside each order, we take the `FilterCharacteristics` from each element, and OR it
+            // to every other element to the right. This is because we are gonna be looking for the
+            // worst `Characteristic` in every order, and for this it makes sense to include a
+            // filter in a `Characteristic` if the filter was applied not just at that input but
+            // any input before. For examples, see chbench.slt Query 02 and 11.
+            orders.iter_mut().for_each(|order| {
+                let mut sum = FilterCharacteristics::none();
+                for (JoinInputCharacteristics { filters, .. }, _, _) in order {
+                    *filters |= sum;
+                    sum = filters.clone();
+                }
+            });
+
+            // `orders` has one order for each starting collection, and now we have to choose one
+            // from these. First, we find the worst `Characteristics` inside each order, and then we
+            // find the best one among these across all orders, which goes into
+            // `max_min_characteristics`.
             let max_min_characteristics = orders
                 .iter()
-                .flat_map(|order| order.iter().skip(1).map(|(c, _, _)| c.clone()).min())
+                .flat_map(|order| order.iter().map(|(c, _, _)| c.clone()).min())
                 .max();
             let mut order = if let Some(max_min_characteristics) = max_min_characteristics {
                 orders
                     .into_iter()
-                    .find(|o| {
-                        o.iter().skip(1).map(|(c, _, _)| c).min().unwrap()
-                            == &max_min_characteristics
+                    .filter(|o| {
+                        o.iter().map(|(c, _, _)| c).min().unwrap() == &max_min_characteristics
+                    })
+                    // It can happen that `orders` has multiple such orders that have the same worst
+                    // `Characteristic` as `max_min_characteristics`. In this case, we go beyond the
+                    // worst `Characteristic`: we inspect the entire `Characteristic` vector of each
+                    // of these orders, and choose the best among these. This pushes bad stuff to
+                    // happen later, by which time we might have applied some filters.
+                    .max_by_key(|o| o.clone())
+                    .ok_or_else(|| {
+                        TransformError::Internal(String::from(
+                            "could not find max-min characteristics",
+                        ))
                     })?
                     .into_iter()
-                    .map(|(_c, k, r)| (r, k))
+                    .map(|(c, key, r)| (r, key, Some(c)))
                     .collect::<Vec<_>>()
             } else {
                 // if max_min_characteristics is None, then there must only be
                 // one input and thus only one order in orders
+                soft_assert_eq_or_log!(orders.len(), 1);
                 orders
                     .remove(0)
                     .into_iter()
-                    .map(|(_c, k, r)| (r, k))
+                    .map(|(c, key, r)| (r, key, Some(c)))
                     .collect::<Vec<_>>()
             };
 
-            let (start, start_keys) = &order[0];
-            let start = *start;
-            let start_keys = if available[start].contains(&start_keys) {
-                Some(start_keys.clone())
-            } else {
-                // if there is not already a pre-existing arrangement
-                // for the start input, do not implement one
-                order.remove(0);
-                None
-            };
+            let (start, mut start_key, start_characteristics) = order[0].clone();
+
+            // Count new arrangements for this choice of ordering.
+            let new_arrangements = inputs.len().saturating_sub(2) + new_input_arrangements[start];
 
             // Implement arrangements in each of the inputs.
-            let lifted_mfp = super::implement_arrangements(inputs, available, order.iter());
+            let (lifted_mfp, lifted_projections) =
+                super::implement_arrangements(inputs, available, order.iter());
 
-            if start_keys.is_some() {
-                // now that the starting arrangement has been implemented,
-                // remove it from `order` so `order` only contains information
-                // about the other inputs
-                order.remove(0);
+            // Permute `start_key` and `order` to compensate for projections being lifted as part of
+            // the mfp lifting in `implement_arrangements`.
+            if let Some(proj) = &lifted_projections[start] {
+                start_key.iter_mut().for_each(|k| {
+                    k.permute(proj);
+                });
             }
+            super::permute_order(&mut order, &lifted_projections);
+
+            // now that the starting arrangement has been implemented,
+            // remove it from `order` so `order` only contains information
+            // about the other inputs
+            order.remove(0);
 
             // Install the implementation.
-            *implementation = JoinImplementation::Differential((start, start_keys), order);
+            *implementation = JoinImplementation::Differential(
+                (start, Some(start_key), start_characteristics),
+                order,
+            );
 
-            super::install_lifted_mfp(&mut new_join, lifted_mfp);
+            super::install_lifted_mfp(&mut new_join, lifted_mfp)?;
 
             // Hooray done!
-            Some(new_join)
+            Ok((new_join, new_arrangements))
         } else {
-            panic!("differential::plan call on non-join expression.")
+            Err(TransformError::Internal(String::from(
+                "differential::plan call on non-join expression.",
+            )))
         }
     }
 }
@@ -374,18 +821,26 @@ mod differential {
 /// Modify `inputs` to ensure specified arrangements are available.
 ///
 /// Lift filter predicates when all needed arrangements are otherwise available.
+///
+/// Returns
+///  - The lifted mfps combined into one mfp.
+///  - Permutations for each input, which were lifted as part of the mfp lifting. These should be
+///    applied to the join order.
 fn implement_arrangements<'a>(
     inputs: &mut [MirRelationExpr],
     available_arrangements: &[Vec<Vec<MirScalarExpr>>],
-    needed_arrangements: impl Iterator<Item = &'a (usize, Vec<MirScalarExpr>)>,
-) -> MapFilterProject {
+    needed_arrangements: impl Iterator<
+        Item = &'a (usize, Vec<MirScalarExpr>, Option<JoinInputCharacteristics>),
+    >,
+) -> (MapFilterProject, Vec<Option<Vec<usize>>>) {
     // Collect needed arrangements by source index.
     let mut needed = vec![Vec::new(); inputs.len()];
-    for (index, key) in needed_arrangements {
+    for (index, key, _characteristics) in needed_arrangements {
         needed[*index].push(key.clone());
     }
 
     let mut lifted_mfps = vec![None; inputs.len()];
+    let mut lifted_projections = vec![None; inputs.len()];
 
     // Transform inputs[index] based on needed and available arrangements.
     // Specifically, lift intervening mfps if all arrangements exist.
@@ -406,22 +861,23 @@ fn implement_arrangements<'a>(
         while let MirRelationExpr::ArrangeBy { input: inner, .. } = &mut inputs[index] {
             inputs[index] = inner.take_dangerous();
         }
-        if !needed.is_empty() {
-            // If a mfp was lifted in order to install the arrangement, permute
-            // the arrangement.
-            if let Some(lifted_mfp) = &lifted_mfps[index] {
-                let (_, _, project) = lifted_mfp.as_map_filter_project();
-                for arr in needed.iter_mut() {
-                    for key in arr.iter_mut() {
-                        key.permute(&project);
-                    }
+        // If a mfp was lifted in order to install the arrangement, permute the arrangement and
+        // save the lifted projection.
+        if let Some(lifted_mfp) = &lifted_mfps[index] {
+            let (_, _, project) = lifted_mfp.as_map_filter_project();
+            for arrangement_key in needed.iter_mut() {
+                for k in arrangement_key.iter_mut() {
+                    k.permute(&project);
                 }
             }
+            lifted_projections[index] = Some(project);
+        }
+        if !needed.is_empty() {
             inputs[index] = MirRelationExpr::arrange_by(inputs[index].take_dangerous(), needed);
         }
     }
 
-    // Combined lifted mfps into one.
+    // Combine lifted mfps into one.
     let new_join_mapper = JoinInputMapper::new(inputs);
     let mut arity = new_join_mapper.total_columns();
     let combined_mfp = MapFilterProject::new(arity);
@@ -430,12 +886,13 @@ fn implement_arrangements<'a>(
     let mut combined_project = Vec::new();
     for (index, lifted_mfp) in lifted_mfps.into_iter().enumerate() {
         if let Some(mut lifted_mfp) = lifted_mfp {
-            lifted_mfp.permute(
+            let column_map = new_join_mapper
+                .local_columns(index)
+                .zip(new_join_mapper.global_columns(index))
+                .collect::<BTreeMap<_, _>>();
+            lifted_mfp.permute_fn(
                 // globalize all input column references
-                new_join_mapper
-                    .local_columns(index)
-                    .zip(new_join_mapper.global_columns(index))
-                    .collect(),
+                |c| column_map[&c],
                 // shift the position of scalars to be after the last input
                 // column
                 arity,
@@ -449,15 +906,22 @@ fn implement_arrangements<'a>(
             combined_project.extend(new_join_mapper.global_columns(index));
         }
     }
-    combined_mfp
-        .map(combined_map)
-        .filter(combined_filter)
-        .project(combined_project)
+
+    (
+        combined_mfp
+            .map(combined_map)
+            .filter(combined_filter)
+            .project(combined_project),
+        lifted_projections,
+    )
 }
 
-fn install_lifted_mfp(new_join: &mut MirRelationExpr, mfp: MapFilterProject) {
+fn install_lifted_mfp(
+    new_join: &mut MirRelationExpr,
+    mfp: MapFilterProject,
+) -> Result<(), TransformError> {
     if !mfp.is_identity() {
-        let (map, filter, project) = mfp.as_map_filter_project();
+        let (mut map, mut filter, project) = mfp.as_map_filter_project();
         if let MirRelationExpr::Join { equivalences, .. } = new_join {
             for equivalence in equivalences.iter_mut() {
                 for expr in equivalence.iter_mut() {
@@ -465,6 +929,7 @@ fn install_lifted_mfp(new_join: &mut MirRelationExpr, mfp: MapFilterProject) {
                     expr.permute(&project);
                     // if column references refer to mapped expressions that have been
                     // lifted, replace the column reference with the mapped expression.
+                    #[allow(deprecated)]
                     expr.visit_mut_pre_post(
                         &mut |e| {
                             if let MirScalarExpr::Column(c) = e {
@@ -475,54 +940,70 @@ fn install_lifted_mfp(new_join: &mut MirRelationExpr, mfp: MapFilterProject) {
                             None
                         },
                         &mut |_| {},
-                    );
+                    )?;
                 }
+            }
+            // Canonicalize scalar expressions in maps and filters with respect to the join
+            // equivalences. This often makes some filters identical, which are then removed.
+            // The identical filters come from either
+            //  - lifting several predicates that originally were pushed down by localizing to more
+            //    than one inputs;
+            //  - individual IS NOT NULL filters on each of the inputs, which become identical
+            //    when rewritten using the join equivalences.
+            //  (This allows for almost the same optimizations as when `Demand`
+            //  used to insert Projections that were marking some columns to be
+            //  identical, when Demand used to run after `JoinImplementation`.)
+            let canonicalizer_map = mz_expr::canonicalize::get_canonicalizer_map(equivalences);
+            for expr in map.iter_mut().chain(filter.iter_mut()) {
+                expr.visit_mut_post(&mut |e| {
+                    if let Some(canonical_expr) = canonicalizer_map.get(e) {
+                        *e = canonical_expr.clone();
+                    }
+                })?
             }
         }
         *new_join = new_join.clone().map(map).filter(filter).project(project);
     }
+    Ok(())
 }
 
+/// Permute the keys in `order` to compensate for projections being lifted from inputs.
+/// `lifted_projections` has an optional projection for each input.
+fn permute_order(
+    order: &mut Vec<(usize, Vec<MirScalarExpr>, Option<JoinInputCharacteristics>)>,
+    lifted_projections: &Vec<Option<Vec<usize>>>,
+) {
+    order.iter_mut().for_each(|(index, key, _)| {
+        key.iter_mut().for_each(|kc| {
+            if let Some(proj) = &lifted_projections[*index] {
+                kc.permute(proj);
+            }
+        })
+    })
+}
+
+// Computes the best join orders for each input.
+//
+// If there are N inputs, returns N orders, with the ith input starting the ith order.
 fn optimize_orders(
-    equivalences: &[Vec<MirScalarExpr>],
-    available: &[Vec<Vec<MirScalarExpr>>],
-    unique_keys: &[Vec<Vec<usize>>],
-    input_mapper: &JoinInputMapper,
-) -> Vec<Vec<(Characteristics, Vec<MirScalarExpr>, usize)>> {
-    let mut orderer = Orderer::new(equivalences, available, unique_keys, input_mapper);
+    equivalences: &[Vec<MirScalarExpr>], // join equivalences: inside a Vec, the exprs are equivalent
+    available: &[Vec<Vec<MirScalarExpr>>], // available arrangements per input
+    unique_keys: &[Vec<Vec<usize>>],     // unique keys per input
+    cardinalities: &[Option<usize>],     // cardinalities of input relations
+    filters: &[FilterCharacteristics],   // filter characteristics per input
+    input_mapper: &JoinInputMapper,      // join helper
+) -> Result<Vec<Vec<(JoinInputCharacteristics, Vec<MirScalarExpr>, usize)>>, TransformError> {
+    let mut orderer = Orderer::new(
+        equivalences,
+        available,
+        unique_keys,
+        cardinalities,
+        filters,
+        input_mapper,
+    );
     (0..available.len())
         .map(move |i| orderer.optimize_order_for(i))
-        .collect::<Vec<_>>()
-}
-
-/// Characteristics of a join order candidate collection.
-///
-/// A candidate is described by a collection and a key, and may have various liabilities.
-/// Primarily, the candidate may risk substantial inflation of records, which is something
-/// that concerns us greatly. Additionally the candidate may be unarranged, and we would
-/// prefer candidates that do not require additional memory. Finally, we prefer lower id
-/// collections in the interest of consistent tie-breaking.
-#[derive(Eq, PartialEq, Ord, PartialOrd, Debug, Clone)]
-pub struct Characteristics {
-    // An excellent indication that record count will not increase.
-    unique_key: bool,
-    // A weaker signal that record count will not increase.
-    key_length: usize,
-    // Indicates that there will be no additional in-memory footprint.
-    arranged: bool,
-    // We want to prefer input earlier in the input list, for stability of ordering.
-    input: std::cmp::Reverse<usize>,
-}
-
-impl Characteristics {
-    fn new(unique_key: bool, key_length: usize, arranged: bool, input: usize) -> Self {
-        Self {
-            unique_key,
-            key_length,
-            arranged,
-            input: std::cmp::Reverse(input),
-        }
-    }
+        .collect::<Result<Vec<_>, _>>()
 }
 
 struct Orderer<'a> {
@@ -530,16 +1011,19 @@ struct Orderer<'a> {
     equivalences: &'a [Vec<MirScalarExpr>],
     arrangements: &'a [Vec<Vec<MirScalarExpr>>],
     unique_keys: &'a [Vec<Vec<usize>>],
+    cardinalities: &'a [Option<usize>],
+    filters: &'a [FilterCharacteristics],
     input_mapper: &'a JoinInputMapper,
     reverse_equivalences: Vec<Vec<(usize, usize)>>,
     unique_arrangement: Vec<Vec<bool>>,
 
-    order: Vec<(Characteristics, Vec<MirScalarExpr>, usize)>,
+    order: Vec<(JoinInputCharacteristics, Vec<MirScalarExpr>, usize)>,
     placed: Vec<bool>,
     bound: Vec<Vec<MirScalarExpr>>,
     equivalences_active: Vec<bool>,
     arrangement_active: Vec<Vec<usize>>,
-    priority_queue: std::collections::BinaryHeap<(Characteristics, Vec<MirScalarExpr>, usize)>,
+    priority_queue:
+        std::collections::BinaryHeap<(JoinInputCharacteristics, Vec<MirScalarExpr>, usize)>,
 }
 
 impl<'a> Orderer<'a> {
@@ -547,6 +1031,8 @@ impl<'a> Orderer<'a> {
         equivalences: &'a [Vec<MirScalarExpr>],
         arrangements: &'a [Vec<Vec<MirScalarExpr>>],
         unique_keys: &'a [Vec<Vec<usize>>],
+        cardinalities: &'a [Option<usize>],
+        filters: &'a [FilterCharacteristics],
         input_mapper: &'a JoinInputMapper,
     ) -> Self {
         let inputs = arrangements.len();
@@ -581,6 +1067,8 @@ impl<'a> Orderer<'a> {
             equivalences,
             arrangements,
             unique_keys,
+            cardinalities,
+            filters,
             input_mapper,
             reverse_equivalences,
             unique_arrangement,
@@ -596,7 +1084,7 @@ impl<'a> Orderer<'a> {
     fn optimize_order_for(
         &mut self,
         start: usize,
-    ) -> Vec<(Characteristics, Vec<MirScalarExpr>, usize)> {
+    ) -> Result<Vec<(JoinInputCharacteristics, Vec<MirScalarExpr>, usize)>, TransformError> {
         self.order.clear();
         self.priority_queue.clear();
         for input in 0..self.inputs {
@@ -610,6 +1098,8 @@ impl<'a> Orderer<'a> {
 
         // Introduce cross joins as a possibility.
         for input in 0..self.inputs {
+            let cardinality = self.cardinalities[input];
+
             let is_unique = self.unique_keys[input].iter().any(|cols| cols.is_empty());
             if let Some(pos) = self.arrangements[input]
                 .iter()
@@ -617,19 +1107,34 @@ impl<'a> Orderer<'a> {
             {
                 self.arrangement_active[input].push(pos);
                 self.priority_queue.push((
-                    Characteristics::new(is_unique, 0, true, input),
+                    JoinInputCharacteristics::new(
+                        is_unique,
+                        0,
+                        true,
+                        cardinality,
+                        self.filters[input].clone(),
+                        input,
+                    ),
                     vec![],
                     input,
                 ));
             } else {
                 self.priority_queue.push((
-                    Characteristics::new(is_unique, 0, false, input),
+                    JoinInputCharacteristics::new(
+                        is_unique,
+                        0,
+                        false,
+                        cardinality,
+                        self.filters[input].clone(),
+                        input,
+                    ),
                     vec![],
                     input,
                 ));
             }
         }
 
+        // Main loop, ordering all the inputs.
         if self.inputs > 1 {
             self.order_input(start);
             while self.order.len() < self.inputs - 1 {
@@ -646,14 +1151,26 @@ impl<'a> Orderer<'a> {
             }
         }
 
-        // calculate characteristics of an arrangement, if any on the starting input
-        // by default, there is no arrangement on the starting input
-        let mut start_tuple = (Characteristics::new(false, 0, false, start), vec![], start);
-        // use an arrangement if there exists one that lines up with the keys of
-        // the second input
+        // `order` now contains all the inputs except the first. Let's create an item for the first
+        // input. We know which input that is, but we need to compute a key and characteristics.
+        // We start with some default values:
+        let mut start_tuple = (
+            JoinInputCharacteristics::new(
+                false,
+                0,
+                false,
+                self.cardinalities[start],
+                self.filters[start].clone(),
+                start,
+            ),
+            vec![],
+            start,
+        );
+        // The key should line up with the key of the second input (if there is a second input).
+        // (At this point, `order[0]` is what will eventually be `order[1]`, i.e., the second input.)
         if let Some((_, key, second)) = self.order.get(0) {
-            // for each key of the second input, try to find the corresponding key in
-            // the starting input
+            // for each component of the key of the second input, try to find the corresponding key
+            // component in the starting input
             let candidate_start_key = key
                 .iter()
                 .filter_map(|k| {
@@ -664,22 +1181,48 @@ impl<'a> Orderer<'a> {
                 })
                 .collect::<Vec<_>>();
             if candidate_start_key.len() == key.len() {
-                if let Some(pos) = self.arrangements[start]
+                let cardinality = self.cardinalities[start];
+                let is_unique = self.unique_keys[start].iter().any(|cols| {
+                    cols.iter()
+                        .all(|c| candidate_start_key.contains(&MirScalarExpr::Column(*c)))
+                });
+                let arranged = self.arrangements[start]
                     .iter()
-                    .position(|k| k == &candidate_start_key)
-                {
-                    let is_unique = self.unique_arrangement[start][pos];
-                    start_tuple = (
-                        Characteristics::new(is_unique, candidate_start_key.len(), true, start),
-                        candidate_start_key,
+                    .find(|arrangement_key| arrangement_key == &&candidate_start_key)
+                    .is_some();
+                start_tuple = (
+                    JoinInputCharacteristics::new(
+                        is_unique,
+                        candidate_start_key.len(),
+                        arranged,
+                        cardinality,
+                        self.filters[start].clone(),
                         start,
-                    );
-                }
+                    ),
+                    candidate_start_key,
+                    start,
+                );
+            } else {
+                // For the second input's key fields, there is nothing else to equate it with but
+                // the fields of the first input, so we should find a match for each of the fields.
+                // (For a later input, different fields of a key might be equated with fields coming
+                // from various inputs.)
+                // Technically, this happens as follows:
+                // The second input must have been placed in the `priority_queue` either
+                // 1) as a cross join possibility, or
+                // 2) when we called `order_input` on the starting input.
+                // In the 1) case, `key.len()` is 0. In the 2) case, it was the very first call to
+                // `order_input`, which means that `placed` was true only for the
+                // starting input, which means that `fully_supported` was true due to
+                // one of the expressions referring only to the starting input.
+                let msg = "Unreachable state in join order optimization".to_string();
+                return Err(TransformError::Internal(msg));
+                // (This couldn't be a soft_panic: we would form an arrangement with a wrong key.)
             }
         }
         self.order.insert(0, start_tuple);
 
-        std::mem::replace(&mut self.order, Vec::new())
+        Ok(std::mem::replace(&mut self.order, Vec::new()))
     }
 
     /// Introduces a specific input and keys to the order, along with its characteristics.
@@ -702,7 +1245,7 @@ impl<'a> Orderer<'a> {
                     self.equivalences_active[*equivalence] = true;
                     for expr in self.equivalences[*equivalence].iter() {
                         // find the relations that columns in the expression belong to
-                        let mut rels = self.input_mapper.lookup_inputs(&expr);
+                        let mut rels = self.input_mapper.lookup_inputs(expr);
                         // Skip the expression if
                         // * the expression is a literal -> this would translate
                         //   to `rels` being empty
@@ -720,7 +1263,7 @@ impl<'a> Orderer<'a> {
                                 self.bound[rel].sort();
 
                                 // Reconsider all available arrangements.
-                                for (pos, keys) in self.arrangements[rel].iter().enumerate() {
+                                for (pos, key) in self.arrangements[rel].iter().enumerate() {
                                     if !self.arrangement_active[rel].contains(&pos) {
                                         // TODO: support the restoration of the
                                         // following original lines, which have been
@@ -728,38 +1271,44 @@ impl<'a> Orderer<'a> {
                                         // panic otherwise. The original line and comments
                                         // here are:
                                         // Determine if the arrangement is viable, which happens when the
-                                        // support of its keys are all bound.
-                                        // if keys.iter().all(|k| k.support().iter().all(|c| self.bound[*rel].contains(&ScalarExpr::Column(*c))) {
+                                        // support of its key is all bound.
+                                        // if key.iter().all(|k| k.support().iter().all(|c| self.bound[*rel].contains(&ScalarExpr::Column(*c))) {
 
                                         // Determine if the arrangement is viable,
-                                        // which happens when all its keys are bound.
-                                        if keys.iter().all(|k| self.bound[rel].contains(k)) {
+                                        // which happens when all its key components are bound.
+                                        if key.iter().all(|k| self.bound[rel].contains(k)) {
                                             self.arrangement_active[rel].push(pos);
                                             // TODO: This could be pre-computed, as it is independent of the order.
                                             let is_unique = self.unique_arrangement[rel][pos];
                                             self.priority_queue.push((
-                                                Characteristics::new(
+                                                JoinInputCharacteristics::new(
                                                     is_unique,
-                                                    keys.len(),
+                                                    key.len(),
                                                     true,
+                                                    self.cardinalities[rel],
+                                                    self.filters[rel].clone(),
                                                     rel,
                                                 ),
-                                                keys.clone(),
+                                                key.clone(),
                                                 rel,
                                             ));
                                         }
                                     }
                                 }
+
+                                // does the relation we're joining on have a unique key wrt what's already bound?
                                 let is_unique = self.unique_keys[rel].iter().any(|cols| {
                                     cols.iter().all(|c| {
                                         self.bound[rel].contains(&MirScalarExpr::Column(*c))
                                     })
                                 });
                                 self.priority_queue.push((
-                                    Characteristics::new(
+                                    JoinInputCharacteristics::new(
                                         is_unique,
                                         self.bound[rel].len(),
                                         false,
+                                        self.cardinalities[rel],
+                                        self.filters[rel].clone(),
                                         rel,
                                     ),
                                     self.bound[rel].clone(),

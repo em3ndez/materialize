@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # Test that recursive Protobuf types are unsupported.
 
 $ file-append path=recursive.proto
@@ -28,12 +30,21 @@ message Mutual3 {
     Mutual1 m = 1;
 }
 
-$ protobuf-compile-descriptors inputs=recursive.proto output=recursive.pb
+$ protobuf-compile-descriptors inputs=recursive.proto output=recursive.pb set-var=recursive-schema
 
-! CREATE SOURCE recursive FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'recursive'
-  FORMAT PROTOBUF MESSAGE '.Self' USING SCHEMA FILE '${testdrive.temp-dir}/recursive.pb'
-Recursive types are not supported: Self
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
-! CREATE SOURCE recursive FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'recursive'
-  FORMAT PROTOBUF MESSAGE '.Mutual1' USING SCHEMA FILE '${testdrive.temp-dir}/recursive.pb'
-Recursive types are not supported: Mutual1
+$ kafka-create-topic topic=recursive partitions=1
+
+> CREATE SOURCE recursive
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-recursive-${testdrive.seed}')
+
+! CREATE TABLE recursive_tbl FROM SOURCE recursive (REFERENCE "testdrive-recursive-${testdrive.seed}")
+  FORMAT PROTOBUF MESSAGE '.Self' USING SCHEMA '${recursive-schema}'
+contains:Recursive types are not supported: Self
+
+! CREATE TABLE recursive_tbl FROM SOURCE recursive (REFERENCE "testdrive-recursive-${testdrive.seed}")
+  FORMAT PROTOBUF MESSAGE '.Mutual1' USING SCHEMA '${recursive-schema}'
+contains:Recursive types are not supported: Mutual1

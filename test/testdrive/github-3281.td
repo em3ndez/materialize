@@ -7,12 +7,12 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-# Regression test for https://github.com/MaterializeInc/materialize/issues/3281.
+# Regression test for https://github.com/MaterializeInc/database-issues/issues/1056.
 #
 # Verifies that the precedence of `->>`, `::`, and `CAST` are not mishandled
 # when rendering a SQL statement.
 
-# With the `--validate-catalog` option, which is enabled in CI, Testdrive
+# With the `--validate-data-dir` option, which is enabled in CI, Testdrive
 # will verify that views can be persisted and reloaded from the catalog, so the
 # very presence of this once-buggy view is a sufficient test.
 

@@ -1,0 +1,483 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+# Regular query works.
+http
+{"query":"select 1+2 as col"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["3"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Multiple queries are ok.
+http
+{"query":"select 1; select 2"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"tag":"SELECT 1","rows":[["2"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Arrays + lists work
+http
+{"query":"select array[1], list[2]"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[[["1"],["2"]]],"desc":{"columns":[{"name":"array","type_oid":1007,"type_len":-1,"type_mod":-1},{"name":"list","type_oid":16384,"type_len":-1,"type_mod":-1}]},"notices":[]}]}
+
+# Succeeding and failing queries can mix and match.
+http
+{"query":"select 1; select * from noexist;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"error":{"message":"unknown catalog item 'noexist'","code":"XX000"},"notices":[]}]}
+
+# CREATEs should work when provided alone.
+http
+{"query":"create view v as select 1"}
+----
+200 OK
+{"results":[{"ok":"CREATE VIEW","notices":[]}]}
+
+# Partial errors make it to the client.
+http
+{"query":"create view if not exists v as select 1"}
+----
+200 OK
+{"results":[{"ok":"CREATE VIEW","notices":[{"message":"view \"v\" already exists, skipping","code":"42710","severity":"notice"}]}]}
+
+# Multiple CREATEs do not work.
+http
+{"query":"create view v1 as select 1; create view v2 as select 1"}
+----
+200 OK
+{"results":[{"error":{"message":"CREATE VIEW v1 AS SELECT 1 cannot be run inside a transaction block","code":"25001"},"notices":[]}]}
+
+# Syntax errors fail the request.
+http
+{"query":"'"}
+----
+200 OK
+{"results":[{"error":{"message":"unterminated quoted string","code":"42601","position":0},"notices":[]}]}
+
+http
+{"query": "SELECTttt * from t"}
+----
+200 OK
+{"results":[{"error":{"message":"Expected a keyword at the beginning of a statement, found identifier \"selectttt\"","code":"42601","position":0},"notices":[]}]}
+
+http
+{"queries": [{"query": "select 1"}, {"query": "selectttt 2"}, {"query": "select 3"}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"error":{"message":"Expected a keyword at the beginning of a statement, found identifier \"selectttt\"","code":"42601","position":0},"notices":[]}]}
+
+# Tables
+http
+{"query":"create table t (a int);"}
+----
+200 OK
+{"results":[{"ok":"CREATE TABLE","notices":[]}]}
+
+http
+{"query":"insert into t values (1)"}
+----
+200 OK
+{"results":[{"ok":"INSERT 0 1","notices":[]}]}
+
+http
+{"query":"select * from t;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"query":"delete from t"}
+----
+200 OK
+{"results":[{"ok":"DELETE 1","notices":[]}]}
+
+http
+{"query":"delete from t"}
+----
+200 OK
+{"results":[{"ok":"DELETE 0","notices":[]}]}
+
+# Txns, read only
+http
+{"query":"begin; select 1; commit"}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"ok":"COMMIT","notices":[]}]}
+
+http
+{"query":"begin; select 1; commit; select 2;"}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"ok":"COMMIT","notices":[]},{"tag":"SELECT 1","rows":[["2"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"query":"select 1; begin; select 2; commit;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"ok":"BEGIN","notices":[]},{"tag":"SELECT 1","rows":[["2"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"ok":"COMMIT","notices":[]}]}
+
+http
+{"query":"begin; select 1/0; commit; select 2;"}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+http
+{"query":"begin; select 1; commit; select 1/0;"}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"ok":"COMMIT","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+http
+{"query":"select 1/0; begin; select 2; commit;"}
+----
+200 OK
+{"results":[{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+http
+{"query":"select 1; begin; select 1/0; commit;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"ok":"BEGIN","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+# Txns w/ writes
+
+# Implicit txn aborted on first error
+http
+{"query":"insert into t values (1); select 1/0; insert into t values (2)"}
+----
+200 OK
+{"results":[{"ok":"INSERT 0 1","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+ # Values not successfully written due to aborted txn
+http
+{"query":"select * from t;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 0","rows":[],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Explicit txn invocation commits values w/in txn, irrespective of results outside txn
+http
+{"query":"begin; insert into t values (1); commit; insert into t values (2); select 1/0;"}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"ok":"COMMIT","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+http
+{"query":"select * from t;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"query":"delete from t;"}
+----
+200 OK
+{"results":[{"ok":"DELETE 1","notices":[]}]}
+
+http
+{"query":"delete from t;"}
+----
+200 OK
+{"results":[{"ok":"DELETE 0","notices":[]}]}
+
+http
+{"query":"insert into t values (1); begin; insert into t values (2); insert into t values (3); commit;"}
+----
+200 OK
+{"results":[{"ok":"INSERT 0 1","notices":[]},{"ok":"BEGIN","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"ok":"COMMIT","notices":[]}]}
+
+http
+{"query":"select * from t;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 3","rows":[["1"],["2"],["3"]],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"query":"delete from t;"}
+----
+200 OK
+{"results":[{"ok":"DELETE 3","notices":[]}]}
+
+# Explicit txn must be terminated to commit
+http
+{"query":"begin; insert into t values (1)"}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"ok":"INSERT 0 1","notices":[]}]}
+
+http
+{"query":"select * from t;"}
+----
+200 OK
+{"results":[{"tag":"SELECT 0","rows":[],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Empty query OK.
+http
+{"query":""}
+----
+200 OK
+{"results":[]}
+
+# Does not support parameters
+http
+{"query":"select $1"}
+----
+200 OK
+{"results":[{"error":{"message":"request supplied 0 parameters, but SELECT $1 requires 1","code":"XX000"},"notices":[]}]}
+
+http
+{"query":"subscribe (select * from t)"}
+----
+200 OK
+{"results":[{"error":{"message":"unsupported via this API: SUBSCRIBE (SELECT * FROM t)","code":"XX000"},"notices":[]}]}
+
+http
+{"query":"copy (select 1) to stdout"}
+----
+200 OK
+{"results":[{"error":{"message":"unsupported via this API: COPY (SELECT 1) TO STDOUT","code":"XX000"},"notices":[]}]}
+
+http
+{"query":"EXPLAIN SELECT 1"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["Explained Query (fast path):\n  Constant\n    - (1)\n\nTarget cluster: mz_catalog_server\n"]],"desc":{"columns":[{"name":"Optimized Plan","type_oid":25,"type_len":-1,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"query":"SHOW VIEWS"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["v",""]],"desc":{"columns":[{"name":"name","type_oid":25,"type_len":-1,"type_mod":-1},{"name":"comment","type_oid":25,"type_len":-1,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"query":"SET cluster = quickstart"}
+----
+200 OK
+{"results":[{"ok":"SET","notices":[],"parameters":[{"name":"cluster","value":"quickstart"}]}]}
+
+# Parameterized queries work
+http
+{"queries":[{"query":"select $1+$2::int as col","params":["1","2"]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["3"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+ # Parameters can be present and empty
+http
+{"queries":[{"query":"select 3 as col","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["3"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Multiple statements
+http
+{"queries":[{"query":"select 1 as col","params":[]},{"query":"select $1+$2::int as col","params":["1","2"]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"tag":"SELECT 1","rows":[["3"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"queries":[{"query":"select $1+$2::int as col","params":["1","2"]},{"query":"select 1 as col","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["3"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"queries":[{"query":"select $1+$2::int as col","params":["1","2"]},{"query":"select $1*$2::int as col","params":["2","3"]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["3"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]},{"tag":"SELECT 1","rows":[["6"]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Quotes escaped
+http
+{"queries":[{"query":"select length($1), length($2)","params":["abc","'abc'"]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["3","5"]],"desc":{"columns":[{"name":"length","type_oid":23,"type_len":4,"type_mod":-1},{"name":"length","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# All parameters values treated as strings
+http
+{"queries":[{"query":"select length($1), length($2)","params":["sum(a)","SELECT * FROM t;"]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["6","16"]],"desc":{"columns":[{"name":"length","type_oid":23,"type_len":4,"type_mod":-1},{"name":"length","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Too many parameters
+http
+{"queries":[{"query":"select $1 as col","params":["1","2"]}]}
+----
+200 OK
+{"results":[{"error":{"message":"request supplied 2 parameters, but SELECT $1 AS col requires 1","code":"XX000"},"notices":[]}]}
+
+# Too few parameters
+http
+{"queries":[{"query":"select $1+$2::int as col","params":["1"]}]}
+----
+200 OK
+{"results":[{"error":{"message":"request supplied 1 parameters, but SELECT $1 + ($2)::int4 AS col requires 2","code":"XX000"},"notices":[]}]}
+
+# NaN
+http
+{"queries":[{"query":"select $1::decimal+2 as col","params":["nan"]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["NaN"]],"desc":{"columns":[{"name":"col","type_oid":1700,"type_len":-1,"type_mod":2555947}]},"notices":[]}]}
+
+# Null string value parameters
+http
+{"queries":[{"query":"select $1+$2::int as col","params":["1",null]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[[null]],"desc":{"columns":[{"name":"col","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Empty query
+http
+{"queries":[{"query":"","params":[]}]}
+----
+400 Bad Request
+each query must contain exactly 1 statement, but "" contains 0
+
+# Empty query w/ param
+http
+{"queries":[{"query":"","params":["1"]}]}
+----
+400 Bad Request
+each query must contain exactly 1 statement, but "" contains 0
+
+http
+{"queries":[{"query":"select 1 as col","params":[]},{"query":"","params":[null]}]}
+----
+400 Bad Request
+each query must contain exactly 1 statement, but "" contains 0
+
+# Multiple statements
+http
+{"queries":[{"query":"select 1 as col","params":[]},{"query":"select 1; select 2;","params":[null]}]}
+----
+400 Bad Request
+each query must contain exactly 1 statement, but "select 1; select 2;" contains 2
+
+# Verify t is empty before executing some inserts.
+http
+{"queries":[{"query":"select count(*) from t","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["0"]],"desc":{"columns":[{"name":"count","type_oid":20,"type_len":8,"type_mod":-1}]},"notices":[]}]}
+
+# Rolledback
+http
+{"queries":[{"query":"begin;","params":[]},{"query":"insert into t values (1);","params":[]},{"query":"rollback","params":[]}]}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"ok":"ROLLBACK","notices":[]}]}
+
+# Rollback prevents insertion.
+http
+{"queries":[{"query":"select count(*) from t","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["0"]],"desc":{"columns":[{"name":"count","type_oid":20,"type_len":8,"type_mod":-1}]},"notices":[]}]}
+
+# Implicit txn
+http
+{"queries":[{"query":"insert into t values (1);","params":[]},{"query":"select 1/0;","params":[]}]}
+----
+200 OK
+{"results":[{"ok":"INSERT 0 1","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+# Implicit transactions are each committed, so the INSERT committed before the SELECT error.
+http
+{"queries":[{"query":"select count(*) from t","params":[]},{"query":"delete from t","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1"]],"desc":{"columns":[{"name":"count","type_oid":20,"type_len":8,"type_mod":-1}]},"notices":[]},{"ok":"DELETE 1","notices":[]}]}
+
+# Errors prevent commit + further execution
+http
+{"queries":[{"query":"begin;","params":[]},{"query":"insert into t values (1);","params":[]},{"query":"select 1/0;","params":[]},{"query":"select * from t","params":[]},{"query":"commit","params":[]}]}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+# Because of the explicit transaction, the INSERT did not commit.
+http
+{"queries":[{"query":"select count(*) from t","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["0"]],"desc":{"columns":[{"name":"count","type_oid":20,"type_len":8,"type_mod":-1}]},"notices":[]}]}
+
+# Requires explicit commit in explicit txn
+http
+{"queries":[{"query":"begin;","params":[]},{"query":"insert into t values (1);","params":[]}]}
+----
+200 OK
+{"results":[{"ok":"BEGIN","notices":[]},{"ok":"INSERT 0 1","notices":[]}]}
+
+http
+{"queries":[{"query":"select * from t","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 0","rows":[],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# Writes
+http
+{"queries":[{"query":"insert into t values ($1);","params":["1"]},{"query":"begin;","params":[]},{"query":"insert into t values ($1);","params":["2"]},{"query":"insert into t values ($1);","params":["3"]},{"query":"commit;","params":[]},{"query":"select 1/0","params":[]}]}
+----
+200 OK
+{"results":[{"ok":"INSERT 0 1","notices":[]},{"ok":"BEGIN","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"ok":"INSERT 0 1","notices":[]},{"ok":"COMMIT","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+http
+{"queries":[{"query":"select * from t","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 3","rows":[["1"],["2"],["3"]],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+# The first statement (insert) succeeds and commits because it's an implicit transaction.
+http
+{"queries":[{"query":"insert into t values ($1);","params":["4"]},{"query":"begin;","params":[]},{"query":"select 1/0;","params":[]},{"query":"commit;","params":[]}]}
+----
+200 OK
+{"results":[{"ok":"INSERT 0 1","notices":[]},{"ok":"BEGIN","notices":[]},{"error":{"message":"division by zero","code":"XX000"},"notices":[]}]}
+
+# We expect to see the INSERT (4) above.
+http
+{"queries":[{"query":"select * from t","params":[]}]}
+----
+200 OK
+{"results":[{"tag":"SELECT 4","rows":[["1"],["2"],["3"],["4"]],"desc":{"columns":[{"name":"a","type_oid":23,"type_len":4,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"queries":[{"query":"subscribe (select * from t)","params":[]}]}
+----
+200 OK
+{"results":[{"error":{"message":"unsupported via this API: SUBSCRIBE (SELECT * FROM t)","code":"XX000"},"notices":[]}]}
+
+# Test detail and hint error fields.
+http
+{"query":"CREATE MATERIALIZED VIEW _now AS SELECT now()"}
+----
+200 OK
+{"results":[{"error":{"message":"cannot materialize call to current_timestamp","code":"0A000","detail":"See: https://materialize.com/docs/sql/functions/now_and_mz_now/","hint":"In temporal filters `mz_now()` may work instead."},"notices":[]}]}
+
+# Test timestamp precision.
+http
+{"query":"select TIMESTAMP '2023-12-19T06:50:37.123056' as col"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1702968637123.056"]],"desc":{"columns":[{"name":"col","type_oid":1114,"type_len":8,"type_mod":-1}]},"notices":[]}]}
+
+http
+{"query":"select TIMESTAMPTZ '2023-12-19T06:50:37.123056' as col"}
+----
+200 OK
+{"results":[{"tag":"SELECT 1","rows":[["1702968637123.056"]],"desc":{"columns":[{"name":"col","type_oid":1184,"type_len":8,"type_mod":-1}]},"notices":[]}]}

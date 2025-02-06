@@ -1,5 +1,5 @@
 ---
-title: "date Data Type"
+title: "date type"
 description: "Expresses a date without a specified time"
 menu:
   main:
@@ -14,8 +14,8 @@ Detail | Info
 **Size** | 1 byte
 **Catalog name** | `pg_catalog.date`
 **OID** | 1082
-**Min value** | 4713 BC
-**Max value** | 5874897 AD
+**Min value** | 4714-11-24 BC
+**Max value** | 262143-12-31 AD
 **Resolution** | 1 day
 
 ## Syntax
@@ -44,7 +44,7 @@ You can [cast](../../functions/cast) `date` to:
 
 You can [cast](../../functions/cast) from the following types to `date`:
 
-- [`text`](../text) (explicity)
+- [`text`](../text) (explicitly)
 - [`timestamp`](../timestamp) (by assignment)
 - [`timestamptz`](../timestamp) (by assignment)
 
@@ -61,7 +61,7 @@ Operation | Computes
 
 ## Examples
 
-```sql
+```mzsql
 SELECT DATE '2007-02-01' AS date_v;
 ```
 ```nofmt

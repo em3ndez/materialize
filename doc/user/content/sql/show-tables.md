@@ -1,22 +1,22 @@
 ---
 title: "SHOW TABLES"
-description: "`SHOW TABLES` returns a list of all tables available to your Materialize instances."
+description: "`SHOW TABLES` returns a list of all tables available in Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`SHOW TABLES` returns a list of all tables available to your Materialize instances.
+`SHOW TABLES` returns a list of all tables available in Materialize.
 
 ## Syntax
 
-{{< diagram "show-tables.svg" >}}
+```mzsql
+SHOW TABLES [FROM <schema_name>]
+```
 
-Field | Use
-------|-----
-_schema&lowbar;name_ | The schema to show tables from. Defaults to `public` in the current database. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
-**EXTENDED** | Returns system tables as well as user-created tables. By default, only user-created tables are returned.
-**FULL**  | Returns a column that lists table type (`system`, `user`, or `temp`).
+Option                 | Description
+-----------------------|------------
+**FROM** <schema_name> | If specified, only show tables from the specified schema. Defaults to first resolvable schema in the search path. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
 
 ## Details
 
@@ -24,53 +24,36 @@ _schema&lowbar;name_ | The schema to show tables from. Defaults to `public` in t
 
 `SHOW TABLES`'s output is a table with one column, `name`.
 
-{{< version-changed v0.5.0 >}}
-The output column is renamed from `TABLES` to `name`.
-{{< /version-changed >}}
-
 ## Examples
 
 ### Show user-created tables
-```sql
+```mzsql
 SHOW TABLES;
 ```
 ```nofmt
-my_table
-my_other_table
+ name
+----------------
+ my_table
+ my_other_table
 ```
 
 ### Show tables from specified schema
-```sql
+```mzsql
 SHOW SCHEMAS;
 ```
 ```nofmt
-public
+  name
+--------
+ public
 ```
-```sql
+```mzsql
 SHOW TABLES FROM public;
 ```
 ```nofmt
-my_table
-my_other_table
-```
-
-### Show all tables and include table type
-
-`EXTENDED` lists system tables as well as user-created tables; `FULL` adds the `type` column that specifies whether the table was created by a user or a temp process or is a system table.
-
-```sql
-SHOW EXTENDED FULL TABLES;
-```
-```nofmt
-name                  |  type
-----------------------+--------
- mz_array_types       | system
- mz_avro_ocf_sinks    | system
- mz_base_types        | system
- ...
- my_table             | user
- my_other_table       | user
-(23 rows)
+ name
+----------------
+ my_table
+ my_other_table
 ```
 
 ## Related pages

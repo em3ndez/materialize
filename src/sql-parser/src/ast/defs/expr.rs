@@ -18,18 +18,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
-use std::mem;
+use std::{fmt, mem};
+
+use mz_ore::soft_assert_eq_or_log;
+use mz_sql_lexer::keywords::*;
 
 use crate::ast::display::{self, AstDisplay, AstFormatter};
-use crate::ast::{AstInfo, DataType, Ident, OrderByExpr, Query, UnresolvedObjectName, Value};
+use crate::ast::{AstInfo, Ident, OrderByExpr, Query, UnresolvedItemName, Value};
 
 /// An SQL expression of any type.
 ///
 /// The parser does not distinguish between expressions of different types
 /// (e.g. boolean vs string), so the caller must handle expressions of
 /// inappropriate type, like `WHERE 1` or `SELECT 1=1`, as necessary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Expr<T: AstInfo> {
     /// Identifier e.g. table name or column name
     Identifier(Vec<Ident>),
@@ -66,7 +68,7 @@ pub enum Expr<T: AstInfo> {
     /// `IS {NULL, TRUE, FALSE, UNKNOWN}` expression
     IsExpr {
         expr: Box<Expr<T>>,
-        construct: IsExprConstruct,
+        construct: IsExprConstruct<T>,
         negated: bool,
     },
     /// `[ NOT ] IN (val1, val2, ...)`
@@ -79,6 +81,14 @@ pub enum Expr<T: AstInfo> {
     InSubquery {
         expr: Box<Expr<T>>,
         subquery: Box<Query<T>>,
+        negated: bool,
+    },
+    /// `<expr> [ NOT ] {LIKE, ILIKE} <pattern> [ ESCAPE <escape> ]`
+    Like {
+        expr: Box<Expr<T>>,
+        pattern: Box<Expr<T>>,
+        escape: Option<Box<Expr<T>>>,
+        case_insensitive: bool,
         negated: bool,
     },
     /// `<expr> [ NOT ] BETWEEN <low> AND <high>`
@@ -97,18 +107,20 @@ pub enum Expr<T: AstInfo> {
     /// CAST an expression to a different data type e.g. `CAST(foo AS VARCHAR(123))`
     Cast {
         expr: Box<Expr<T>>,
-        data_type: DataType<T>,
+        data_type: T::DataType,
     },
     /// `expr COLLATE collation`
     Collate {
         expr: Box<Expr<T>>,
-        collation: UnresolvedObjectName,
+        collation: UnresolvedItemName,
     },
-    /// COALESCE(<expr>, ...)
+    /// `COALESCE(<expr>, ...)` or `GREATEST(<expr>, ...)` or `LEAST(<expr>`, ...)
     ///
-    /// While COALESCE has the same syntax as a function call, its semantics are
-    /// extremely unusual, and are better captured with a dedicated AST node.
-    Coalesce {
+    /// While COALESCE/GREATEST/LEAST have the same syntax as a function call,
+    /// their semantics are extremely unusual, and are better captured with a
+    /// dedicated AST node.
+    HomogenizingFunction {
+        function: HomogenizingFunction,
         exprs: Vec<Expr<T>>,
     },
     /// NULLIF(expr, expr)
@@ -172,16 +184,15 @@ pub enum Expr<T: AstInfo> {
     },
     /// `ARRAY[<expr>*]`
     Array(Vec<Expr<T>>),
+    ArraySubquery(Box<Query<T>>),
     /// `LIST[<expr>*]`
     List(Vec<Expr<T>>),
     ListSubquery(Box<Query<T>>),
-    /// `<expr>[<expr>]`
-    SubscriptIndex {
-        expr: Box<Expr<T>>,
-        subscript: Box<Expr<T>>,
-    },
-    /// `<expr>[<expr>:<expr>(, <expr>?:<expr>?)*]`
-    SubscriptSlice {
+    /// `MAP[<expr>*]`
+    Map(Vec<MapEntry<T>>),
+    MapSubquery(Box<Query<T>>),
+    /// `<expr>([<expr>(:<expr>)?])+`
+    Subscript {
         expr: Box<Expr<T>>,
         positions: Vec<SubscriptPosition<T>>,
     },
@@ -259,6 +270,28 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_node(&subquery);
                 f.write_str(")");
             }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                case_insensitive,
+                negated,
+            } => {
+                f.write_node(&expr);
+                f.write_str(" ");
+                if *negated {
+                    f.write_str("NOT ");
+                }
+                if *case_insensitive {
+                    f.write_str("I");
+                }
+                f.write_str("LIKE ");
+                f.write_node(&pattern);
+                if let Some(escape) = escape {
+                    f.write_str(" ESCAPE ");
+                    f.write_node(escape);
+                }
+            }
             Expr::Between {
                 expr,
                 negated,
@@ -306,7 +339,7 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                         | Expr::Function { .. }
                         | Expr::Identifier { .. }
                         | Expr::Collate { .. }
-                        | Expr::Coalesce { .. }
+                        | Expr::HomogenizingFunction { .. }
                         | Expr::NullIf { .. }
                 );
                 if needs_wrap {
@@ -324,13 +357,14 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_str(" COLLATE ");
                 f.write_node(&collation);
             }
-            Expr::Coalesce { exprs } => {
-                f.write_str("COALESCE(");
-                f.write_node(&display::comma_separated(&exprs));
+            Expr::HomogenizingFunction { function, exprs } => {
+                f.write_node(function);
+                f.write_str("(");
+                f.write_node(&display::comma_separated(exprs));
                 f.write_str(")");
             }
             Expr::NullIf { l_expr, r_expr } => {
-                f.write_str("COALESCE(");
+                f.write_str("NULLIF(");
                 f.write_node(&display::comma_separated(&[l_expr, r_expr]));
                 f.write_str(")");
             }
@@ -341,7 +375,7 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
             }
             Expr::Row { exprs } => {
                 f.write_str("ROW(");
-                f.write_node(&display::comma_separated(&exprs));
+                f.write_node(&display::comma_separated(exprs));
                 f.write_str(")");
             }
             Expr::Value(v) => {
@@ -388,7 +422,7 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_node(&left);
                 f.write_str(" ");
                 f.write_str(op);
-                f.write_str("ANY (");
+                f.write_str(" ANY (");
                 f.write_node(&right);
                 f.write_str(")");
             }
@@ -396,7 +430,7 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_node(&left);
                 f.write_str(" ");
                 f.write_str(op);
-                f.write_str("ANY (");
+                f.write_str(" ANY (");
                 f.write_node(&right);
                 f.write_str(")");
             }
@@ -417,25 +451,18 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_str(")");
             }
             Expr::Array(exprs) => {
-                let mut exprs = exprs.iter().peekable();
                 f.write_str("ARRAY[");
-                while let Some(expr) = exprs.next() {
-                    f.write_node(expr);
-                    if exprs.peek().is_some() {
-                        f.write_str(", ");
-                    }
-                }
+                f.write_node(&display::comma_separated(exprs));
                 f.write_str("]");
             }
+            Expr::ArraySubquery(s) => {
+                f.write_str("ARRAY(");
+                f.write_node(&s);
+                f.write_str(")");
+            }
             Expr::List(exprs) => {
-                let mut exprs = exprs.iter().peekable();
                 f.write_str("LIST[");
-                while let Some(expr) = exprs.next() {
-                    f.write_node(expr);
-                    if exprs.peek().is_some() {
-                        f.write_str(", ");
-                    }
-                }
+                f.write_node(&display::comma_separated(exprs));
                 f.write_str("]");
             }
             Expr::ListSubquery(s) => {
@@ -443,16 +470,31 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_node(&s);
                 f.write_str(")");
             }
-            Expr::SubscriptIndex { expr, subscript } => {
-                f.write_node(&expr);
-                f.write_str("[");
-                f.write_node(subscript);
+            Expr::Map(exprs) => {
+                f.write_str("MAP[");
+                f.write_node(&display::comma_separated(exprs));
                 f.write_str("]");
             }
-            Expr::SubscriptSlice { expr, positions } => {
+            Expr::MapSubquery(s) => {
+                f.write_str("MAP(");
+                f.write_node(&s);
+                f.write_str(")");
+            }
+            Expr::Subscript { expr, positions } => {
                 f.write_node(&expr);
                 f.write_str("[");
-                f.write_node(&display::comma_separated(positions));
+
+                let mut first = true;
+
+                for p in positions {
+                    if first {
+                        first = false
+                    } else {
+                        f.write_str("][");
+                    }
+                    f.write_node(p);
+                }
+
                 f.write_str("]");
             }
         }
@@ -520,6 +562,10 @@ impl<T: AstInfo> Expr<T> {
         self.binop(Op::bare("="), right)
     }
 
+    pub fn not_equals(self, right: Expr<T>) -> Expr<T> {
+        self.binop(Op::bare("<>"), right)
+    }
+
     pub fn minus(self, right: Expr<T>) -> Expr<T> {
         self.binop(Op::bare("-"), right)
     }
@@ -536,9 +582,16 @@ impl<T: AstInfo> Expr<T> {
         self.binop(Op::bare("/"), right)
     }
 
-    pub fn call(name: Vec<&str>, args: Vec<Expr<T>>) -> Expr<T> {
+    pub fn cast(self, data_type: T::DataType) -> Expr<T> {
+        Expr::Cast {
+            expr: Box::new(self),
+            data_type,
+        }
+    }
+
+    pub fn call(name: T::ItemName, args: Vec<Expr<T>>) -> Expr<T> {
         Expr::Function(Function {
-            name: UnresolvedObjectName(name.into_iter().map(Into::into).collect()),
+            name,
             args: FunctionArgs::args(args),
             filter: None,
             over: None,
@@ -546,11 +599,11 @@ impl<T: AstInfo> Expr<T> {
         })
     }
 
-    pub fn call_nullary(name: Vec<&str>) -> Expr<T> {
+    pub fn call_nullary(name: T::ItemName) -> Expr<T> {
         Expr::call(name, vec![])
     }
 
-    pub fn call_unary(self, name: Vec<&str>) -> Expr<T> {
+    pub fn call_unary(self, name: T::ItemName) -> Expr<T> {
         Expr::call(name, vec![self])
     }
 
@@ -559,51 +612,84 @@ impl<T: AstInfo> Expr<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Op {
-    Bare(String),
-    Qualified { schema: Vec<Ident>, name: String },
+/// A reference to an operator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Op {
+    /// Any namespaces that preceded the operator.
+    pub namespace: Option<Vec<Ident>>,
+    /// The operator itself.
+    pub op: String,
 }
 
 impl AstDisplay for Op {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            Op::Bare(s) => f.write_str(s),
-            Op::Qualified { schema, name } => {
-                f.write_str("OPERATOR(");
-                for part in schema {
-                    f.write_node(part);
-                    f.write_str(".");
-                }
-                f.write_str(&name);
-                f.write_str(")");
+        if let Some(namespace) = &self.namespace {
+            f.write_str("OPERATOR(");
+            for name in namespace {
+                f.write_node(name);
+                f.write_str(".");
             }
+            f.write_str(&self.op);
+            f.write_str(")");
+        } else {
+            f.write_str(&self.op)
         }
     }
 }
 impl_display!(Op);
 
 impl Op {
-    // returns the bare operator name in all cases, rather than the fully qualified name
-    pub fn op_str(&self) -> &str {
-        match self {
-            Op::Bare(name) => &*name,
-            Op::Qualified { schema: _, name } => &*name,
-        }
-    }
-
-    pub fn bare<S>(name: S) -> Op
+    /// Constructs a new unqualified operator reference.
+    pub fn bare<S>(op: S) -> Op
     where
         S: Into<String>,
     {
-        Op::Bare(name.into())
+        Op {
+            namespace: None,
+            op: op.into(),
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HomogenizingFunction {
+    Coalesce,
+    Greatest,
+    Least,
+}
+
+impl AstDisplay for HomogenizingFunction {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            HomogenizingFunction::Coalesce => f.write_str("COALESCE"),
+            HomogenizingFunction::Greatest => f.write_str("GREATEST"),
+            HomogenizingFunction::Least => f.write_str("LEAST"),
+        }
+    }
+}
+impl_display!(HomogenizingFunction);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MapEntry<T: AstInfo> {
+    pub key: Expr<T>,
+    pub value: Expr<T>,
+}
+
+impl<T: AstInfo> AstDisplay for MapEntry<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.key);
+        f.write_str(" => ");
+        f.write_node(&self.value);
+    }
+}
+impl_display_t!(MapEntry);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SubscriptPosition<T: AstInfo> {
     pub start: Option<Expr<T>>,
     pub end: Option<Expr<T>>,
+    // i.e. did this subscript include a colon
+    pub explicit_slice: bool,
 }
 
 impl<T: AstInfo> AstDisplay for SubscriptPosition<T> {
@@ -611,24 +697,38 @@ impl<T: AstInfo> AstDisplay for SubscriptPosition<T> {
         if let Some(start) = &self.start {
             f.write_node(start);
         }
-        f.write_str(":");
-        if let Some(end) = &self.end {
-            f.write_node(end);
+        if self.explicit_slice {
+            f.write_str(":");
+            if let Some(end) = &self.end {
+                f.write_node(end);
+            }
         }
     }
 }
 impl_display_t!(SubscriptPosition);
 
 /// A window specification (i.e. `OVER (PARTITION BY .. ORDER BY .. etc.)`)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Includes potential IGNORE NULLS or RESPECT NULLS from before the OVER clause.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowSpec<T: AstInfo> {
     pub partition_by: Vec<Expr<T>>,
     pub order_by: Vec<OrderByExpr<T>>,
     pub window_frame: Option<WindowFrame>,
+    // Note that IGNORE NULLS and RESPECT NULLS are mutually exclusive. We validate that not both
+    // are present during HIR planning.
+    pub ignore_nulls: bool,
+    pub respect_nulls: bool,
 }
 
 impl<T: AstInfo> AstDisplay for WindowSpec<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if self.ignore_nulls {
+            f.write_str(" IGNORE NULLS");
+        }
+        if self.respect_nulls {
+            f.write_str(" RESPECT NULLS");
+        }
+        f.write_str(" OVER (");
         let mut delim = "";
         if !self.partition_by.is_empty() {
             delim = " ";
@@ -656,6 +756,7 @@ impl<T: AstInfo> AstDisplay for WindowSpec<T> {
                 f.write_node(&window_frame.start_bound);
             }
         }
+        f.write_str(")");
     }
 }
 impl_display_t!(WindowSpec);
@@ -665,7 +766,7 @@ impl_display_t!(WindowSpec);
 ///
 /// Note: The parser does not validate the specified bounds; the caller should
 /// reject invalid bounds like `ROWS UNBOUNDED FOLLOWING` before execution.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowFrame {
     pub units: WindowFrameUnits,
     pub start_bound: WindowFrameBound,
@@ -676,7 +777,7 @@ pub struct WindowFrame {
     // TBD: EXCLUDE
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WindowFrameUnits {
     Rows,
     Range,
@@ -695,7 +796,7 @@ impl AstDisplay for WindowFrameUnits {
 impl_display!(WindowFrameUnits);
 
 /// Specifies [WindowFrame]'s `start_bound` and `end_bound`
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WindowFrameBound {
     /// `CURRENT ROW`
     CurrentRow,
@@ -725,9 +826,9 @@ impl AstDisplay for WindowFrameBound {
 impl_display!(WindowFrameBound);
 
 /// A function call
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Function<T: AstInfo> {
-    pub name: UnresolvedObjectName,
+    pub name: T::ItemName,
     pub args: FunctionArgs<T>,
     // aggregate functions may specify e.g. `COUNT(DISTINCT X) FILTER (WHERE ...)`
     pub filter: Option<Box<Expr<T>>>,
@@ -738,6 +839,33 @@ pub struct Function<T: AstInfo> {
 
 impl<T: AstInfo> AstDisplay for Function<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        // This block handles printing function calls that have special parsing. In stable mode, the
+        // name is quoted and so won't get the special parsing. We only need to print the special
+        // formats in non-stable mode.
+        if !f.stable() {
+            let special: Option<(&str, &[Option<Keyword>])> =
+                match self.name.to_ast_string_stable().as_str() {
+                    r#""extract""# if self.args.len() == Some(2) => {
+                        Some(("extract", &[None, Some(FROM)]))
+                    }
+                    r#""position""# if self.args.len() == Some(2) => {
+                        Some(("position", &[None, Some(IN)]))
+                    }
+
+                    // "trim" doesn't need to appear here because it changes the function name (to
+                    // "btrim", "ltrim", or "rtrim"), but only "trim" is parsed specially. "substring"
+                    // supports comma-delimited arguments, so doesn't need to be here.
+                    _ => None,
+                };
+            if let Some((name, kws)) = special {
+                f.write_str(name);
+                f.write_str("(");
+                self.args.intersperse_function_argument_keywords(f, kws);
+                f.write_str(")");
+                return;
+            }
+        }
+
         f.write_node(&self.name);
         f.write_str("(");
         if self.distinct {
@@ -751,16 +879,14 @@ impl<T: AstInfo> AstDisplay for Function<T> {
             f.write_str(")");
         }
         if let Some(o) = &self.over {
-            f.write_str(" OVER (");
             f.write_node(o);
-            f.write_str(")");
         }
     }
 }
 impl_display_t!(Function);
 
 /// Arguments for a function call.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FunctionArgs<T: AstInfo> {
     /// The special star argument, as in `count(*)`.
     Star,
@@ -778,6 +904,38 @@ impl<T: AstInfo> FunctionArgs<T> {
             order_by: vec![],
         }
     }
+
+    /// Returns the number of arguments. Star (`*`) is None.
+    pub fn len(&self) -> Option<usize> {
+        match self {
+            FunctionArgs::Star => None,
+            FunctionArgs::Args { args, .. } => Some(args.len()),
+        }
+    }
+
+    /// Prints associated keywords before each argument
+    fn intersperse_function_argument_keywords<W: fmt::Write>(
+        &self,
+        f: &mut AstFormatter<W>,
+        kws: &[Option<Keyword>],
+    ) {
+        let args = match self {
+            FunctionArgs::Star => unreachable!(),
+            FunctionArgs::Args { args, .. } => args,
+        };
+        soft_assert_eq_or_log!(args.len(), kws.len());
+        let mut delim = "";
+        for (arg, kw) in args.iter().zip(kws) {
+            if let Some(kw) = kw {
+                f.write_str(delim);
+                f.write_str(kw.as_str());
+                delim = " ";
+            }
+            f.write_str(delim);
+            f.write_node(arg);
+            delim = " ";
+        }
+    }
 }
 
 impl<T: AstInfo> AstDisplay for FunctionArgs<T> {
@@ -785,10 +943,10 @@ impl<T: AstInfo> AstDisplay for FunctionArgs<T> {
         match self {
             FunctionArgs::Star => f.write_str("*"),
             FunctionArgs::Args { args, order_by } => {
-                f.write_node(&display::comma_separated(&args));
+                f.write_node(&display::comma_separated(args));
                 if !order_by.is_empty() {
                     f.write_str(" ORDER BY ");
-                    f.write_node(&display::comma_separated(&order_by));
+                    f.write_node(&display::comma_separated(order_by));
                 }
             }
         }
@@ -796,31 +954,27 @@ impl<T: AstInfo> AstDisplay for FunctionArgs<T> {
 }
 impl_display_t!(FunctionArgs);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IsExprConstruct {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IsExprConstruct<T: AstInfo> {
     Null,
     True,
     False,
     Unknown,
+    DistinctFrom(Box<Expr<T>>),
 }
 
-impl IsExprConstruct {
-    pub fn requires_boolean_expr(&self) -> bool {
-        match self {
-            IsExprConstruct::Null => false,
-            IsExprConstruct::True | IsExprConstruct::False | IsExprConstruct::Unknown => true,
-        }
-    }
-}
-
-impl AstDisplay for IsExprConstruct {
+impl<T: AstInfo> AstDisplay for IsExprConstruct<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             IsExprConstruct::Null => f.write_str("NULL"),
             IsExprConstruct::True => f.write_str("TRUE"),
             IsExprConstruct::False => f.write_str("FALSE"),
             IsExprConstruct::Unknown => f.write_str("UNKNOWN"),
+            IsExprConstruct::DistinctFrom(e) => {
+                f.write_str("DISTINCT FROM ");
+                e.fmt(f);
+            }
         }
     }
 }
-impl_display!(IsExprConstruct);
+impl_display_t!(IsExprConstruct);

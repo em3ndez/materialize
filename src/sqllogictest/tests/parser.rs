@@ -7,10 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use sqllogictest::ast::{Location, Record};
-use sqllogictest::parser;
+use mz_sqllogictest::ast::{Location, Record};
+use mz_sqllogictest::parser;
 
-#[test]
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] //  unsupported operation: can't call foreign function `llvm.x86.avx2.pshuf.b` on OS `linux`
 fn test_parser() {
     struct TestCase {
         input: &'static str,

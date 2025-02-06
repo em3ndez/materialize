@@ -19,11 +19,15 @@
 
 pub mod array;
 pub mod char;
+pub mod date;
 pub mod datetime;
 pub mod interval;
 pub mod jsonb;
+pub mod mz_acl_item;
 pub mod numeric;
+pub mod pg_legacy_name;
+pub mod range;
 pub mod regex;
 pub mod system;
-mod util;
+pub mod timestamp;
 pub mod varchar;

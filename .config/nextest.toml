@@ -1,0 +1,77 @@
+[profile.default]
+slow-timeout = { period = "90s", terminate-after = 2 }
+
+[profile.default-miri]
+slow-timeout = { period = "1200s", terminate-after = 2 }
+
+# For a given configuration parameter, the first override to match wins. Keep
+# these sorted in order from most specific to least specific.
+
+[[profile.default.overrides]]
+filter = "package(mz-environmentd) and test(test_pgtest)"
+threads-required = 8
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-environmentd) and test(test_storage_usage_collection_interval)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-catalog) and test(global_expr_cache_roundtrip)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-catalog) and test(local_expr_cache_roundtrip)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-catalog) and test(expression_cache)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-environmentd)"
+threads-required = 8
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-storage-types) and test(all_datums_parquet_roundtrip)"
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-storage-types) and test(all_datums_produce_valid_stats)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-storage-types) and test(all_source_data_roundtrips)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "package(mz-adapter) and test(test_smoketest_all_builtins)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[profile.ci]
+junit = { path = "junit_cargo-test.xml" }
+fail-fast = false
+failure-output = "immediate-final"
+
+[profile.coverage]
+slow-timeout = { period = "480s", terminate-after = 2 }
+junit = { path = "junit_cargo-test.xml" }
+fail-fast = false
+failure-output = "immediate-final"
+
+[[profile.coverage.overrides]]
+filter = "package(mz-environmentd)"
+threads-required = 8
+slow-timeout = { period = "800s", terminate-after = 2 }
+
+[profile.sanitizer]
+slow-timeout = { period = "1000s", terminate-after = 2 }
+junit = { path = "junit_cargo-test.xml" }
+fail-fast = false
+failure-output = "immediate-final"
+
+[[profile.sanitizer.overrides]]
+filter = "package(mz-environmentd)"
+threads-required = 8
+slow-timeout = { period = "2000s", terminate-after = 2 }

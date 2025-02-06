@@ -7,295 +7,475 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! A columnar representation of ((Key, Val), Time, Diff) data suitable for in-memory
+//! A columnar representation of ((Key, Val), Time, i64) data suitable for in-memory
 //! reads and persistent storage.
 
 use std::fmt;
-use std::iter::FromIterator;
+use std::mem::size_of;
 
-use serde::{Deserialize, Serialize};
+use ::arrow::array::{
+    make_array, Array, ArrayRef, AsArray, BinaryArray, BinaryBuilder, Int64Array,
+};
+use ::arrow::datatypes::ToByteSlice;
+use mz_persist_types::arrow::{ArrayOrd, ProtoArrayData};
+use mz_proto::{ProtoType, RustType, TryFromProtoError};
 
-/// A set of ((Key, Val), Time, Diff) records stored in a columnar representation.
+use crate::indexed::columnar::arrow::realloc_array;
+use crate::metrics::ColumnarMetrics;
+
+pub mod arrow;
+pub mod parquet;
+
+/// The maximum allowed amount of total key data (similarly val data) in a
+/// single ColumnarBatch.
 ///
-/// Note that the data are unsorted, and unconsolidated (so there may be multiple
-/// instances of the same ((Key, Val), Time), and some Diffs might be zero, or
-/// add up to zero).
-#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Note that somewhat counter-intuitively, this also includes offsets (counting
+/// as 4 bytes each) in the definition of "key/val data".
+///
+/// TODO: The limit on the amount of {key,val} data is because we use i32
+/// offsets in parquet; this won't change. However, we include the offsets in
+/// the size because the parquet library we use currently maps each Array 1:1
+/// with a parquet "page" (so for a "binary" column this is both the offsets and
+/// the data). The parquet format internally stores the size of a page in an
+/// i32, so if this gets too big, our library overflows it and writes bad data.
+/// There's no reason it needs to map an Array 1:1 to a page (it could instead
+/// be 1:1 with a "column chunk", which contains 1 or more pages). For now, we
+/// work around it.
+// TODO(benesch): find a way to express this without `as`.
+#[allow(clippy::as_conversions)]
+pub const KEY_VAL_DATA_MAX_LEN: usize = i32::MAX as usize;
+
+const BYTES_PER_KEY_VAL_OFFSET: usize = 4;
+
+/// A set of ((Key, Val), Time, Diff) records stored in a columnar
+/// representation.
+///
+/// Note that the data are unsorted, and unconsolidated (so there may be
+/// multiple instances of the same ((Key, Val), Time), and some Diffs might be
+/// zero, or add up to zero).
+///
+/// Both Time and Diff are presented externally to persist users as a type
+/// parameter that implements [mz_persist_types::Codec64]. Our columnar format
+/// intentionally stores them both as i64 columns (as opposed to something like
+/// a fixed width binary column) because this allows us additional compression
+/// options.
+///
+/// Also note that we intentionally use an i64 over a u64 for Time. Over the
+/// range `[0, i64::MAX]`, the bytes are the same and we've talked at various
+/// times about changing Time in mz to an i64. Both millis since unix epoch and
+/// nanos since unix epoch easily fit into this range (the latter until some
+/// time after year 2200). Using a i64 might be a pessimization for a
+/// non-realtime mz source with u64 timestamps in the range `(i64::MAX,
+/// u64::MAX]`, but realtime sources are overwhelmingly the common case.
+///
+/// Invariants:
+/// - len <= u32::MAX (since we use arrow's `BinaryArray` for our binary data)
+/// - the length of all arrays should == len
+/// - all entries should be non-null
+#[derive(Clone, PartialEq)]
 pub struct ColumnarRecords {
     len: usize,
-    key_data: Vec<u8>,
-    key_offsets: Vec<usize>,
-    val_data: Vec<u8>,
-    val_offsets: Vec<usize>,
-    timestamps: Vec<u64>,
-    diffs: Vec<isize>,
+    key_data: BinaryArray,
+    val_data: BinaryArray,
+    timestamps: Int64Array,
+    diffs: Int64Array,
+}
+
+impl Default for ColumnarRecords {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            key_data: BinaryArray::from_vec(vec![]),
+            val_data: BinaryArray::from_vec(vec![]),
+            timestamps: Int64Array::from_iter_values([]),
+            diffs: Int64Array::from_iter_values([]),
+        }
+    }
 }
 
 impl fmt::Debug for ColumnarRecords {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&self.borrow(), fmt)
-    }
-}
-
-impl ColumnarRecords {
-    /// The number of (potentially duplicated) ((Key, Val), Time, Diff) records
-    /// stored in Self.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Borrow Self as a [ColumnarRecordsRef].
-    fn borrow<'a>(&'a self) -> ColumnarRecordsRef<'a> {
-        ColumnarRecordsRef {
-            len: self.len,
-            key_data: self.key_data.as_slice(),
-            key_offsets: self.key_offsets.as_slice(),
-            val_data: self.val_data.as_slice(),
-            val_offsets: self.val_offsets.as_slice(),
-            timestamps: self.timestamps.as_slice(),
-            diffs: self.diffs.as_slice(),
-        }
-    }
-
-    /// Convert an instance of Self into a [ColumnarRecordsBuilder] by reusing
-    /// and clearing out the underlying memory.
-    pub fn into_builder(mut self) -> ColumnarRecordsBuilder {
-        self.len = 0;
-        self.key_data.clear();
-        self.key_offsets.clear();
-        self.val_data.clear();
-        self.val_offsets.clear();
-        self.timestamps.clear();
-        self.diffs.clear();
-        ColumnarRecordsBuilder { records: self }
-    }
-
-    /// Iterate through the records in Self.
-    pub fn iter<'a>(&'a self) -> ColumnarRecordsIter<'a> {
-        self.borrow().iter()
-    }
-}
-
-// TODO: deduplicate this with the other FromIterator implementation.
-impl<'a, K, V> FromIterator<&'a ((K, V), u64, isize)> for ColumnarRecords
-where
-    K: AsRef<[u8]> + 'a,
-    V: AsRef<[u8]> + 'a,
-{
-    fn from_iter<T: IntoIterator<Item = &'a ((K, V), u64, isize)>>(iter: T) -> Self {
-        let iter = iter.into_iter();
-        let size_hint = iter.size_hint();
-
-        let mut builder = ColumnarRecordsBuilder::default();
-        for record in iter.into_iter() {
-            let ((key, val), ts, diff) = record;
-            let (key, val) = (key.as_ref(), val.as_ref());
-            if builder.records.len() == 0 {
-                // Use the first record to attempt to pre-size the builder
-                // allocations. This uses the iter's size_hint's lower+1 to
-                // match the logic in Vec.
-                let (lower, _) = size_hint;
-                let additional = usize::saturating_add(lower, 1);
-                builder.reserve(additional, key.len(), val.len());
-            }
-            builder.push(((key, val), *ts, *diff));
-        }
-        builder.finish()
-    }
-}
-
-impl<K, V> FromIterator<((K, V), u64, isize)> for ColumnarRecords
-where
-    K: AsRef<[u8]>,
-    V: AsRef<[u8]>,
-{
-    fn from_iter<T: IntoIterator<Item = ((K, V), u64, isize)>>(iter: T) -> Self {
-        let iter = iter.into_iter();
-        let size_hint = iter.size_hint();
-
-        let mut builder = ColumnarRecordsBuilder::default();
-        for record in iter.into_iter() {
-            let ((key, val), ts, diff) = record;
-            let (key, val) = (key.as_ref(), val.as_ref());
-            if builder.records.len() == 0 {
-                // Use the first record to attempt to pre-size the builder
-                // allocations. This uses the iter's size_hint's lower+1 to
-                // match the logic in Vec.
-                let (lower, _) = size_hint;
-                let additional = usize::saturating_add(lower, 1);
-                builder.reserve(additional, key.len(), val.len());
-            }
-            builder.push(((key, val), ts, diff));
-        }
-        builder.finish()
-    }
-}
-
-/// A reference to a [ColumnarRecords].
-#[derive(Clone)]
-struct ColumnarRecordsRef<'a> {
-    len: usize,
-    key_data: &'a [u8],
-    key_offsets: &'a [usize],
-    val_data: &'a [u8],
-    val_offsets: &'a [usize],
-    timestamps: &'a [u64],
-    diffs: &'a [isize],
-}
-
-impl<'a> fmt::Debug for ColumnarRecordsRef<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<'a> ColumnarRecordsRef<'a> {
+impl ColumnarRecords {
+    /// Construct a columnar records instance from the given arrays, checking invariants.
+    pub fn new(
+        key_data: BinaryArray,
+        val_data: BinaryArray,
+        timestamps: Int64Array,
+        diffs: Int64Array,
+    ) -> Self {
+        let len = key_data.len();
+        let records = Self {
+            len,
+            key_data,
+            val_data,
+            timestamps,
+            diffs,
+        };
+        assert_eq!(records.validate(), Ok(()));
+        records
+    }
+
+    /// The number of (potentially duplicated) ((Key, Val), Time, i64) records
+    /// stored in Self.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The keys in this columnar records as an array.
+    pub fn keys(&self) -> &BinaryArray {
+        &self.key_data
+    }
+
+    /// The vals in this columnar records as an array.
+    pub fn vals(&self) -> &BinaryArray {
+        &self.val_data
+    }
+
+    /// The timestamps in this columnar records as an array.
+    pub fn timestamps(&self) -> &Int64Array {
+        &self.timestamps
+    }
+
+    /// The diffs in this columnar records as an array.
+    pub fn diffs(&self) -> &Int64Array {
+        &self.diffs
+    }
+
+    /// The number of logical bytes in the represented data, excluding offsets
+    /// and lengths.
+    pub fn goodbytes(&self) -> usize {
+        self.key_data.values().len()
+            + self.val_data.values().len()
+            + self.timestamps.values().inner().len()
+            + self.diffs.values().inner().len()
+    }
+
     /// Read the record at `idx`, if there is one.
     ///
     /// Returns None if `idx >= self.len()`.
-    fn get(&self, idx: usize) -> Option<((&'a [u8], &'a [u8]), u64, isize)> {
+    pub fn get(&self, idx: usize) -> Option<((&[u8], &[u8]), [u8; 8], [u8; 8])> {
         if idx >= self.len {
             return None;
         }
-        debug_assert_eq!(self.key_offsets.len(), self.len + 1);
-        debug_assert_eq!(self.val_offsets.len(), self.len + 1);
-        debug_assert_eq!(self.timestamps.len(), self.len);
-        debug_assert_eq!(self.diffs.len(), self.len);
-        let key = &self.key_data[self.key_offsets[idx]..self.key_offsets[idx + 1]];
-        let val = &self.val_data[self.val_offsets[idx]..self.val_offsets[idx + 1]];
-        let ts = self.timestamps[idx];
-        let diff = self.diffs[idx];
+
+        // There used to be `debug_assert_eq!(self.validate(), Ok(()))`, but it
+        // resulted in accidentally O(n^2) behavior in debug mode. Instead, we
+        // push that responsibility to the ColumnarRecordsRef constructor.
+        let key = self.key_data.value(idx);
+        let val = self.val_data.value(idx);
+        let ts = i64::to_le_bytes(self.timestamps.values()[idx]);
+        let diff = i64::to_le_bytes(self.diffs.values()[idx]);
         Some(((key, val), ts, diff))
     }
 
     /// Iterate through the records in Self.
-    fn iter(&self) -> ColumnarRecordsIter<'a> {
-        ColumnarRecordsIter {
-            idx: 0,
-            records: self.clone(),
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = ((&[u8], &[u8]), [u8; 8], [u8; 8])> + ExactSizeIterator {
+        (0..self.len).map(move |idx| self.get(idx).unwrap())
+    }
+
+    /// Concatenate the given records together, column-by-column.
+    pub fn concat(records: &[ColumnarRecords], metrics: &ColumnarMetrics) -> ColumnarRecords {
+        match records.len() {
+            0 => return ColumnarRecords::default(),
+            1 => return records[0].clone(),
+            _ => {}
+        }
+
+        let mut concat_array = vec![];
+        let mut concat = |get: fn(&ColumnarRecords) -> &dyn Array| {
+            concat_array.extend(records.iter().map(get));
+            let res = ::arrow::compute::concat(&concat_array).expect("same type");
+            concat_array.clear();
+            res
+        };
+
+        Self {
+            len: records.iter().map(|c| c.len).sum(),
+            key_data: realloc_array(concat(|c| &c.key_data).as_binary(), metrics),
+            val_data: realloc_array(concat(|c| &c.val_data).as_binary(), metrics),
+            timestamps: realloc_array(concat(|c| &c.timestamps).as_primitive(), metrics),
+            diffs: realloc_array(concat(|c| &c.diffs).as_primitive(), metrics),
         }
     }
 }
 
-/// An [Iterator] over the records in a [ColumnarRecords].
-#[derive(Clone, Debug)]
-pub struct ColumnarRecordsIter<'a> {
-    idx: usize,
-    records: ColumnarRecordsRef<'a>,
-}
-
-impl<'a> Iterator for ColumnarRecordsIter<'a> {
-    type Item = ((&'a [u8], &'a [u8]), u64, isize);
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.records.len, Some(self.records.len))
-    }
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let ret = self.records.get(self.idx);
-        self.idx += 1;
-        ret
-    }
-}
-
-impl<'a> ExactSizeIterator for ColumnarRecordsIter<'a> {}
-
-/// An abstraction to incrementally add ((Key, Value), Time, Diff) records
+/// An abstraction to incrementally add ((Key, Value), Time, i64) records
 /// in a columnar representation, and eventually get back a [ColumnarRecords].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ColumnarRecordsBuilder {
-    records: ColumnarRecords,
+    len: usize,
+    key_data: BinaryBuilder,
+    val_data: BinaryBuilder,
+    timestamps: Vec<i64>,
+    diffs: Vec<i64>,
+}
+
+impl Default for ColumnarRecordsBuilder {
+    fn default() -> Self {
+        ColumnarRecordsBuilder {
+            len: 0,
+            key_data: BinaryBuilder::new(),
+            val_data: BinaryBuilder::new(),
+            timestamps: Vec::new(),
+            diffs: Vec::new(),
+        }
+    }
 }
 
 impl ColumnarRecordsBuilder {
-    /// The number of (potentially duplicated) ((Key, Val), Time, Diff) records
-    /// stored in Self.
-    pub fn len(&self) -> usize {
-        self.records.len
+    /// Reserve space for the given number of items with the given sizes in bytes.
+    /// If they end up being too small, the underlying buffers will be resized as usual.
+    pub fn with_capacity(items: usize, key_bytes: usize, val_bytes: usize) -> Self {
+        let key_data = BinaryBuilder::with_capacity(items, key_bytes);
+        let val_data = BinaryBuilder::with_capacity(items, val_bytes);
+        let timestamps = Vec::with_capacity(items);
+        let diffs = Vec::with_capacity(items);
+        Self {
+            len: 0,
+            key_data,
+            val_data,
+            timestamps,
+            diffs,
+        }
     }
 
-    /// Reserve space for `additional` more records, based on `key_size_guess` and
-    /// `val_size_guess`.
+    /// The number of (potentially duplicated) ((Key, Val), Time, i64) records
+    /// stored in Self.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns if the given key_offsets+key_data or val_offsets+val_data fits
+    /// in the limits imposed by ColumnarRecords.
     ///
-    /// The guesses for key and val sizes are best effort, and if they end up being
-    /// too small, the underlying buffers will be resized.
-    pub fn reserve(&mut self, additional: usize, key_size_guess: usize, val_size_guess: usize) {
-        self.records.key_offsets.reserve(additional);
-        self.records.key_data.reserve(additional * key_size_guess);
-        self.records.val_offsets.reserve(additional);
-        self.records.val_data.reserve(additional * val_size_guess);
-        self.records.timestamps.reserve(additional);
-        self.records.diffs.reserve(additional);
+    /// Note that limit is always [KEY_VAL_DATA_MAX_LEN] in production. It's
+    /// only override-able here for testing.
+    pub fn can_fit(&self, key: &[u8], val: &[u8], limit: usize) -> bool {
+        let key_data_size = self.key_data.values_slice().len()
+            + self.key_data.offsets_slice().to_byte_slice().len()
+            + key.len();
+        let val_data_size = self.val_data.values_slice().len()
+            + self.val_data.offsets_slice().to_byte_slice().len()
+            + val.len();
+        key_data_size <= limit && val_data_size <= limit
+    }
+
+    /// The current size of the columnar records data, useful for bounding batches at a
+    /// target size.
+    pub fn total_bytes(&self) -> usize {
+        self.key_data.values_slice().len()
+            + self.key_data.offsets_slice().to_byte_slice().len()
+            + self.val_data.values_slice().len()
+            + self.val_data.offsets_slice().to_byte_slice().len()
+            + self.timestamps.to_byte_slice().len()
+            + self.diffs.to_byte_slice().len()
     }
 
     /// Add a record to Self.
-    pub fn push(&mut self, record: ((&[u8], &[u8]), u64, isize)) {
+    ///
+    /// Returns whether the record was successfully added. A record will not a
+    /// added if it exceeds the size limitations of ColumnarBatch. This method
+    /// is atomic, if it fails, no partial data will have been added.
+    #[must_use]
+    pub fn push(&mut self, record: ((&[u8], &[u8]), [u8; 8], [u8; 8])) -> bool {
         let ((key, val), ts, diff) = record;
-        self.records.key_offsets.push(self.records.key_data.len());
-        self.records.key_data.extend_from_slice(key);
-        self.records.val_offsets.push(self.records.val_data.len());
-        self.records.val_data.extend_from_slice(val);
-        self.records.timestamps.push(ts);
-        self.records.diffs.push(diff);
-        self.records.len += 1;
-        // The checks on `key_offsets` and `val_offsets` are different than in the
-        // rest of the file because those arrays have not received their final
-        // value yet in finish().
-        debug_assert_eq!(self.records.key_offsets.len(), self.records.len);
-        debug_assert_eq!(self.records.val_offsets.len(), self.records.len);
-        debug_assert_eq!(self.records.timestamps.len(), self.records.len);
-        debug_assert_eq!(self.records.diffs.len(), self.records.len);
+
+        // Check size invariants ahead of time so we stay atomic when we can't
+        // add the record.
+        if !self.can_fit(key, val, KEY_VAL_DATA_MAX_LEN) {
+            return false;
+        }
+
+        self.key_data.append_value(key);
+        self.val_data.append_value(val);
+        self.timestamps.push(i64::from_le_bytes(ts));
+        self.diffs.push(i64::from_le_bytes(diff));
+        self.len += 1;
+
+        true
     }
 
     /// Finalize constructing a [ColumnarRecords].
-    pub fn finish(mut self) -> ColumnarRecords {
-        self.records.key_offsets.push(self.records.key_data.len());
-        self.records.val_offsets.push(self.records.val_data.len());
-        debug_assert_eq!(self.records.key_offsets.len(), self.records.len + 1);
-        debug_assert_eq!(self.records.val_offsets.len(), self.records.len + 1);
-        debug_assert_eq!(self.records.timestamps.len(), self.records.len);
-        debug_assert_eq!(self.records.diffs.len(), self.records.len);
-        self.records
+    pub fn finish(mut self, _metrics: &ColumnarMetrics) -> ColumnarRecords {
+        // We're almost certainly going to immediately encode this and drop it,
+        // so don't bother actually copying the data into lgalloc.
+        // Revisit if that changes.
+        let ret = ColumnarRecords {
+            len: self.len,
+            key_data: BinaryBuilder::finish(&mut self.key_data),
+            val_data: BinaryBuilder::finish(&mut self.val_data),
+            timestamps: self.timestamps.into(),
+            diffs: self.diffs.into(),
+        };
+        debug_assert_eq!(ret.validate(), Ok(()));
+        ret
+    }
+
+    /// Size of an update record as stored in the columnar representation
+    pub fn columnar_record_size(key_bytes_len: usize, value_bytes_len: usize) -> usize {
+        (key_bytes_len + BYTES_PER_KEY_VAL_OFFSET)
+            + (value_bytes_len + BYTES_PER_KEY_VAL_OFFSET)
+            + (2 * size_of::<u64>()) // T and D
+    }
+}
+
+impl ColumnarRecords {
+    fn validate(&self) -> Result<(), String> {
+        let validate_array = |name: &str, array: &dyn Array| {
+            let len = array.len();
+            if len != self.len {
+                return Err(format!("expected {} {name} got {len}", self.len));
+            }
+            let null_count = array.null_count();
+            if null_count > 0 {
+                return Err(format!("{null_count} unexpected nulls in {name} array"));
+            }
+            Ok(())
+        };
+
+        let key_data_size =
+            self.key_data.values().len() + self.key_data.offsets().inner().inner().len();
+        if key_data_size > KEY_VAL_DATA_MAX_LEN {
+            return Err(format!(
+                "expected encoded key offsets and data size to be less than or equal to {} got {}",
+                KEY_VAL_DATA_MAX_LEN, key_data_size
+            ));
+        }
+        validate_array("keys", &self.key_data)?;
+
+        let val_data_size =
+            self.val_data.values().len() + self.val_data.offsets().inner().inner().len();
+        if val_data_size > KEY_VAL_DATA_MAX_LEN {
+            return Err(format!(
+                "expected encoded val offsets and data size to be less than or equal to {} got {}",
+                KEY_VAL_DATA_MAX_LEN, val_data_size
+            ));
+        }
+        validate_array("vals", &self.val_data)?;
+
+        if self.diffs.len() != self.len {
+            return Err(format!(
+                "expected {} diffs got {}",
+                self.len,
+                self.diffs.len()
+            ));
+        }
+        if self.timestamps.len() != self.len {
+            return Err(format!(
+                "expected {} timestamps got {}",
+                self.len,
+                self.timestamps.len()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// An "extension" to [`ColumnarRecords`] that duplicates the "key" (`K`) and "val" (`V`) columns
+/// as structured Arrow data.
+///
+/// [`ColumnarRecords`] stores the key and value columns as binary blobs encoded with the [`Codec`]
+/// trait. We're migrating to instead store the key and value columns as structured Parquet data,
+/// which we interface with via Arrow.
+///
+/// [`Codec`]: mz_persist_types::Codec
+#[derive(Debug, Clone)]
+pub struct ColumnarRecordsStructuredExt {
+    /// The structured `k` column.
+    ///
+    /// [`arrow`] does not allow empty [`StructArray`]s so we model an empty `key` column as None.
+    ///
+    /// [`StructArray`]: ::arrow::array::StructArray
+    pub key: ArrayRef,
+    /// The structured `v` column.
+    ///
+    /// [`arrow`] does not allow empty [`StructArray`]s so we model an empty `val` column as None.
+    ///
+    /// [`StructArray`]: ::arrow::array::StructArray
+    pub val: ArrayRef,
+}
+
+impl PartialEq for ColumnarRecordsStructuredExt {
+    fn eq(&self, other: &Self) -> bool {
+        *self.key == *other.key && *self.val == *other.val
+    }
+}
+
+impl ColumnarRecordsStructuredExt {
+    /// See [`RustType::into_proto`].
+    pub fn into_proto(&self) -> (ProtoArrayData, ProtoArrayData) {
+        let key = self.key.to_data().into_proto();
+        let val = self.val.to_data().into_proto();
+
+        (key, val)
+    }
+
+    /// See [`RustType::from_proto`].
+    pub fn from_proto(
+        key: Option<ProtoArrayData>,
+        val: Option<ProtoArrayData>,
+    ) -> Result<Option<Self>, TryFromProtoError> {
+        let key = key.map(|d| d.into_rust()).transpose()?.map(make_array);
+        let val = val.map(|d| d.into_rust()).transpose()?.map(make_array);
+
+        let ext = match (key, val) {
+            (Some(key), Some(val)) => Some(ColumnarRecordsStructuredExt { key, val }),
+            x @ (Some(_), None) | x @ (None, Some(_)) => {
+                mz_ore::soft_panic_or_log!("found only one of key or val, {x:?}");
+                None
+            }
+            (None, None) => None,
+        };
+        Ok(ext)
+    }
+
+    /// The "goodput" of these arrays, excluding overhead like offsets etc.
+    pub fn goodbytes(&self) -> usize {
+        ArrayOrd::new(self.key.as_ref()).goodbytes() + ArrayOrd::new(self.val.as_ref()).goodbytes()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use mz_persist_types::Codec64;
+
     use super::*;
 
     /// Smoke test some edge cases around empty sets of records and empty keys/vals
     ///
     /// Most of this functionality is also well-exercised in other unit tests as well.
-    #[test]
+    #[mz_ore::test]
     fn columnar_records() {
+        let metrics = ColumnarMetrics::disconnected();
         let builder = ColumnarRecordsBuilder::default();
 
         // Empty builder.
-        let records = builder.finish();
+        let records = builder.finish(&metrics);
         let reads: Vec<_> = records.iter().collect();
         assert_eq!(reads, vec![]);
 
         // Empty key and val.
-        let updates: Vec<((Vec<u8>, Vec<u8>), _, _)> = vec![
+        let updates: Vec<((Vec<u8>, Vec<u8>), u64, i64)> = vec![
             (("".into(), "".into()), 0, 0),
             (("".into(), "".into()), 1, 1),
         ];
         let mut builder = ColumnarRecordsBuilder::default();
         for ((key, val), time, diff) in updates.iter() {
-            builder.push(((key, val), *time, *diff));
+            assert!(builder.push(((key, val), u64::encode(time), i64::encode(diff))));
         }
 
-        let records = builder.finish();
+        let records = builder.finish(&metrics);
         let reads: Vec<_> = records
             .iter()
-            .map(|((k, v), t, d)| ((k.to_vec(), v.to_vec()), t, d))
+            .map(|((k, v), t, d)| ((k.to_vec(), v.to_vec()), u64::decode(t), i64::decode(d)))
             .collect();
         assert_eq!(reads, updates);
-
-        // Recycling a [ColumnarRecords] into a [ColumnarRecordsBuilder]
-        let builder = records.into_builder();
-        let records = builder.finish();
-        let reads: Vec<_> = records.iter().collect();
-        assert_eq!(reads, vec![]);
     }
 }

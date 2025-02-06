@@ -1,0 +1,274 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+mode cockroach
+
+reset-server
+
+# Verify initial roles.
+query TTB rowsort
+SELECT id, name, inherit FROM mz_roles WHERE id LIKE 's%' OR id LIKE 'g%'
+----
+s1  mz_system  true
+s2  mz_support  true
+s3  mz_analytics  true
+g1  mz_monitor  true
+g2  mz_monitor_redacted  true
+
+query TB
+SELECT name, inherit FROM mz_roles WHERE id LIKE 'u%'
+----
+materialize  true
+
+simple conn=mz_support,user=mz_support
+SELECT mz_catalog.mz_is_superuser()
+----
+f
+COMPLETE 1
+
+simple conn=mz_system,user=mz_system
+SELECT mz_catalog.mz_is_superuser()
+----
+t
+COMPLETE 1
+
+# Give materialize the CREATEROLE attribute.
+simple conn=mz_system,user=mz_system
+GRANT CREATEROLE ON SYSTEM TO materialize
+----
+COMPLETE 0
+
+statement error non inherit roles not yet supported
+CREATE ROLE foo NOINHERIT
+
+statement error LOGIN attribute is not supported, for more information consult the documentation at
+CREATE ROLE foo LOGIN
+
+statement error SUPERUSER attribute is not supported, for more information consult the documentation at
+CREATE ROLE foo SUPERUSER
+
+statement error conflicting or redundant options
+CREATE ROLE foo INHERIT INHERIT
+
+statement error CREATEDB attribute is not supported
+CREATE ROLE foo CREATEDB
+
+statement error CREATEROLE attribute is not supported
+CREATE ROLE foo CREATEROLE
+
+statement error CREATECLUSTER attribute is not supported
+CREATE ROLE foo CREATECLUSTER
+
+# Create role and verify its existence.
+statement ok
+CREATE ROLE rj
+
+statement error CREATE USER is not supported, for more information consult the documentation at
+CREATE USER fms
+
+query TB rowsort
+SELECT name, inherit FROM mz_roles
+----
+materialize  true
+mz_analytics  true
+mz_monitor  true
+mz_monitor_redacted  true
+mz_support  true
+mz_system  true
+rj  true
+
+# Dropping multiple roles should not have any effect if one of the role names
+# is bad...
+statement error unknown role 'bad'
+DROP ROLE rj, bad
+
+query T rowsort
+SELECT name FROM mz_roles
+----
+materialize
+mz_analytics
+mz_monitor
+mz_monitor_redacted
+mz_support
+mz_system
+rj
+
+# ...unless IF EXISTS is specified.
+statement ok
+DROP ROLE IF EXISTS rj, bad
+
+query T rowsort
+SELECT name FROM mz_roles
+----
+materialize
+mz_analytics
+mz_monitor
+mz_monitor_redacted
+mz_support
+mz_system
+
+# Verify that the single name version of DROP ROLE works too.
+statement ok
+CREATE ROLE nlb
+
+query T rowsort
+SELECT name FROM mz_roles
+----
+materialize
+mz_analytics
+mz_monitor
+mz_monitor_redacted
+mz_support
+mz_system
+nlb
+
+statement ok
+DROP ROLE nlb
+
+query T
+SELECT name FROM mz_roles
+----
+mz_system
+mz_monitor
+mz_support
+materialize
+mz_analytics
+mz_monitor_redacted
+
+statement ok
+DROP ROLE IF EXISTS nlb
+
+# No dropping the current role.
+statement error current role cannot be dropped
+DROP ROLE materialize
+
+# No creating roles that already exist.
+statement error role 'materialize' already exists
+CREATE ROLE materialize
+
+# No creating roles that look like system roles.
+statement error role name "mz_system" is reserved
+CREATE ROLE mz_system
+
+statement error role name "mz_foo" is reserved
+CREATE ROLE mz_foo
+
+# Create role
+statement ok
+CREATE ROLE foo
+
+query TB rowsort
+SELECT name, inherit FROM mz_roles WHERE name = 'foo'
+----
+foo true
+
+statement error non inherit roles not yet supported
+ALTER ROLE foo NOINHERIT
+
+statement error role name "mz_system" is reserved
+ALTER ROLE mz_system INHERIT
+
+statement error conflicting or redundant options
+ALTER ROLE foo INHERIT INHERIT
+
+statement error CREATEDB attribute is not supported
+ALTER ROLE foo CREATEDB
+
+statement error CREATEROLE attribute is not supported
+ALTER ROLE foo CREATEROLE
+
+statement error CREATECLUSTER attribute is not supported
+ALTER ROLE foo CREATECLUSTER
+
+# Prevent creating, dropping, and altering PUBLIC role
+
+statement error role name "public" is reserved
+CREATE ROLE puBLic
+
+statement error role name "public" is reserved
+DROP ROLE PUBLIC
+
+statement error role name "public" is reserved
+ALTER ROLE public INHERIT
+
+query T
+SELECT pg_get_userbyid((SELECT oid FROM mz_roles WHERE name = 'materialize'))
+----
+materialize
+
+query T
+SELECT pg_get_userbyid((SELECT oid FROM mz_roles WHERE name = 'foo'))
+----
+foo
+
+query T
+SELECT pg_get_userbyid(NULL)
+----
+NULL
+
+query T
+SELECT pg_get_userbyid(4294967295);
+----
+ unknown (OID=4294967295)
+
+# Test concurrently dropped role
+
+simple conn=foo,user=foo
+SELECT current_user();
+----
+foo
+COMPLETE 1
+
+statement ok
+DROP ROLE foo
+
+simple conn=foo,user=foo
+SELECT current_user();
+----
+db error: ERROR: role u4 was concurrently dropped
+DETAIL: Please disconnect and re-connect with a valid role.
+
+simple conn=mz_system,user=mz_system
+DROP CLUSTER mz_system CASCADE;
+----
+db error: ERROR: system cluster 'mz_system' cannot be modified
+
+simple conn=mz_system,user=mz_system
+DROP CLUSTER mz_catalog_server CASCADE;
+----
+db error: ERROR: system cluster 'mz_catalog_server' cannot be modified
+
+statement error role name "external_foo" is reserved
+CREATE ROLE external_foo
+
+# Test SHOW ROLES
+
+query TT
+SHOW ROLES
+----
+materialize (empty)
+
+statement ok
+CREATE ROLE foo
+
+query TT
+SHOW ROLES
+----
+foo (empty)
+materialize (empty)
+
+query TT
+SHOW ROLES WHERE name = 'foo'
+----
+foo (empty)
+
+query TT
+SHOW ROLES LIKE 'f%'
+----
+foo (empty)

@@ -9,114 +9,55 @@
 
 #![allow(missing_docs)]
 
-use std::fmt;
-use std::iter;
+use std::cmp::{max, min};
+use std::iter::Sum;
+use std::ops::Deref;
+use std::{fmt, iter};
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc};
 use dec::OrderedDecimal;
-use num::{CheckedAdd, Integer, Signed};
+use itertools::Itertools;
+use mz_lowertest::MzReflect;
+use mz_ore::cast::CastFrom;
+
+use mz_ore::soft_assert_or_log;
+use mz_ore::str::separated;
+use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
+use mz_repr::adt::array::ArrayDimension;
+use mz_repr::adt::date::Date;
+use mz_repr::adt::interval::Interval;
+use mz_repr::adt::numeric::{self, Numeric, NumericMaxScale};
+use mz_repr::adt::regex::Regex as ReprRegex;
+use mz_repr::adt::timestamp::{CheckedTimestamp, TimestampLike};
+use mz_repr::{ColumnName, ColumnType, Datum, Diff, RelationType, Row, RowArena, ScalarType};
+use num::{CheckedAdd, Integer, Signed, ToPrimitive};
 use ordered_float::OrderedFloat;
+use proptest::prelude::{Arbitrary, Just};
+use proptest::strategy::{BoxedStrategy, Strategy, Union};
+use proptest_derive::Arbitrary;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use lowertest::MzEnumReflect;
-use ore::cast::CastFrom;
-use repr::adt::array::ArrayDimension;
-use repr::adt::interval::Interval;
-use repr::adt::numeric;
-use repr::adt::regex::Regex as ReprRegex;
-use repr::{ColumnName, ColumnType, Datum, Diff, RelationType, Row, RowArena, ScalarType};
-
-use crate::relation::{compare_columns, ColumnOrder};
+use crate::explain::{HumanizedExpr, HumanizerMode};
+use crate::relation::proto_aggregate_func::{
+    self, ProtoColumnOrders, ProtoFusedValueWindowFunc, ProtoFusedWindowAggregate,
+};
+use crate::relation::proto_table_func::ProtoTabletizedScalar;
+use crate::relation::{
+    compare_columns, proto_table_func, ColumnOrder, ProtoAggregateFunc, ProtoTableFunc,
+    WindowFrame, WindowFrameBound, WindowFrameUnits,
+};
 use crate::scalar::func::{add_timestamp_months, jsonb_stringify};
 use crate::EvalError;
+use crate::WindowFrameBound::{
+    CurrentRow, OffsetFollowing, OffsetPreceding, UnboundedFollowing, UnboundedPreceding,
+};
+use crate::WindowFrameUnits::{Groups, Range, Rows};
+
+include!(concat!(env!("OUT_DIR"), "/mz_expr.relation.func.rs"));
 
 // TODO(jamii) be careful about overflow in sum/avg
 // see https://timely.zulipchat.com/#narrow/stream/186635-engineering/topic/additional.20work/near/163507435
-
-fn max_numeric<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<OrderedDecimal<numeric::Numeric>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_numeric())
-        .max();
-    x.map(Datum::Numeric).unwrap_or(Datum::Null)
-}
-
-fn max_int16<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<i16> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_int16())
-        .max();
-    Datum::from(x)
-}
-
-fn max_int32<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<i32> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_int32())
-        .max();
-    Datum::from(x)
-}
-
-fn max_int64<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<i64> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_int64())
-        .max();
-    Datum::from(x)
-}
-
-fn max_float32<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<OrderedFloat<f32>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_ordered_float32())
-        .max();
-    Datum::from(x)
-}
-
-fn max_float64<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<OrderedFloat<f64>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_ordered_float64())
-        .max();
-    Datum::from(x)
-}
-
-fn max_bool<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<bool> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_bool())
-        .max();
-    Datum::from(x)
-}
 
 fn max_string<'a, I>(datums: I) -> Datum<'a>
 where
@@ -125,131 +66,43 @@ where
     match datums
         .into_iter()
         .filter(|d| !d.is_null())
-        .max_by(|a, b| a.unwrap_str().cmp(&b.unwrap_str()))
+        .max_by(|a, b| a.unwrap_str().cmp(b.unwrap_str()))
     {
         Some(datum) => datum,
         None => Datum::Null,
     }
 }
 
-fn max_date<'a, I>(datums: I) -> Datum<'a>
+fn max_datum<'a, I, DatumType>(datums: I) -> Datum<'a>
 where
     I: IntoIterator<Item = Datum<'a>>,
+    DatumType: TryFrom<Datum<'a>> + Ord,
+    <DatumType as TryFrom<Datum<'a>>>::Error: std::fmt::Debug,
+    Datum<'a>: From<Option<DatumType>>,
 {
-    let x: Option<NaiveDate> = datums
+    let x: Option<DatumType> = datums
         .into_iter()
         .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_date())
+        .map(|d| DatumType::try_from(d).expect("unexpected type"))
         .max();
-    Datum::from(x)
+
+    x.into()
 }
 
-fn max_timestamp<'a, I>(datums: I) -> Datum<'a>
+fn min_datum<'a, I, DatumType>(datums: I) -> Datum<'a>
 where
     I: IntoIterator<Item = Datum<'a>>,
+    DatumType: TryFrom<Datum<'a>> + Ord,
+    <DatumType as TryFrom<Datum<'a>>>::Error: std::fmt::Debug,
+    Datum<'a>: From<Option<DatumType>>,
 {
-    let x: Option<NaiveDateTime> = datums
+    let x: Option<DatumType> = datums
         .into_iter()
         .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_timestamp())
-        .max();
-    Datum::from(x)
-}
-
-fn max_timestamptz<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<DateTime<Utc>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_timestamptz())
-        .max();
-    Datum::from(x)
-}
-
-fn min_numeric<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<OrderedDecimal<numeric::Numeric>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_numeric())
+        .map(|d| DatumType::try_from(d).expect("unexpected type"))
         .min();
-    x.map(Datum::Numeric).unwrap_or(Datum::Null)
-}
 
-fn min_int16<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<i16> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_int16())
-        .min();
-    Datum::from(x)
-}
-
-fn min_int32<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<i32> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_int32())
-        .min();
-    Datum::from(x)
-}
-
-fn min_int64<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<i64> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_int64())
-        .min();
-    Datum::from(x)
-}
-
-fn min_float32<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<OrderedFloat<f32>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_ordered_float32())
-        .min();
-    Datum::from(x)
-}
-
-fn min_float64<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<OrderedFloat<f64>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_ordered_float64())
-        .min();
-    Datum::from(x)
-}
-
-fn min_bool<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<bool> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_bool())
-        .min();
-    Datum::from(x)
+    x.into()
 }
 
 fn min_string<'a, I>(datums: I) -> Datum<'a>
@@ -259,111 +112,28 @@ where
     match datums
         .into_iter()
         .filter(|d| !d.is_null())
-        .min_by(|a, b| a.unwrap_str().cmp(&b.unwrap_str()))
+        .min_by(|a, b| a.unwrap_str().cmp(b.unwrap_str()))
     {
         Some(datum) => datum,
         None => Datum::Null,
     }
 }
 
-fn min_date<'a, I>(datums: I) -> Datum<'a>
+fn sum_datum<'a, I, DatumType, ResultType>(datums: I) -> Datum<'a>
 where
     I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<NaiveDate> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_date())
-        .min();
-    Datum::from(x)
-}
-
-fn min_timestamp<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<NaiveDateTime> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_timestamp())
-        .min();
-    Datum::from(x)
-}
-
-fn min_timestamptz<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let x: Option<DateTime<Utc>> = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_timestamptz())
-        .min();
-    Datum::from(x)
-}
-
-fn sum_int16<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
+    DatumType: TryFrom<Datum<'a>>,
+    <DatumType as TryFrom<Datum<'a>>>::Error: std::fmt::Debug,
+    ResultType: From<DatumType> + Sum + Into<Datum<'a>>,
 {
     let mut datums = datums.into_iter().filter(|d| !d.is_null()).peekable();
     if datums.peek().is_none() {
         Datum::Null
     } else {
-        let x: i64 = datums.map(|d| i64::from(d.unwrap_int16())).sum();
-        Datum::from(x)
-    }
-}
-
-fn sum_int32<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let mut datums = datums.into_iter().filter(|d| !d.is_null()).peekable();
-    if datums.peek().is_none() {
-        Datum::Null
-    } else {
-        let x: i64 = datums.map(|d| i64::from(d.unwrap_int32())).sum();
-        Datum::from(x)
-    }
-}
-
-fn sum_int64<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let mut datums = datums.into_iter().filter(|d| !d.is_null()).peekable();
-    if datums.peek().is_none() {
-        Datum::Null
-    } else {
-        let x: i128 = datums.map(|d| i128::from(d.unwrap_int64())).sum();
-        Datum::from(x)
-    }
-}
-
-fn sum_float32<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let mut datums = datums.into_iter().filter(|d| !d.is_null()).peekable();
-    if datums.peek().is_none() {
-        Datum::Null
-    } else {
-        let x: f32 = datums.map(|d| d.unwrap_float32()).sum();
-        Datum::from(x)
-    }
-}
-
-fn sum_float64<'a, I>(datums: I) -> Datum<'a>
-where
-    I: IntoIterator<Item = Datum<'a>>,
-{
-    let mut datums = datums.into_iter().filter(|d| !d.is_null()).peekable();
-    if datums.peek().is_none() {
-        Datum::Null
-    } else {
-        let x: f64 = datums.map(|d| d.unwrap_float64()).sum();
-        Datum::from(x)
+        let x = datums
+            .map(|d| ResultType::from(DatumType::try_from(d).expect("unexpected type")))
+            .sum::<ResultType>();
+        x.into()
     }
 }
 
@@ -371,24 +141,28 @@ fn sum_numeric<'a, I>(datums: I) -> Datum<'a>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
-    let datums = datums
-        .into_iter()
-        .filter(|d| !d.is_null())
-        .map(|d| d.unwrap_numeric().0)
-        .collect::<Vec<_>>();
-    if datums.is_empty() {
-        Datum::Null
-    } else {
-        let mut cx = numeric::cx_datum();
-        let sum = cx.sum(datums.iter());
-        Datum::from(sum)
+    let mut cx = numeric::cx_datum();
+    let mut sum = Numeric::zero();
+    let mut empty = true;
+    for d in datums {
+        if !d.is_null() {
+            empty = false;
+            cx.add(&mut sum, &d.unwrap_numeric().0);
+        }
+    }
+    match empty {
+        true => Datum::Null,
+        false => Datum::from(sum),
     }
 }
 
+// TODO(benesch): remove potentially dangerous usage of `as`.
+#[allow(clippy::as_conversions)]
 fn count<'a, I>(datums: I) -> Datum<'a>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
+    // TODO(jkosh44) This should error when the count can't fit inside of an `i64` instead of returning a negative result.
     let x: i64 = datums.into_iter().filter(|d| !d.is_null()).count() as i64;
     Datum::from(x)
 }
@@ -423,7 +197,7 @@ fn string_agg<'a, I>(datums: I, temp_storage: &'a RowArena, order_by: &[ColumnOr
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
-    const EMPTY_SEP: &'static str = "";
+    const EMPTY_SEP: &str = "";
 
     let datums = order_aggregate_datums(datums, order_by);
     let mut sep_value_pairs = datums.into_iter().filter_map(|d| {
@@ -465,11 +239,7 @@ where
     })
 }
 
-fn jsonb_object_agg<'a, I>(
-    datums: I,
-    temp_storage: &'a RowArena,
-    order_by: &[ColumnOrder],
-) -> Datum<'a>
+fn dict_agg<'a, I>(datums: I, temp_storage: &'a RowArena, order_by: &[ColumnOrder]) -> Datum<'a>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
@@ -506,36 +276,94 @@ where
     })
 }
 
-// Assuming datums is a List, sort them by the 2nd through Nth elements
-// corresponding to order_by, then return the 1st element.
-fn order_aggregate_datums<'a, I>(
+/// Assuming datums is a List, sort them by the 2nd through Nth elements
+/// corresponding to order_by, then return the 1st element.
+///
+/// Near the usages of this function, we sometimes want to produce Datums with a shorter lifetime
+/// than 'a. We have to actually perform the shortening of the lifetime here, inside this function,
+/// because if we were to simply return `impl Iterator<Item = Datum<'a>>`, that wouldn't be
+/// covariant in the item type, because opaque types are always invariant. (Contrast this with how
+/// we perform the shortening _inside_ this function: the input of the `map` is known to
+/// specifically be `std::vec::IntoIter`, which is known to be covariant.)
+pub fn order_aggregate_datums<'a: 'b, 'b, I>(
     datums: I,
     order_by: &[ColumnOrder],
-) -> impl Iterator<Item = Datum<'a>>
+) -> impl Iterator<Item = Datum<'b>>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
-    let mut rows: Vec<(Datum, Row)> = datums
+    order_aggregate_datums_with_rank_inner(datums, order_by)
         .into_iter()
-        .filter_map(|d| {
+        // (`payload` is coerced here to `Datum<'b>` in the argument of the closure)
+        .map(|(payload, _order_datums)| payload)
+}
+
+/// Assuming datums is a List, sort them by the 2nd through Nth elements
+/// corresponding to order_by, then return the 1st element and computed order by expression.
+fn order_aggregate_datums_with_rank<'a, I>(
+    datums: I,
+    order_by: &[ColumnOrder],
+) -> impl Iterator<Item = (Datum<'a>, Row)>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    order_aggregate_datums_with_rank_inner(datums, order_by)
+        .into_iter()
+        .map(|(payload, order_by_datums)| (payload, Row::pack(order_by_datums)))
+}
+
+fn order_aggregate_datums_with_rank_inner<'a, I>(
+    datums: I,
+    order_by: &[ColumnOrder],
+) -> Vec<(Datum<'a>, Vec<Datum<'a>>)>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let mut decoded: Vec<(Datum, Vec<Datum>)> = datums
+        .into_iter()
+        .map(|d| {
             let list = d.unwrap_list();
-            let expr = list.iter().next().unwrap();
-            let order_row = Row::pack(list.iter().skip(1));
-            Some((expr, order_row))
+            let mut list_it = list.iter();
+            let payload = list_it.next().unwrap();
+
+            // We decode the order_by Datums here instead of the comparison function, because the
+            // comparison function is expected to be called `O(log n)` times on each input row.
+            // The only downside is that the decoded data might be bigger, but I think that's fine,
+            // because:
+            // - if we have a window partition so big that this would create a memory problem, then
+            //   the non-incrementalness of window functions will create a serious CPU problem
+            //   anyway,
+            // - and anyhow various other parts of the window function code already do decoding
+            //   upfront.
+            let mut order_by_datums = Vec::with_capacity(order_by.len());
+            for _ in 0..order_by.len() {
+                order_by_datums.push(
+                    list_it
+                        .next()
+                        .expect("must have exactly the same number of Datums as `order_by`"),
+                );
+            }
+
+            (payload, order_by_datums)
         })
         .collect();
 
-    let mut left_datum_vec = repr::DatumVec::new();
-    let mut right_datum_vec = repr::DatumVec::new();
-    let mut sort_by = |left: &(_, Row), right: &(_, Row)| {
-        let left = &left.1;
-        let right = &right.1;
-        let left_datums = left_datum_vec.borrow_with(left);
-        let right_datums = right_datum_vec.borrow_with(right);
-        compare_columns(&order_by, &left_datums, &right_datums, || left.cmp(&right))
-    };
-    rows.sort_by(&mut sort_by);
-    rows.into_iter().map(|(expr, _order_row)| expr)
+    let mut sort_by =
+        |(payload_left, left_order_by_datums): &(Datum, Vec<Datum>),
+         (payload_right, right_order_by_datums): &(Datum, Vec<Datum>)| {
+            compare_columns(
+                order_by,
+                left_order_by_datums,
+                right_order_by_datums,
+                || payload_left.cmp(payload_right),
+            )
+        };
+    // `sort_unstable_by` can be faster and uses less memory than `sort_by`. An unstable sort is
+    // enough here, because if two elements are equal in our `compare` function, then the elements
+    // are actually binary-equal (because of the `tiebreaker` given to `compare_columns`), so it
+    // doesn't matter what order they end up in.
+    decoded.sort_unstable_by(&mut sort_by);
+    decoded
 }
 
 fn array_concat<'a, I>(datums: I, temp_storage: &'a RowArena, order_by: &[ColumnOrder]) -> Datum<'a>
@@ -553,7 +381,7 @@ where
         length: datums.len(),
     };
     temp_storage.make_datum(|packer| {
-        packer.push_array(&[dims], datums).unwrap();
+        packer.try_push_array(&[dims], datums).unwrap();
     })
 }
 
@@ -567,33 +395,1418 @@ where
     })
 }
 
-fn row_number<'a, I>(datums: I, temp_storage: &'a RowArena, order_by: &[ColumnOrder]) -> Datum<'a>
+/// The expected input is in the format of `[((OriginalRow, [EncodedArgs]), OrderByExprs...)]`
+/// The output is in the format of `[result_value, original_row]`.
+/// See an example at `lag_lead`, where the input-output formats are similar.
+fn row_number<'a, I>(
+    datums: I,
+    callers_temp_storage: &'a RowArena,
+    order_by: &[ColumnOrder],
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    // We want to use our own temp_storage here, to avoid flooding `callers_temp_storage` with a
+    // large number of new datums. This is because we don't want to make an assumption about
+    // whether the caller creates a new temp_storage between window partitions.
+    let temp_storage = RowArena::new();
+    let datums = row_number_no_list(datums, &temp_storage, order_by);
+
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(datums);
+    })
+}
+
+/// Like `row_number`, but doesn't perform the final wrapping in a list, returning an Iterator
+/// instead.
+fn row_number_no_list<'a: 'b, 'b, I>(
+    datums: I,
+    callers_temp_storage: &'b RowArena,
+    order_by: &[ColumnOrder],
+) -> impl Iterator<Item = Datum<'b>>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
     let datums = order_aggregate_datums(datums, order_by);
-    let datums = datums
+
+    callers_temp_storage.reserve(datums.size_hint().0);
+    datums
         .into_iter()
         .map(|d| d.unwrap_list().iter())
         .flatten()
         .zip(1i64..)
         .map(|(d, i)| {
-            temp_storage.make_datum(|packer| {
-                packer.push_list(vec![Datum::Int64(i), d]);
+            callers_temp_storage.make_datum(|packer| {
+                packer.push_list_with(|packer| {
+                    packer.push(Datum::Int64(i));
+                    packer.push(d);
+                });
             })
-        });
+        })
+}
 
-    temp_storage.make_datum(|packer| {
+/// The expected input is in the format of `[((OriginalRow, [EncodedArgs]), OrderByExprs...)]`
+/// The output is in the format of `[result_value, original_row]`.
+/// See an example at `lag_lead`, where the input-output formats are similar.
+fn rank<'a, I>(datums: I, callers_temp_storage: &'a RowArena, order_by: &[ColumnOrder]) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let temp_storage = RowArena::new();
+    let datums = rank_no_list(datums, &temp_storage, order_by);
+
+    callers_temp_storage.make_datum(|packer| {
         packer.push_list(datums);
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzEnumReflect)]
+/// Like `rank`, but doesn't perform the final wrapping in a list, returning an Iterator
+/// instead.
+fn rank_no_list<'a: 'b, 'b, I>(
+    datums: I,
+    callers_temp_storage: &'b RowArena,
+    order_by: &[ColumnOrder],
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    // Keep the row used for ordering around, as it is used to determine the rank
+    let datums = order_aggregate_datums_with_rank(datums, order_by);
+
+    let mut datums = datums
+        .into_iter()
+        .map(|(d0, order_row)| {
+            d0.unwrap_list()
+                .iter()
+                .map(move |d1| (d1, order_row.clone()))
+        })
+        .flatten();
+
+    callers_temp_storage.reserve(datums.size_hint().0);
+    datums
+        .next()
+        .map_or(vec![], |(first_datum, first_order_row)| {
+            // Folding with (last order_by row, last assigned rank, row number, output vec)
+            datums.fold((first_order_row, 1, 1, vec![(first_datum, 1)]), |mut acc, (next_datum, next_order_row)| {
+                let (ref mut acc_row, ref mut acc_rank, ref mut acc_row_num, ref mut output) = acc;
+                *acc_row_num += 1;
+                // Identity is based on the order_by expression
+                if *acc_row != next_order_row {
+                    *acc_rank = *acc_row_num;
+                    *acc_row = next_order_row;
+                }
+
+                (*output).push((next_datum, *acc_rank));
+                acc
+            })
+        }.3).into_iter().map(|(d, i)| {
+        callers_temp_storage.make_datum(|packer| {
+            packer.push_list_with(|packer| {
+                packer.push(Datum::Int64(i));
+                packer.push(d);
+            });
+        })
+    })
+}
+
+/// The expected input is in the format of `[((OriginalRow, [EncodedArgs]), OrderByExprs...)]`
+/// The output is in the format of `[result_value, original_row]`.
+/// See an example at `lag_lead`, where the input-output formats are similar.
+fn dense_rank<'a, I>(
+    datums: I,
+    callers_temp_storage: &'a RowArena,
+    order_by: &[ColumnOrder],
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let temp_storage = RowArena::new();
+    let datums = dense_rank_no_list(datums, &temp_storage, order_by);
+
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(datums);
+    })
+}
+
+/// Like `dense_rank`, but doesn't perform the final wrapping in a list, returning an Iterator
+/// instead.
+fn dense_rank_no_list<'a: 'b, 'b, I>(
+    datums: I,
+    callers_temp_storage: &'b RowArena,
+    order_by: &[ColumnOrder],
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    // Keep the row used for ordering around, as it is used to determine the rank
+    let datums = order_aggregate_datums_with_rank(datums, order_by);
+
+    let mut datums = datums
+        .into_iter()
+        .map(|(d0, order_row)| {
+            d0.unwrap_list()
+                .iter()
+                .map(move |d1| (d1, order_row.clone()))
+        })
+        .flatten();
+
+    callers_temp_storage.reserve(datums.size_hint().0);
+    datums
+        .next()
+        .map_or(vec![], |(first_datum, first_order_row)| {
+            // Folding with (last order_by row, last assigned rank, output vec)
+            datums.fold((first_order_row, 1, vec![(first_datum, 1)]), |mut acc, (next_datum, next_order_row)| {
+                let (ref mut acc_row, ref mut acc_rank, ref mut output) = acc;
+                // Identity is based on the order_by expression
+                if *acc_row != next_order_row {
+                    *acc_rank += 1;
+                    *acc_row = next_order_row;
+                }
+
+                (*output).push((next_datum, *acc_rank));
+                acc
+            })
+        }.2).into_iter().map(|(d, i)| {
+        callers_temp_storage.make_datum(|packer| {
+            packer.push_list_with(|packer| {
+                packer.push(Datum::Int64(i));
+                packer.push(d);
+            });
+        })
+    })
+}
+
+/// The expected input is in the format of `[((OriginalRow, EncodedArgs), OrderByExprs...)]`
+/// For example,
+///
+/// lag(x*y, 1, null) over (partition by x+y order by x-y, x/y)
+///
+/// list of:
+/// row(
+///   row(
+///     row(#0, #1),
+///     row((#0 * #1), 1, null)
+///   ),
+///   (#0 - #1),
+///   (#0 / #1)
+/// )
+///
+/// The output is in the format of `[result_value, original_row]`, e.g.
+/// list of:
+/// row(
+///   42,
+///   row(7, 8)
+/// )
+fn lag_lead<'a, I>(
+    datums: I,
+    callers_temp_storage: &'a RowArena,
+    order_by: &[ColumnOrder],
+    lag_lead_type: &LagLeadType,
+    ignore_nulls: &bool,
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let temp_storage = RowArena::new();
+    let iter = lag_lead_no_list(datums, &temp_storage, order_by, lag_lead_type, ignore_nulls);
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(iter);
+    })
+}
+
+/// Like `lag_lead`, but doesn't perform the final wrapping in a list, returning an Iterator
+/// instead.
+fn lag_lead_no_list<'a: 'b, 'b, I>(
+    datums: I,
+    callers_temp_storage: &'b RowArena,
+    order_by: &[ColumnOrder],
+    lag_lead_type: &LagLeadType,
+    ignore_nulls: &bool,
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    // Sort the datums according to the ORDER BY expressions and return the (OriginalRow, EncodedArgs) record
+    let datums = order_aggregate_datums(datums, order_by);
+
+    // Take the (OriginalRow, EncodedArgs) records and unwrap them into separate datums.
+    // EncodedArgs = (InputValue, Offset, DefaultValue) for Lag/Lead
+    // (`OriginalRow` is kept in a record form, as we don't need to look inside that.)
+    let (orig_rows, unwrapped_args): (Vec<_>, Vec<_>) = datums
+        .into_iter()
+        .map(|d| {
+            let mut iter = d.unwrap_list().iter();
+            let original_row = iter.next().unwrap();
+            let (input_value, offset, default_value) =
+                unwrap_lag_lead_encoded_args(iter.next().unwrap());
+            (original_row, (input_value, offset, default_value))
+        })
+        .unzip();
+
+    let result = lag_lead_inner(unwrapped_args, lag_lead_type, ignore_nulls);
+
+    callers_temp_storage.reserve(result.len());
+    result
+        .into_iter()
+        .zip_eq(orig_rows)
+        .map(|(result_value, original_row)| {
+            callers_temp_storage.make_datum(|packer| {
+                packer.push_list_with(|packer| {
+                    packer.push(result_value);
+                    packer.push(original_row);
+                });
+            })
+        })
+}
+
+/// lag/lead's arguments are in a record. This function unwraps this record.
+fn unwrap_lag_lead_encoded_args(encoded_args: Datum) -> (Datum, Datum, Datum) {
+    let mut encoded_args_iter = encoded_args.unwrap_list().iter();
+    let (input_value, offset, default_value) = (
+        encoded_args_iter.next().unwrap(),
+        encoded_args_iter.next().unwrap(),
+        encoded_args_iter.next().unwrap(),
+    );
+    (input_value, offset, default_value)
+}
+
+/// Each element of `args` has the 3 arguments evaluated for a single input row.
+/// Returns the results for each input row.
+fn lag_lead_inner<'a>(
+    args: Vec<(Datum<'a>, Datum<'a>, Datum<'a>)>,
+    lag_lead_type: &LagLeadType,
+    ignore_nulls: &bool,
+) -> Vec<Datum<'a>> {
+    if *ignore_nulls {
+        lag_lead_inner_ignore_nulls(args, lag_lead_type)
+    } else {
+        lag_lead_inner_respect_nulls(args, lag_lead_type)
+    }
+}
+
+fn lag_lead_inner_respect_nulls<'a>(
+    args: Vec<(Datum<'a>, Datum<'a>, Datum<'a>)>,
+    lag_lead_type: &LagLeadType,
+) -> Vec<Datum<'a>> {
+    let mut result: Vec<Datum> = Vec::with_capacity(args.len());
+    for (idx, (_, offset, default_value)) in args.iter().enumerate() {
+        // Null offsets are acceptable, and always return null
+        if offset.is_null() {
+            result.push(Datum::Null);
+            continue;
+        }
+
+        let idx = i64::try_from(idx).expect("Array index does not fit in i64");
+        let offset = i64::from(offset.unwrap_int32());
+        let offset = match lag_lead_type {
+            LagLeadType::Lag => -offset,
+            LagLeadType::Lead => offset,
+        };
+
+        // Get a Datum from `datums`. Return None if index is out of range.
+        let datums_get = |i: i64| -> Option<Datum> {
+            match u64::try_from(i) {
+                Ok(i) => args
+                    .get(usize::cast_from(i))
+                    .map(|d| Some(d.0)) // succeeded in getting a Datum from the vec
+                    .unwrap_or(None), // overindexing
+                Err(_) => None, // underindexing (negative index)
+            }
+        };
+
+        let lagged_value = datums_get(idx + offset).unwrap_or(*default_value);
+
+        result.push(lagged_value);
+    }
+
+    result
+}
+
+// `i64` indexes get involved in this function because it's convenient to allow negative indexes and
+// have `datums_get` fail on them, and thus handle the beginning and end of the input vector
+// uniformly, rather than checking underflow separately during index manipulations.
+#[allow(clippy::as_conversions)]
+fn lag_lead_inner_ignore_nulls<'a>(
+    args: Vec<(Datum<'a>, Datum<'a>, Datum<'a>)>,
+    lag_lead_type: &LagLeadType,
+) -> Vec<Datum<'a>> {
+    // We check here once that even the largest index fits in `i64`, and then do silent `as`
+    // conversions from `usize` indexes to `i64` indexes throughout this function.
+    if i64::try_from(args.len()).is_err() {
+        panic!("window partition way too big")
+    }
+    // Preparation: Make sure we can jump over a run of nulls in constant time, i.e., regardless of
+    // how many nulls the run has. The following skip tables will point to the next non-null index.
+    let mut skip_nulls_backward = vec![None; args.len()];
+    let mut last_non_null: i64 = -1;
+    let pairs = args
+        .iter()
+        .enumerate()
+        .zip_eq(skip_nulls_backward.iter_mut());
+    for ((i, (d, _, _)), slot) in pairs {
+        if d.is_null() {
+            *slot = Some(last_non_null);
+        } else {
+            last_non_null = i as i64;
+        }
+    }
+    let mut skip_nulls_forward = vec![None; args.len()];
+    let mut last_non_null: i64 = args.len() as i64;
+    let pairs = args
+        .iter()
+        .enumerate()
+        .rev()
+        .zip_eq(skip_nulls_forward.iter_mut().rev());
+    for ((i, (d, _, _)), slot) in pairs {
+        if d.is_null() {
+            *slot = Some(last_non_null);
+        } else {
+            last_non_null = i as i64;
+        }
+    }
+
+    // The actual computation.
+    let mut result: Vec<Datum> = Vec::with_capacity(args.len());
+    for (idx, (_, offset, default_value)) in args.iter().enumerate() {
+        // Null offsets are acceptable, and always return null
+        if offset.is_null() {
+            result.push(Datum::Null);
+            continue;
+        }
+
+        let idx = idx as i64; // checked at the beginning of the function that len() fits
+        let offset = i64::cast_from(offset.unwrap_int32());
+        let offset = match lag_lead_type {
+            LagLeadType::Lag => -offset,
+            LagLeadType::Lead => offset,
+        };
+        let increment = offset.signum();
+
+        // Get a Datum from `datums`. Return None if index is out of range.
+        let datums_get = |i: i64| -> Option<Datum> {
+            match u64::try_from(i) {
+                Ok(i) => args
+                    .get(usize::cast_from(i))
+                    .map(|d| Some(d.0)) // succeeded in getting a Datum from the vec
+                    .unwrap_or(None), // overindexing
+                Err(_) => None, // underindexing (negative index)
+            }
+        };
+
+        let lagged_value = if increment != 0 {
+            // We start j from idx, and step j until we have seen an abs(offset) number of non-null
+            // values or reach the beginning or end of the partition.
+            //
+            // If offset is big, then this is slow: Considering the entire function, it's
+            // `O(partition_size * offset)`.
+            // However, a common use case is an offset of 1, for which this doesn't matter.
+            // TODO: For larger offsets, we could have a completely different implementation
+            // that starts the inner loop from the index where we found the previous result:
+            // https://github.com/MaterializeInc/materialize/pull/29287#discussion_r1738695174
+            let mut j = idx;
+            for _ in 0..num::abs(offset) {
+                j += increment;
+                // Jump over a run of nulls
+                if datums_get(j).is_some_and(|d| d.is_null()) {
+                    let ju = j as usize; // `j >= 0` because of the above `is_some_and`
+                    if increment > 0 {
+                        j = skip_nulls_forward[ju].expect("checked above that it's null");
+                    } else {
+                        j = skip_nulls_backward[ju].expect("checked above that it's null");
+                    }
+                }
+                if datums_get(j).is_none() {
+                    break;
+                }
+            }
+            match datums_get(j) {
+                Some(datum) => datum,
+                None => *default_value,
+            }
+        } else {
+            assert_eq!(offset, 0);
+            let datum = datums_get(idx).expect("known to exist");
+            if !datum.is_null() {
+                datum
+            } else {
+                // I can imagine returning here either `default_value` or `null`.
+                // (I'm leaning towards `default_value`.)
+                // We used to run into an infinite loop in this case, so panicking is
+                // better. Started a SQL Council thread:
+                // https://materializeinc.slack.com/archives/C063H5S7NKE/p1724962369706729
+                panic!("0 offset in lag/lead IGNORE NULLS");
+            }
+        };
+
+        result.push(lagged_value);
+    }
+
+    result
+}
+
+/// The expected input is in the format of [((OriginalRow, InputValue), OrderByExprs...)]
+fn first_value<'a, I>(
+    datums: I,
+    callers_temp_storage: &'a RowArena,
+    order_by: &[ColumnOrder],
+    window_frame: &WindowFrame,
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let temp_storage = RowArena::new();
+    let iter = first_value_no_list(datums, &temp_storage, order_by, window_frame);
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(iter);
+    })
+}
+
+/// Like `first_value`, but doesn't perform the final wrapping in a list, returning an Iterator
+/// instead.
+fn first_value_no_list<'a: 'b, 'b, I>(
+    datums: I,
+    callers_temp_storage: &'b RowArena,
+    order_by: &[ColumnOrder],
+    window_frame: &WindowFrame,
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    // Sort the datums according to the ORDER BY expressions and return the (OriginalRow, InputValue) record
+    let datums = order_aggregate_datums(datums, order_by);
+
+    // Decode the input (OriginalRow, InputValue) into separate datums
+    let (orig_rows, args): (Vec<_>, Vec<_>) = datums
+        .into_iter()
+        .map(|d| {
+            let mut iter = d.unwrap_list().iter();
+            let original_row = iter.next().unwrap();
+            let arg = iter.next().unwrap();
+
+            (original_row, arg)
+        })
+        .unzip();
+
+    let results = first_value_inner(args, window_frame);
+
+    callers_temp_storage.reserve(results.len());
+    results
+        .into_iter()
+        .zip_eq(orig_rows)
+        .map(|(result_value, original_row)| {
+            callers_temp_storage.make_datum(|packer| {
+                packer.push_list_with(|packer| {
+                    packer.push(result_value);
+                    packer.push(original_row);
+                });
+            })
+        })
+}
+
+fn first_value_inner<'a>(datums: Vec<Datum<'a>>, window_frame: &WindowFrame) -> Vec<Datum<'a>> {
+    let length = datums.len();
+    let mut result: Vec<Datum> = Vec::with_capacity(length);
+    for (idx, current_datum) in datums.iter().enumerate() {
+        let first_value = match &window_frame.start_bound {
+            // Always return the current value
+            WindowFrameBound::CurrentRow => *current_datum,
+            WindowFrameBound::UnboundedPreceding => {
+                if let WindowFrameBound::OffsetPreceding(end_offset) = &window_frame.end_bound {
+                    let end_offset = usize::cast_from(*end_offset);
+
+                    // If the frame ends before the first row, return null
+                    if idx < end_offset {
+                        Datum::Null
+                    } else {
+                        datums[0]
+                    }
+                } else {
+                    datums[0]
+                }
+            }
+            WindowFrameBound::OffsetPreceding(offset) => {
+                let start_offset = usize::cast_from(*offset);
+                let start_idx = idx.saturating_sub(start_offset);
+                if let WindowFrameBound::OffsetPreceding(end_offset) = &window_frame.end_bound {
+                    let end_offset = usize::cast_from(*end_offset);
+
+                    // If the frame is empty or ends before the first row, return null
+                    if start_offset < end_offset || idx < end_offset {
+                        Datum::Null
+                    } else {
+                        datums[start_idx]
+                    }
+                } else {
+                    datums[start_idx]
+                }
+            }
+            WindowFrameBound::OffsetFollowing(offset) => {
+                let start_offset = usize::cast_from(*offset);
+                let start_idx = idx.saturating_add(start_offset);
+                if let WindowFrameBound::OffsetFollowing(end_offset) = &window_frame.end_bound {
+                    // If the frame is empty or starts after the last row, return null
+                    if offset > end_offset || start_idx >= length {
+                        Datum::Null
+                    } else {
+                        datums[start_idx]
+                    }
+                } else {
+                    datums
+                        .get(start_idx)
+                        .map(|d| d.clone())
+                        .unwrap_or(Datum::Null)
+                }
+            }
+            // Forbidden during planning
+            WindowFrameBound::UnboundedFollowing => unreachable!(),
+        };
+        result.push(first_value);
+    }
+    result
+}
+
+/// The expected input is in the format of [((OriginalRow, InputValue), OrderByExprs...)]
+fn last_value<'a, I>(
+    datums: I,
+    callers_temp_storage: &'a RowArena,
+    order_by: &[ColumnOrder],
+    window_frame: &WindowFrame,
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let temp_storage = RowArena::new();
+    let iter = last_value_no_list(datums, &temp_storage, order_by, window_frame);
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(iter);
+    })
+}
+
+/// Like `last_value`, but doesn't perform the final wrapping in a list, returning an Iterator
+/// instead.
+fn last_value_no_list<'a: 'b, 'b, I>(
+    datums: I,
+    callers_temp_storage: &'b RowArena,
+    order_by: &[ColumnOrder],
+    window_frame: &WindowFrame,
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    // Sort the datums according to the ORDER BY expressions and return the ((OriginalRow, InputValue), OrderByRow) record
+    // The OrderByRow is kept around because it is required to compute the peer groups in RANGE mode
+    let datums = order_aggregate_datums_with_rank(datums, order_by);
+
+    // Decode the input (OriginalRow, InputValue) into separate datums, while keeping the OrderByRow
+    let size_hint = datums.size_hint().0;
+    let mut args = Vec::with_capacity(size_hint);
+    let mut original_rows = Vec::with_capacity(size_hint);
+    let mut order_by_rows = Vec::with_capacity(size_hint);
+    for (d, order_by_row) in datums.into_iter() {
+        let mut iter = d.unwrap_list().iter();
+        let original_row = iter.next().unwrap();
+        let arg = iter.next().unwrap();
+        order_by_rows.push(order_by_row);
+        original_rows.push(original_row);
+        args.push(arg);
+    }
+
+    let results = last_value_inner(args, &order_by_rows, window_frame);
+
+    callers_temp_storage.reserve(results.len());
+    results
+        .into_iter()
+        .zip_eq(original_rows)
+        .map(|(result_value, original_row)| {
+            callers_temp_storage.make_datum(|packer| {
+                packer.push_list_with(|packer| {
+                    packer.push(result_value);
+                    packer.push(original_row);
+                });
+            })
+        })
+}
+
+fn last_value_inner<'a>(
+    args: Vec<Datum<'a>>,
+    order_by_rows: &Vec<Row>,
+    window_frame: &WindowFrame,
+) -> Vec<Datum<'a>> {
+    let length = args.len();
+    let mut results: Vec<Datum> = Vec::with_capacity(length);
+    for (idx, (current_datum, order_by_row)) in args.iter().zip_eq(order_by_rows).enumerate() {
+        let last_value = match &window_frame.end_bound {
+            WindowFrameBound::CurrentRow => match &window_frame.units {
+                // Always return the current value when in ROWS mode
+                WindowFrameUnits::Rows => *current_datum,
+                WindowFrameUnits::Range => {
+                    // When in RANGE mode, return the last value of the peer group
+                    // The peer group is the group of rows with the same ORDER BY value
+                    // Note: Range is only supported for the default window frame (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                    // which is why it does not appear in the other branches
+                    let target_idx = order_by_rows[idx..]
+                        .iter()
+                        .enumerate()
+                        .take_while(|(_, row)| *row == order_by_row)
+                        .last()
+                        .unwrap()
+                        .0
+                        + idx;
+                    args[target_idx]
+                }
+                // GROUPS is not supported, and forbidden during planning
+                WindowFrameUnits::Groups => unreachable!(),
+            },
+            WindowFrameBound::UnboundedFollowing => {
+                if let WindowFrameBound::OffsetFollowing(start_offset) = &window_frame.start_bound {
+                    let start_offset = usize::cast_from(*start_offset);
+
+                    // If the frame starts after the last row of the window, return null
+                    if idx + start_offset > length - 1 {
+                        Datum::Null
+                    } else {
+                        args[length - 1]
+                    }
+                } else {
+                    args[length - 1]
+                }
+            }
+            WindowFrameBound::OffsetFollowing(offset) => {
+                let end_offset = usize::cast_from(*offset);
+                let end_idx = idx.saturating_add(end_offset);
+                if let WindowFrameBound::OffsetFollowing(start_offset) = &window_frame.start_bound {
+                    let start_offset = usize::cast_from(*start_offset);
+                    let start_idx = idx.saturating_add(start_offset);
+
+                    // If the frame is empty or starts after the last row of the window, return null
+                    if end_offset < start_offset || start_idx >= length {
+                        Datum::Null
+                    } else {
+                        // Return the last valid element in the window
+                        args.get(end_idx).unwrap_or(&args[length - 1]).clone()
+                    }
+                } else {
+                    args.get(end_idx).unwrap_or(&args[length - 1]).clone()
+                }
+            }
+            WindowFrameBound::OffsetPreceding(offset) => {
+                let end_offset = usize::cast_from(*offset);
+                let end_idx = idx.saturating_sub(end_offset);
+                if idx < end_offset {
+                    // If the frame ends before the first row, return null
+                    Datum::Null
+                } else if let WindowFrameBound::OffsetPreceding(start_offset) =
+                    &window_frame.start_bound
+                {
+                    // If the frame is empty, return null
+                    if offset > start_offset {
+                        Datum::Null
+                    } else {
+                        args[end_idx]
+                    }
+                } else {
+                    args[end_idx]
+                }
+            }
+            // Forbidden during planning
+            WindowFrameBound::UnboundedPreceding => unreachable!(),
+        };
+        results.push(last_value);
+    }
+    results
+}
+
+/// Executes `FusedValueWindowFunc` on a reduction group.
+/// The expected input is in the format of `[((OriginalRow, (Args1, Args2, ...)), OrderByExprs...)]`
+/// where `Args1`, `Args2`, are the arguments of each of the fused functions. For functions that
+/// have only a single argument (first_value/last_value), these are simple values. For functions
+/// that have multiple arguments (lag/lead), these are also records.
+fn fused_value_window_func<'a, I>(
+    input_datums: I,
+    callers_temp_storage: &'a RowArena,
+    funcs: &Vec<AggregateFunc>,
+    order_by: &Vec<ColumnOrder>,
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let temp_storage = RowArena::new();
+    let iter = fused_value_window_func_no_list(input_datums, &temp_storage, funcs, order_by);
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(iter);
+    })
+}
+
+/// Like `fused_value_window_func`, but doesn't perform the final wrapping in a list, returning an
+/// Iterator instead.
+fn fused_value_window_func_no_list<'a: 'b, 'b, I>(
+    input_datums: I,
+    callers_temp_storage: &'b RowArena,
+    funcs: &Vec<AggregateFunc>,
+    order_by: &Vec<ColumnOrder>,
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    let has_last_value = funcs
+        .iter()
+        .any(|f| matches!(f, AggregateFunc::LastValue { .. }));
+
+    let input_datums_with_ranks = order_aggregate_datums_with_rank(input_datums, order_by);
+
+    let size_hint = input_datums_with_ranks.size_hint().0;
+    let mut encoded_argsss = vec![Vec::with_capacity(size_hint); funcs.len()];
+    let mut original_rows = Vec::with_capacity(size_hint);
+    let mut order_by_rows = Vec::with_capacity(size_hint);
+    for (d, order_by_row) in input_datums_with_ranks {
+        let mut iter = d.unwrap_list().iter();
+        let original_row = iter.next().unwrap();
+        original_rows.push(original_row);
+        let mut argss_iter = iter.next().unwrap().unwrap_list().iter();
+        for i in 0..funcs.len() {
+            let encoded_args = argss_iter.next().unwrap();
+            encoded_argsss[i].push(encoded_args);
+        }
+        if has_last_value {
+            order_by_rows.push(order_by_row);
+        }
+    }
+
+    let mut results_per_row = vec![Vec::with_capacity(funcs.len()); original_rows.len()];
+    for (func, encoded_argss) in funcs.iter().zip_eq(encoded_argsss) {
+        let results = match func {
+            AggregateFunc::LagLead {
+                order_by: inner_order_by,
+                lag_lead,
+                ignore_nulls,
+            } => {
+                assert_eq!(order_by, inner_order_by);
+                let unwrapped_argss = encoded_argss
+                    .into_iter()
+                    .map(|encoded_args| unwrap_lag_lead_encoded_args(encoded_args))
+                    .collect();
+                lag_lead_inner(unwrapped_argss, lag_lead, ignore_nulls)
+            }
+            AggregateFunc::FirstValue {
+                order_by: inner_order_by,
+                window_frame,
+            } => {
+                assert_eq!(order_by, inner_order_by);
+                // (No unwrapping to do on the args here, because there is only 1 arg, so it's not
+                // wrapped into a record.)
+                first_value_inner(encoded_argss, window_frame)
+            }
+            AggregateFunc::LastValue {
+                order_by: inner_order_by,
+                window_frame,
+            } => {
+                assert_eq!(order_by, inner_order_by);
+                // (No unwrapping to do on the args here, because there is only 1 arg, so it's not
+                // wrapped into a record.)
+                last_value_inner(encoded_argss, &order_by_rows, window_frame)
+            }
+            _ => panic!("unknown window function in FusedValueWindowFunc"),
+        };
+        for (results, result) in results_per_row.iter_mut().zip_eq(results) {
+            results.push(result);
+        }
+    }
+
+    callers_temp_storage.reserve(2 * original_rows.len());
+    results_per_row
+        .into_iter()
+        .enumerate()
+        .map(move |(i, results)| {
+            callers_temp_storage.make_datum(|packer| {
+                packer.push_list_with(|packer| {
+                    packer
+                        .push(callers_temp_storage.make_datum(|packer| packer.push_list(results)));
+                    packer.push(original_rows[i]);
+                });
+            })
+        })
+}
+
+/// `input_datums` is an entire window partition.
+/// The expected input is in the format of `[((OriginalRow, InputValue), OrderByExprs...)]`
+/// See also in the comment in `window_func_applied_to`.
+///
+/// `wrapped_aggregate`: e.g., for `sum(...) OVER (...)`, this is the `sum(...)`.
+///
+/// Note that this `order_by` doesn't have expressions, only `ColumnOrder`s. For an explanation,
+/// see the comment on `WindowExprType`.
+fn window_aggr<'a, I, A>(
+    input_datums: I,
+    callers_temp_storage: &'a RowArena,
+    wrapped_aggregate: &AggregateFunc,
+    order_by: &[ColumnOrder],
+    window_frame: &WindowFrame,
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+    A: OneByOneAggr,
+{
+    let temp_storage = RowArena::new();
+    let iter = window_aggr_no_list::<I, A>(
+        input_datums,
+        &temp_storage,
+        wrapped_aggregate,
+        order_by,
+        window_frame,
+    );
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(iter);
+    })
+}
+
+/// Like `window_aggr`, but doesn't perform the final wrapping in a list, returning an Iterator
+/// instead.
+fn window_aggr_no_list<'a: 'b, 'b, I, A>(
+    input_datums: I,
+    callers_temp_storage: &'b RowArena,
+    wrapped_aggregate: &AggregateFunc,
+    order_by: &[ColumnOrder],
+    window_frame: &WindowFrame,
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+    A: OneByOneAggr,
+{
+    // Sort the datums according to the ORDER BY expressions and return the ((OriginalRow, InputValue), OrderByRow) record
+    // The OrderByRow is kept around because it is required to compute the peer groups in RANGE mode
+    let datums = order_aggregate_datums_with_rank(input_datums, order_by);
+
+    // Decode the input (OriginalRow, InputValue) into separate datums, while keeping the OrderByRow
+    let size_hint = datums.size_hint().0;
+    let mut args: Vec<Datum> = Vec::with_capacity(size_hint);
+    let mut original_rows: Vec<Datum> = Vec::with_capacity(size_hint);
+    let mut order_by_rows = Vec::with_capacity(size_hint);
+    for (d, order_by_row) in datums.into_iter() {
+        let mut iter = d.unwrap_list().iter();
+        let original_row = iter.next().unwrap();
+        let arg = iter.next().unwrap();
+        order_by_rows.push(order_by_row);
+        original_rows.push(original_row);
+        args.push(arg);
+    }
+
+    let results = window_aggr_inner::<A>(
+        args,
+        &order_by_rows,
+        wrapped_aggregate,
+        order_by,
+        window_frame,
+        callers_temp_storage,
+    );
+
+    callers_temp_storage.reserve(results.len());
+    results
+        .into_iter()
+        .zip_eq(original_rows)
+        .map(|(result_value, original_row)| {
+            callers_temp_storage.make_datum(|packer| {
+                packer.push_list_with(|packer| {
+                    packer.push(result_value);
+                    packer.push(original_row);
+                });
+            })
+        })
+}
+
+fn window_aggr_inner<'a, A>(
+    mut args: Vec<Datum<'a>>,
+    order_by_rows: &Vec<Row>,
+    wrapped_aggregate: &AggregateFunc,
+    order_by: &[ColumnOrder],
+    window_frame: &WindowFrame,
+    temp_storage: &'a RowArena,
+) -> Vec<Datum<'a>>
+where
+    A: OneByOneAggr,
+{
+    let length = args.len();
+    let mut result: Vec<Datum> = Vec::with_capacity(length);
+
+    // In this degenerate case, all results would be `wrapped_aggregate.default()` (usually null).
+    // However, this currently can't happen, because
+    // - Groups frame mode is currently not supported;
+    // - Range frame mode is currently supported only for the default frame, which includes the
+    //   current row.
+    soft_assert_or_log!(
+        !((matches!(window_frame.units, WindowFrameUnits::Groups)
+            || matches!(window_frame.units, WindowFrameUnits::Range))
+            && !window_frame.includes_current_row()),
+        "window frame without current row"
+    );
+
+    if (matches!(
+        window_frame.start_bound,
+        WindowFrameBound::UnboundedPreceding
+    ) && matches!(window_frame.end_bound, WindowFrameBound::UnboundedFollowing))
+        || (order_by.is_empty()
+            && (matches!(window_frame.units, WindowFrameUnits::Groups)
+                || matches!(window_frame.units, WindowFrameUnits::Range))
+            && window_frame.includes_current_row())
+    {
+        // Either
+        //  - UNBOUNDED frame in both directions, or
+        //  - There is no ORDER BY and the frame is such that the current peer group is included.
+        //    (The current peer group will be the whole partition if there is no ORDER BY.)
+        // We simply need to compute the aggregate once, on the entire partition, and each input
+        // row will get this one aggregate value as result.
+        let result_value = wrapped_aggregate.eval(args, temp_storage);
+        // Every row will get the above aggregate as result.
+        for _ in 0..length {
+            result.push(result_value);
+        }
+    } else {
+        fn rows_between_unbounded_preceding_and_current_row<'a, A>(
+            args: Vec<Datum<'a>>,
+            result: &mut Vec<Datum<'a>>,
+            mut one_by_one_aggr: A,
+            temp_storage: &'a RowArena,
+        ) where
+            A: OneByOneAggr,
+        {
+            for current_arg in args.into_iter() {
+                one_by_one_aggr.give(&current_arg);
+                let result_value = one_by_one_aggr.get_current_aggregate(temp_storage);
+                result.push(result_value);
+            }
+        }
+
+        fn groups_between_unbounded_preceding_and_current_row<'a, A>(
+            args: Vec<Datum<'a>>,
+            order_by_rows: &Vec<Row>,
+            result: &mut Vec<Datum<'a>>,
+            mut one_by_one_aggr: A,
+            temp_storage: &'a RowArena,
+        ) where
+            A: OneByOneAggr,
+        {
+            let mut peer_group_start = 0;
+            while peer_group_start < args.len() {
+                // Find the boundaries of the current peer group.
+                // peer_group_start will point to the first element of the peer group,
+                // peer_group_end will point to _just after_ the last element of the peer group.
+                let mut peer_group_end = peer_group_start + 1;
+                while peer_group_end < args.len()
+                    && order_by_rows[peer_group_start] == order_by_rows[peer_group_end]
+                {
+                    // The peer group goes on while the OrderByRows not differ.
+                    peer_group_end += 1;
+                }
+                // Let's compute the aggregate (which will be the same for all records in this
+                // peer group).
+                for current_arg in args[peer_group_start..peer_group_end].iter() {
+                    one_by_one_aggr.give(current_arg);
+                }
+                let agg_for_peer_group = one_by_one_aggr.get_current_aggregate(temp_storage);
+                // Put the above aggregate into each record in the peer group.
+                for _ in args[peer_group_start..peer_group_end].iter() {
+                    result.push(agg_for_peer_group);
+                }
+                // Point to the start of the next peer group.
+                peer_group_start = peer_group_end;
+            }
+        }
+
+        fn rows_between_offset_and_offset<'a>(
+            args: Vec<Datum<'a>>,
+            result: &mut Vec<Datum<'a>>,
+            wrapped_aggregate: &AggregateFunc,
+            temp_storage: &'a RowArena,
+            offset_start: i64,
+            offset_end: i64,
+        ) {
+            let len = args
+                .len()
+                .to_i64()
+                .expect("window partition's len should fit into i64");
+            for i in 0..len {
+                let i = i.to_i64().expect("window partition shouldn't be super big");
+                // Trim the start of the frame to make it not reach over the start of the window
+                // partition.
+                let frame_start = max(i + offset_start, 0)
+                    .to_usize()
+                    .expect("The max made sure it's not negative");
+                // Trim the end of the frame to make it not reach over the end of the window
+                // partition.
+                let frame_end = min(i + offset_end, len - 1).to_usize();
+                match frame_end {
+                    Some(frame_end) => {
+                        if frame_start <= frame_end {
+                            // Compute the aggregate on the frame.
+                            // TODO:
+                            // This implementation is quite slow if the frame is large: we do an
+                            // inner loop over the entire frame, and compute the aggregate from
+                            // scratch. We could do better:
+                            //  - For invertible aggregations we could do a rolling aggregation.
+                            //  - There are various tricks for min/max as well, making use of either
+                            //    the fixed size of the window, or that we are not retracting
+                            //    arbitrary elements but doing queue operations. E.g., see
+                            //    http://codercareer.blogspot.com/2012/02/no-33-maximums-in-sliding-windows.html
+                            let frame_values = args[frame_start..=frame_end].iter().cloned();
+                            let result_value = wrapped_aggregate.eval(frame_values, temp_storage);
+                            result.push(result_value);
+                        } else {
+                            // frame_start > frame_end, so this is an empty frame.
+                            let result_value = wrapped_aggregate.default();
+                            result.push(result_value);
+                        }
+                    }
+                    None => {
+                        // frame_end would be negative, so this is an empty frame.
+                        let result_value = wrapped_aggregate.default();
+                        result.push(result_value);
+                    }
+                }
+            }
+        }
+
+        match (
+            &window_frame.units,
+            &window_frame.start_bound,
+            &window_frame.end_bound,
+        ) {
+            // Cases where one edge of the frame is CurrentRow.
+            // Note that these cases could be merged into the more general cases below where one
+            // edge is some offset (with offset = 0), but the CurrentRow cases probably cover 95%
+            // of user queries, so let's make this simple and fast.
+            (Rows, UnboundedPreceding, CurrentRow) => {
+                rows_between_unbounded_preceding_and_current_row::<A>(
+                    args,
+                    &mut result,
+                    A::new(wrapped_aggregate, false),
+                    temp_storage,
+                );
+            }
+            (Rows, CurrentRow, UnboundedFollowing) => {
+                // Same as above, but reverse.
+                args.reverse();
+                rows_between_unbounded_preceding_and_current_row::<A>(
+                    args,
+                    &mut result,
+                    A::new(wrapped_aggregate, true),
+                    temp_storage,
+                );
+                result.reverse();
+            }
+            (Range, UnboundedPreceding, CurrentRow) => {
+                // Note that for the default frame, the RANGE frame mode is identical to the GROUPS
+                // frame mode.
+                groups_between_unbounded_preceding_and_current_row::<A>(
+                    args,
+                    order_by_rows,
+                    &mut result,
+                    A::new(wrapped_aggregate, false),
+                    temp_storage,
+                );
+            }
+            // The next several cases all call `rows_between_offset_and_offset`. Note that the
+            // offset passed to `rows_between_offset_and_offset` should be negated when it's
+            // PRECEDING.
+            (Rows, OffsetPreceding(start_prec), OffsetPreceding(end_prec)) => {
+                let start_prec = start_prec.to_i64().expect(
+                    "window frame start OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                let end_prec = end_prec.to_i64().expect(
+                    "window frame end OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                rows_between_offset_and_offset(
+                    args,
+                    &mut result,
+                    wrapped_aggregate,
+                    temp_storage,
+                    -start_prec,
+                    -end_prec,
+                );
+            }
+            (Rows, OffsetPreceding(start_prec), OffsetFollowing(end_fol)) => {
+                let start_prec = start_prec.to_i64().expect(
+                    "window frame start OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                let end_fol = end_fol.to_i64().expect(
+                    "window frame end OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                rows_between_offset_and_offset(
+                    args,
+                    &mut result,
+                    wrapped_aggregate,
+                    temp_storage,
+                    -start_prec,
+                    end_fol,
+                );
+            }
+            (Rows, OffsetFollowing(start_fol), OffsetFollowing(end_fol)) => {
+                let start_fol = start_fol.to_i64().expect(
+                    "window frame start OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                let end_fol = end_fol.to_i64().expect(
+                    "window frame end OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                rows_between_offset_and_offset(
+                    args,
+                    &mut result,
+                    wrapped_aggregate,
+                    temp_storage,
+                    start_fol,
+                    end_fol,
+                );
+            }
+            (Rows, OffsetFollowing(_), OffsetPreceding(_)) => {
+                unreachable!() // The planning ensured that this nonsensical case can't happen
+            }
+            (Rows, OffsetPreceding(start_prec), CurrentRow) => {
+                let start_prec = start_prec.to_i64().expect(
+                    "window frame start OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                let end_fol = 0;
+                rows_between_offset_and_offset(
+                    args,
+                    &mut result,
+                    wrapped_aggregate,
+                    temp_storage,
+                    -start_prec,
+                    end_fol,
+                );
+            }
+            (Rows, CurrentRow, OffsetFollowing(end_fol)) => {
+                let start_fol = 0;
+                let end_fol = end_fol.to_i64().expect(
+                    "window frame end OFFSET shouldn't be super big (the planning ensured this)",
+                );
+                rows_between_offset_and_offset(
+                    args,
+                    &mut result,
+                    wrapped_aggregate,
+                    temp_storage,
+                    start_fol,
+                    end_fol,
+                );
+            }
+            (Rows, CurrentRow, CurrentRow) => {
+                // We could have a more efficient implementation for this, but this is probably
+                // super rare. (Might be more common with RANGE or GROUPS frame mode, though!)
+                let start_fol = 0;
+                let end_fol = 0;
+                rows_between_offset_and_offset(
+                    args,
+                    &mut result,
+                    wrapped_aggregate,
+                    temp_storage,
+                    start_fol,
+                    end_fol,
+                );
+            }
+            (Rows, CurrentRow, OffsetPreceding(_))
+            | (Rows, UnboundedFollowing, _)
+            | (Rows, _, UnboundedPreceding)
+            | (Rows, OffsetFollowing(..), CurrentRow) => {
+                unreachable!() // The planning ensured that these nonsensical cases can't happen
+            }
+            (Rows, UnboundedPreceding, UnboundedFollowing) => {
+                // This is handled by the complicated if condition near the beginning of this
+                // function.
+                unreachable!()
+            }
+            (Rows, UnboundedPreceding, OffsetPreceding(_))
+            | (Rows, UnboundedPreceding, OffsetFollowing(_))
+            | (Rows, OffsetPreceding(..), UnboundedFollowing)
+            | (Rows, OffsetFollowing(..), UnboundedFollowing) => {
+                // Unsupported. Bail in the planner.
+                // https://github.com/MaterializeInc/database-issues/issues/6720
+                unreachable!()
+            }
+            (Range, _, _) => {
+                // Unsupported.
+                // The planner doesn't allow Range frame mode for now (except for the default
+                // frame), see https://github.com/MaterializeInc/database-issues/issues/6585
+                // Note that it would be easy to handle (Range, CurrentRow, UnboundedFollowing):
+                // it would be similar to (Rows, CurrentRow, UnboundedFollowing), but would call
+                // groups_between_unbounded_preceding_current_row.
+                unreachable!()
+            }
+            (Groups, _, _) => {
+                // Unsupported.
+                // The planner doesn't allow Groups frame mode for now, see
+                // https://github.com/MaterializeInc/database-issues/issues/6588
+                unreachable!()
+            }
+        }
+    }
+
+    result
+}
+
+/// Computes a bundle of fused window aggregations.
+/// The input is similar to `window_aggr`, but `InputValue` is not just a single value, but a record
+/// where each component is the input to one of the aggregations.
+fn fused_window_aggr<'a, I, A>(
+    input_datums: I,
+    callers_temp_storage: &'a RowArena,
+    wrapped_aggregates: &Vec<AggregateFunc>,
+    order_by: &Vec<ColumnOrder>,
+    window_frame: &WindowFrame,
+) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+    A: OneByOneAggr,
+{
+    let temp_storage = RowArena::new();
+    let iter = fused_window_aggr_no_list::<_, A>(
+        input_datums,
+        &temp_storage,
+        wrapped_aggregates,
+        order_by,
+        window_frame,
+    );
+    callers_temp_storage.make_datum(|packer| {
+        packer.push_list(iter);
+    })
+}
+
+/// Like `fused_window_aggr`, but doesn't perform the final wrapping in a list, returning an
+/// Iterator instead.
+fn fused_window_aggr_no_list<'a: 'b, 'b, I, A>(
+    input_datums: I,
+    callers_temp_storage: &'b RowArena,
+    wrapped_aggregates: &Vec<AggregateFunc>,
+    order_by: &Vec<ColumnOrder>,
+    window_frame: &WindowFrame,
+) -> impl Iterator<Item = Datum<'b>>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+    A: OneByOneAggr,
+{
+    // Sort the datums according to the ORDER BY expressions and return the ((OriginalRow, InputValue), OrderByRow) record
+    // The OrderByRow is kept around because it is required to compute the peer groups in RANGE mode
+    let datums = order_aggregate_datums_with_rank(input_datums, order_by);
+
+    let size_hint = datums.size_hint().0;
+    let mut argss = vec![Vec::with_capacity(size_hint); wrapped_aggregates.len()];
+    let mut original_rows = Vec::with_capacity(size_hint);
+    let mut order_by_rows = Vec::with_capacity(size_hint);
+    for (d, order_by_row) in datums {
+        let mut iter = d.unwrap_list().iter();
+        let original_row = iter.next().unwrap();
+        original_rows.push(original_row);
+        let args_iter = iter.next().unwrap().unwrap_list().iter();
+        // Push each argument into the respective list
+        for (args, arg) in argss.iter_mut().zip_eq(args_iter) {
+            args.push(arg);
+        }
+        order_by_rows.push(order_by_row);
+    }
+
+    let mut results_per_row =
+        vec![Vec::with_capacity(wrapped_aggregates.len()); original_rows.len()];
+    for (wrapped_aggr, args) in wrapped_aggregates.iter().zip_eq(argss) {
+        let results = window_aggr_inner::<A>(
+            args,
+            &order_by_rows,
+            wrapped_aggr,
+            order_by,
+            window_frame,
+            callers_temp_storage,
+        );
+        for (results, result) in results_per_row.iter_mut().zip_eq(results) {
+            results.push(result);
+        }
+    }
+
+    callers_temp_storage.reserve(2 * original_rows.len());
+    results_per_row
+        .into_iter()
+        .enumerate()
+        .map(move |(i, results)| {
+            callers_temp_storage.make_datum(|packer| {
+                packer.push_list_with(|packer| {
+                    packer
+                        .push(callers_temp_storage.make_datum(|packer| packer.push_list(results)));
+                    packer.push(original_rows[i]);
+                });
+            })
+        })
+}
+
+/// An implementation of an aggregation where we can send in the input elements one-by-one, and
+/// can also ask the current aggregate at any moment. (This just delegates to other aggregation
+/// evaluation approaches.)
+pub trait OneByOneAggr {
+    /// The `reverse` parameter makes the aggregations process input elements in reverse order.
+    /// This has an effect only for non-commutative aggregations, e.g. `list_agg`. These are
+    /// currently only some of the Basic aggregations. (Basic aggregations are handled by
+    /// `NaiveOneByOneAggr`).
+    fn new(agg: &AggregateFunc, reverse: bool) -> Self;
+    /// Pushes one input element into the aggregation.
+    fn give(&mut self, d: &Datum);
+    /// Returns the value of the aggregate computed on the given values so far.
+    fn get_current_aggregate<'a>(&self, temp_storage: &'a RowArena) -> Datum<'a>;
+}
+
+/// Naive implementation of [OneByOneAggr], suitable for stuff like const folding, but too slow for
+/// rendering. This relies only on infrastructure available in `mz-expr`. It simply saves all the
+/// given input, and calls the given [AggregateFunc]'s `eval` method when asked about the current
+/// aggregate. (For Accumulable and Hierarchical aggregations, the rendering has more efficient
+/// implementations, but for Basic aggregations even the rendering uses this naive implementation.)
+#[derive(Debug)]
+pub struct NaiveOneByOneAggr {
+    agg: AggregateFunc,
+    input: Vec<Row>,
+    reverse: bool,
+}
+
+impl OneByOneAggr for NaiveOneByOneAggr {
+    fn new(agg: &AggregateFunc, reverse: bool) -> Self {
+        NaiveOneByOneAggr {
+            agg: agg.clone(),
+            input: Vec::new(),
+            reverse,
+        }
+    }
+
+    fn give(&mut self, d: &Datum) {
+        let mut row = Row::default();
+        row.packer().push(d);
+        self.input.push(row);
+    }
+
+    fn get_current_aggregate<'a>(&self, temp_storage: &'a RowArena) -> Datum<'a> {
+        temp_storage.make_datum(|packer| {
+            packer.push(if !self.reverse {
+                self.agg
+                    .eval(self.input.iter().map(|r| r.unpack_first()), temp_storage)
+            } else {
+                self.agg.eval(
+                    self.input.iter().rev().map(|r| r.unpack_first()),
+                    temp_storage,
+                )
+            });
+        })
+    }
+}
+
+/// Identify whether the given aggregate function is Lag or Lead, since they share
+/// implementations.
+#[derive(
+    Arbitrary, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzReflect,
+)]
+pub enum LagLeadType {
+    Lag,
+    Lead,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzReflect)]
 pub enum AggregateFunc {
     MaxNumeric,
     MaxInt16,
     MaxInt32,
     MaxInt64,
+    MaxUInt16,
+    MaxUInt32,
+    MaxUInt64,
+    MaxMzTimestamp,
     MaxFloat32,
     MaxFloat64,
     MaxBool,
@@ -601,10 +1814,16 @@ pub enum AggregateFunc {
     MaxDate,
     MaxTimestamp,
     MaxTimestampTz,
+    MaxInterval,
+    MaxTime,
     MinNumeric,
     MinInt16,
     MinInt32,
     MinInt64,
+    MinUInt16,
+    MinUInt32,
+    MinUInt64,
+    MinMzTimestamp,
     MinFloat32,
     MinFloat64,
     MinBool,
@@ -612,9 +1831,14 @@ pub enum AggregateFunc {
     MinDate,
     MinTimestamp,
     MinTimestampTz,
+    MinInterval,
+    MinTime,
     SumInt16,
     SumInt32,
     SumInt64,
+    SumUInt16,
+    SumUInt32,
+    SumUInt64,
     SumFloat32,
     SumFloat64,
     SumNumeric,
@@ -639,8 +1863,15 @@ pub enum AggregateFunc {
     JsonbObjectAgg {
         order_by: Vec<ColumnOrder>,
     },
-    /// Accumulates `Datum::List`s whose first element is a `Datum::Array` into a
-    /// single `Datum::Array`. The other elements are columns used by `order_by`.
+    /// Zips a `Datum::List` whose first element is a `Datum::List` guaranteed
+    /// to be non-empty and whose len % 2 == 0 into a `Datum::Map`. The other
+    /// elements are columns used by `order_by`.
+    MapAgg {
+        order_by: Vec<ColumnOrder>,
+        value_type: ScalarType,
+    },
+    /// Accumulates `Datum::Array`s of `ScalarType::Record` whose first element is a `Datum::Array`
+    /// into a single `Datum::Array` (the remaining fields are used by `order_by`).
     ArrayConcat {
         order_by: Vec<ColumnOrder>,
     },
@@ -655,11 +1886,457 @@ pub enum AggregateFunc {
     RowNumber {
         order_by: Vec<ColumnOrder>,
     },
+    Rank {
+        order_by: Vec<ColumnOrder>,
+    },
+    DenseRank {
+        order_by: Vec<ColumnOrder>,
+    },
+    LagLead {
+        order_by: Vec<ColumnOrder>,
+        lag_lead: LagLeadType,
+        ignore_nulls: bool,
+    },
+    FirstValue {
+        order_by: Vec<ColumnOrder>,
+        window_frame: WindowFrame,
+    },
+    LastValue {
+        order_by: Vec<ColumnOrder>,
+        window_frame: WindowFrame,
+    },
+    /// Several value window functions fused into one function, to amortize overheads.
+    FusedValueWindowFunc {
+        funcs: Vec<AggregateFunc>,
+        /// Currently, all the fused functions must have the same `order_by`. (We can later
+        /// eliminate this limitation.)
+        order_by: Vec<ColumnOrder>,
+    },
+    WindowAggregate {
+        wrapped_aggregate: Box<AggregateFunc>,
+        order_by: Vec<ColumnOrder>,
+        window_frame: WindowFrame,
+    },
+    FusedWindowAggregate {
+        wrapped_aggregates: Vec<AggregateFunc>,
+        order_by: Vec<ColumnOrder>,
+        window_frame: WindowFrame,
+    },
     /// Accumulates any number of `Datum::Dummy`s into `Datum::Dummy`.
     ///
     /// Useful for removing an expensive aggregation while maintaining the shape
     /// of a reduce operator.
     Dummy,
+}
+
+/// An explicit [`Arbitrary`] implementation needed here because of a known
+/// `proptest` issue.
+///
+/// Revert to the derive-macro implementation once the issue[^1] is fixed.
+///
+/// [^1]: <https://github.com/AltSysrq/proptest/issues/152>
+impl Arbitrary for AggregateFunc {
+    type Parameters = ();
+
+    type Strategy = Union<BoxedStrategy<Self>>;
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        use proptest::collection::vec;
+        use proptest::prelude::any as proptest_any;
+        Union::new(vec![
+            Just(AggregateFunc::MaxNumeric).boxed(),
+            Just(AggregateFunc::MaxInt16).boxed(),
+            Just(AggregateFunc::MaxInt32).boxed(),
+            Just(AggregateFunc::MaxInt64).boxed(),
+            Just(AggregateFunc::MaxUInt16).boxed(),
+            Just(AggregateFunc::MaxUInt32).boxed(),
+            Just(AggregateFunc::MaxUInt64).boxed(),
+            Just(AggregateFunc::MaxMzTimestamp).boxed(),
+            Just(AggregateFunc::MaxFloat32).boxed(),
+            Just(AggregateFunc::MaxFloat64).boxed(),
+            Just(AggregateFunc::MaxBool).boxed(),
+            Just(AggregateFunc::MaxString).boxed(),
+            Just(AggregateFunc::MaxTimestamp).boxed(),
+            Just(AggregateFunc::MaxDate).boxed(),
+            Just(AggregateFunc::MaxTimestampTz).boxed(),
+            Just(AggregateFunc::MaxInterval).boxed(),
+            Just(AggregateFunc::MaxTime).boxed(),
+            Just(AggregateFunc::MinNumeric).boxed(),
+            Just(AggregateFunc::MinInt16).boxed(),
+            Just(AggregateFunc::MinInt32).boxed(),
+            Just(AggregateFunc::MinInt64).boxed(),
+            Just(AggregateFunc::MinUInt16).boxed(),
+            Just(AggregateFunc::MinUInt32).boxed(),
+            Just(AggregateFunc::MinUInt64).boxed(),
+            Just(AggregateFunc::MinMzTimestamp).boxed(),
+            Just(AggregateFunc::MinFloat32).boxed(),
+            Just(AggregateFunc::MinFloat64).boxed(),
+            Just(AggregateFunc::MinBool).boxed(),
+            Just(AggregateFunc::MinString).boxed(),
+            Just(AggregateFunc::MinDate).boxed(),
+            Just(AggregateFunc::MinTimestamp).boxed(),
+            Just(AggregateFunc::MinTimestampTz).boxed(),
+            Just(AggregateFunc::MinInterval).boxed(),
+            Just(AggregateFunc::MinTime).boxed(),
+            Just(AggregateFunc::SumInt16).boxed(),
+            Just(AggregateFunc::SumInt32).boxed(),
+            Just(AggregateFunc::SumInt64).boxed(),
+            Just(AggregateFunc::SumUInt16).boxed(),
+            Just(AggregateFunc::SumUInt32).boxed(),
+            Just(AggregateFunc::SumUInt64).boxed(),
+            Just(AggregateFunc::SumFloat32).boxed(),
+            Just(AggregateFunc::SumFloat64).boxed(),
+            Just(AggregateFunc::SumNumeric).boxed(),
+            Just(AggregateFunc::Count).boxed(),
+            Just(AggregateFunc::Any).boxed(),
+            Just(AggregateFunc::All).boxed(),
+            vec(proptest_any::<ColumnOrder>(), 1..4)
+                .prop_map(|order_by| AggregateFunc::JsonbAgg { order_by })
+                .boxed(),
+            vec(proptest_any::<ColumnOrder>(), 1..4)
+                .prop_map(|order_by| AggregateFunc::JsonbObjectAgg { order_by })
+                .boxed(),
+            (
+                vec(proptest_any::<ColumnOrder>(), 1..4),
+                proptest_any::<ScalarType>(),
+            )
+                .prop_map(|(order_by, value_type)| AggregateFunc::MapAgg {
+                    order_by,
+                    value_type,
+                })
+                .boxed(),
+            vec(proptest_any::<ColumnOrder>(), 1..4)
+                .prop_map(|order_by| AggregateFunc::ArrayConcat { order_by })
+                .boxed(),
+            vec(proptest_any::<ColumnOrder>(), 1..4)
+                .prop_map(|order_by| AggregateFunc::ListConcat { order_by })
+                .boxed(),
+            vec(proptest_any::<ColumnOrder>(), 1..4)
+                .prop_map(|order_by| AggregateFunc::StringAgg { order_by })
+                .boxed(),
+            vec(proptest_any::<ColumnOrder>(), 1..4)
+                .prop_map(|order_by| AggregateFunc::RowNumber { order_by })
+                .boxed(),
+            vec(proptest_any::<ColumnOrder>(), 1..4)
+                .prop_map(|order_by| AggregateFunc::DenseRank { order_by })
+                .boxed(),
+            (
+                vec(proptest_any::<ColumnOrder>(), 1..4),
+                proptest_any::<LagLeadType>(),
+                proptest_any::<bool>(),
+            )
+                .prop_map(
+                    |(order_by, lag_lead, ignore_nulls)| AggregateFunc::LagLead {
+                        order_by,
+                        lag_lead,
+                        ignore_nulls,
+                    },
+                )
+                .boxed(),
+            (
+                vec(proptest_any::<ColumnOrder>(), 1..4),
+                proptest_any::<WindowFrame>(),
+            )
+                .prop_map(|(order_by, window_frame)| AggregateFunc::FirstValue {
+                    order_by,
+                    window_frame,
+                })
+                .boxed(),
+            (
+                vec(proptest_any::<ColumnOrder>(), 1..4),
+                proptest_any::<WindowFrame>(),
+            )
+                .prop_map(|(order_by, window_frame)| AggregateFunc::LastValue {
+                    order_by,
+                    window_frame,
+                })
+                .boxed(),
+            Just(AggregateFunc::Dummy).boxed(),
+        ])
+    }
+}
+
+impl RustType<ProtoColumnOrders> for Vec<ColumnOrder> {
+    fn into_proto(&self) -> ProtoColumnOrders {
+        ProtoColumnOrders {
+            orders: self.into_proto(),
+        }
+    }
+
+    fn from_proto(proto: ProtoColumnOrders) -> Result<Self, TryFromProtoError> {
+        proto.orders.into_rust()
+    }
+}
+
+impl RustType<ProtoAggregateFunc> for AggregateFunc {
+    fn into_proto(&self) -> ProtoAggregateFunc {
+        use proto_aggregate_func::Kind;
+        ProtoAggregateFunc {
+            kind: Some(match self {
+                AggregateFunc::MaxNumeric => Kind::MaxNumeric(()),
+                AggregateFunc::MaxInt16 => Kind::MaxInt16(()),
+                AggregateFunc::MaxInt32 => Kind::MaxInt32(()),
+                AggregateFunc::MaxInt64 => Kind::MaxInt64(()),
+                AggregateFunc::MaxUInt16 => Kind::MaxUint16(()),
+                AggregateFunc::MaxUInt32 => Kind::MaxUint32(()),
+                AggregateFunc::MaxUInt64 => Kind::MaxUint64(()),
+                AggregateFunc::MaxMzTimestamp => Kind::MaxMzTimestamp(()),
+                AggregateFunc::MaxFloat32 => Kind::MaxFloat32(()),
+                AggregateFunc::MaxFloat64 => Kind::MaxFloat64(()),
+                AggregateFunc::MaxBool => Kind::MaxBool(()),
+                AggregateFunc::MaxString => Kind::MaxString(()),
+                AggregateFunc::MaxDate => Kind::MaxDate(()),
+                AggregateFunc::MaxTimestamp => Kind::MaxTimestamp(()),
+                AggregateFunc::MaxTimestampTz => Kind::MaxTimestampTz(()),
+                AggregateFunc::MinNumeric => Kind::MinNumeric(()),
+                AggregateFunc::MaxInterval => Kind::MaxInterval(()),
+                AggregateFunc::MaxTime => Kind::MaxTime(()),
+                AggregateFunc::MinInt16 => Kind::MinInt16(()),
+                AggregateFunc::MinInt32 => Kind::MinInt32(()),
+                AggregateFunc::MinInt64 => Kind::MinInt64(()),
+                AggregateFunc::MinUInt16 => Kind::MinUint16(()),
+                AggregateFunc::MinUInt32 => Kind::MinUint32(()),
+                AggregateFunc::MinUInt64 => Kind::MinUint64(()),
+                AggregateFunc::MinMzTimestamp => Kind::MinMzTimestamp(()),
+                AggregateFunc::MinFloat32 => Kind::MinFloat32(()),
+                AggregateFunc::MinFloat64 => Kind::MinFloat64(()),
+                AggregateFunc::MinBool => Kind::MinBool(()),
+                AggregateFunc::MinString => Kind::MinString(()),
+                AggregateFunc::MinDate => Kind::MinDate(()),
+                AggregateFunc::MinTimestamp => Kind::MinTimestamp(()),
+                AggregateFunc::MinTimestampTz => Kind::MinTimestampTz(()),
+                AggregateFunc::MinInterval => Kind::MinInterval(()),
+                AggregateFunc::MinTime => Kind::MinTime(()),
+                AggregateFunc::SumInt16 => Kind::SumInt16(()),
+                AggregateFunc::SumInt32 => Kind::SumInt32(()),
+                AggregateFunc::SumInt64 => Kind::SumInt64(()),
+                AggregateFunc::SumUInt16 => Kind::SumUint16(()),
+                AggregateFunc::SumUInt32 => Kind::SumUint32(()),
+                AggregateFunc::SumUInt64 => Kind::SumUint64(()),
+                AggregateFunc::SumFloat32 => Kind::SumFloat32(()),
+                AggregateFunc::SumFloat64 => Kind::SumFloat64(()),
+                AggregateFunc::SumNumeric => Kind::SumNumeric(()),
+                AggregateFunc::Count => Kind::Count(()),
+                AggregateFunc::Any => Kind::Any(()),
+                AggregateFunc::All => Kind::All(()),
+                AggregateFunc::JsonbAgg { order_by } => Kind::JsonbAgg(order_by.into_proto()),
+                AggregateFunc::JsonbObjectAgg { order_by } => {
+                    Kind::JsonbObjectAgg(order_by.into_proto())
+                }
+                AggregateFunc::MapAgg {
+                    order_by,
+                    value_type,
+                } => Kind::MapAgg(proto_aggregate_func::ProtoMapAgg {
+                    order_by: Some(order_by.into_proto()),
+                    value_type: Some(value_type.into_proto()),
+                }),
+                AggregateFunc::ArrayConcat { order_by } => Kind::ArrayConcat(order_by.into_proto()),
+                AggregateFunc::ListConcat { order_by } => Kind::ListConcat(order_by.into_proto()),
+                AggregateFunc::StringAgg { order_by } => Kind::StringAgg(order_by.into_proto()),
+                AggregateFunc::RowNumber { order_by } => Kind::RowNumber(order_by.into_proto()),
+                AggregateFunc::Rank { order_by } => Kind::Rank(order_by.into_proto()),
+                AggregateFunc::DenseRank { order_by } => Kind::DenseRank(order_by.into_proto()),
+                AggregateFunc::LagLead {
+                    order_by,
+                    lag_lead,
+                    ignore_nulls,
+                } => Kind::LagLead(proto_aggregate_func::ProtoLagLead {
+                    order_by: Some(order_by.into_proto()),
+                    lag_lead: Some(match lag_lead {
+                        LagLeadType::Lag => proto_aggregate_func::proto_lag_lead::LagLead::Lag(()),
+                        LagLeadType::Lead => {
+                            proto_aggregate_func::proto_lag_lead::LagLead::Lead(())
+                        }
+                    }),
+                    ignore_nulls: *ignore_nulls,
+                }),
+                AggregateFunc::FirstValue {
+                    order_by,
+                    window_frame,
+                } => Kind::FirstValue(proto_aggregate_func::ProtoFramedWindowFunc {
+                    order_by: Some(order_by.into_proto()),
+                    window_frame: Some(window_frame.into_proto()),
+                }),
+                AggregateFunc::LastValue {
+                    order_by,
+                    window_frame,
+                } => Kind::LastValue(proto_aggregate_func::ProtoFramedWindowFunc {
+                    order_by: Some(order_by.into_proto()),
+                    window_frame: Some(window_frame.into_proto()),
+                }),
+                AggregateFunc::WindowAggregate {
+                    wrapped_aggregate,
+                    order_by,
+                    window_frame,
+                } => Kind::WindowAggregate(Box::new(proto_aggregate_func::ProtoWindowAggregate {
+                    wrapped_aggregate: Some(wrapped_aggregate.into_proto()),
+                    order_by: Some(order_by.into_proto()),
+                    window_frame: Some(window_frame.into_proto()),
+                })),
+                AggregateFunc::FusedValueWindowFunc { funcs, order_by } => {
+                    Kind::FusedValueWindowFunc(ProtoFusedValueWindowFunc {
+                        funcs: funcs.into_proto(),
+                        order_by: Some(order_by.into_proto()),
+                    })
+                }
+                AggregateFunc::FusedWindowAggregate {
+                    wrapped_aggregates,
+                    order_by,
+                    window_frame,
+                } => Kind::FusedWindowAggregate(ProtoFusedWindowAggregate {
+                    wrapped_aggregates: wrapped_aggregates.into_proto(),
+                    order_by: Some(order_by.into_proto()),
+                    window_frame: Some(window_frame.into_proto()),
+                }),
+                AggregateFunc::Dummy => Kind::Dummy(()),
+            }),
+        }
+    }
+
+    fn from_proto(proto: ProtoAggregateFunc) -> Result<Self, TryFromProtoError> {
+        use proto_aggregate_func::Kind;
+        let kind = proto
+            .kind
+            .ok_or_else(|| TryFromProtoError::missing_field("ProtoAggregateFunc::kind"))?;
+        Ok(match kind {
+            Kind::MaxNumeric(()) => AggregateFunc::MaxNumeric,
+            Kind::MaxInt16(()) => AggregateFunc::MaxInt16,
+            Kind::MaxInt32(()) => AggregateFunc::MaxInt32,
+            Kind::MaxInt64(()) => AggregateFunc::MaxInt64,
+            Kind::MaxUint16(()) => AggregateFunc::MaxUInt16,
+            Kind::MaxUint32(()) => AggregateFunc::MaxUInt32,
+            Kind::MaxUint64(()) => AggregateFunc::MaxUInt64,
+            Kind::MaxMzTimestamp(()) => AggregateFunc::MaxMzTimestamp,
+            Kind::MaxFloat32(()) => AggregateFunc::MaxFloat32,
+            Kind::MaxFloat64(()) => AggregateFunc::MaxFloat64,
+            Kind::MaxBool(()) => AggregateFunc::MaxBool,
+            Kind::MaxString(()) => AggregateFunc::MaxString,
+            Kind::MaxDate(()) => AggregateFunc::MaxDate,
+            Kind::MaxTimestamp(()) => AggregateFunc::MaxTimestamp,
+            Kind::MaxTimestampTz(()) => AggregateFunc::MaxTimestampTz,
+            Kind::MaxInterval(()) => AggregateFunc::MaxInterval,
+            Kind::MaxTime(()) => AggregateFunc::MaxTime,
+            Kind::MinNumeric(()) => AggregateFunc::MinNumeric,
+            Kind::MinInt16(()) => AggregateFunc::MinInt16,
+            Kind::MinInt32(()) => AggregateFunc::MinInt32,
+            Kind::MinInt64(()) => AggregateFunc::MinInt64,
+            Kind::MinUint16(()) => AggregateFunc::MinUInt16,
+            Kind::MinUint32(()) => AggregateFunc::MinUInt32,
+            Kind::MinUint64(()) => AggregateFunc::MinUInt64,
+            Kind::MinMzTimestamp(()) => AggregateFunc::MinMzTimestamp,
+            Kind::MinFloat32(()) => AggregateFunc::MinFloat32,
+            Kind::MinFloat64(()) => AggregateFunc::MinFloat64,
+            Kind::MinBool(()) => AggregateFunc::MinBool,
+            Kind::MinString(()) => AggregateFunc::MinString,
+            Kind::MinDate(()) => AggregateFunc::MinDate,
+            Kind::MinTimestamp(()) => AggregateFunc::MinTimestamp,
+            Kind::MinTimestampTz(()) => AggregateFunc::MinTimestampTz,
+            Kind::MinInterval(()) => AggregateFunc::MinInterval,
+            Kind::MinTime(()) => AggregateFunc::MinTime,
+            Kind::SumInt16(()) => AggregateFunc::SumInt16,
+            Kind::SumInt32(()) => AggregateFunc::SumInt32,
+            Kind::SumInt64(()) => AggregateFunc::SumInt64,
+            Kind::SumUint16(()) => AggregateFunc::SumUInt16,
+            Kind::SumUint32(()) => AggregateFunc::SumUInt32,
+            Kind::SumUint64(()) => AggregateFunc::SumUInt64,
+            Kind::SumFloat32(()) => AggregateFunc::SumFloat32,
+            Kind::SumFloat64(()) => AggregateFunc::SumFloat64,
+            Kind::SumNumeric(()) => AggregateFunc::SumNumeric,
+            Kind::Count(()) => AggregateFunc::Count,
+            Kind::Any(()) => AggregateFunc::Any,
+            Kind::All(()) => AggregateFunc::All,
+            Kind::JsonbAgg(order_by) => AggregateFunc::JsonbAgg {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::JsonbObjectAgg(order_by) => AggregateFunc::JsonbObjectAgg {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::MapAgg(pma) => AggregateFunc::MapAgg {
+                order_by: pma.order_by.into_rust_if_some("ProtoMapAgg::order_by")?,
+                value_type: pma
+                    .value_type
+                    .into_rust_if_some("ProtoMapAgg::value_type")?,
+            },
+            Kind::ArrayConcat(order_by) => AggregateFunc::ArrayConcat {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::ListConcat(order_by) => AggregateFunc::ListConcat {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::StringAgg(order_by) => AggregateFunc::StringAgg {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::RowNumber(order_by) => AggregateFunc::RowNumber {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::Rank(order_by) => AggregateFunc::Rank {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::DenseRank(order_by) => AggregateFunc::DenseRank {
+                order_by: order_by.into_rust()?,
+            },
+            Kind::LagLead(pll) => AggregateFunc::LagLead {
+                order_by: pll.order_by.into_rust_if_some("ProtoLagLead::order_by")?,
+                lag_lead: match pll.lag_lead {
+                    Some(proto_aggregate_func::proto_lag_lead::LagLead::Lag(())) => {
+                        LagLeadType::Lag
+                    }
+                    Some(proto_aggregate_func::proto_lag_lead::LagLead::Lead(())) => {
+                        LagLeadType::Lead
+                    }
+                    None => {
+                        return Err(TryFromProtoError::MissingField(
+                            "ProtoLagLead::lag_lead".into(),
+                        ))
+                    }
+                },
+                ignore_nulls: pll.ignore_nulls,
+            },
+            Kind::FirstValue(pfv) => AggregateFunc::FirstValue {
+                order_by: pfv
+                    .order_by
+                    .into_rust_if_some("ProtoFramedWindowFunc::order_by")?,
+                window_frame: pfv
+                    .window_frame
+                    .into_rust_if_some("ProtoFramedWindowFunc::window_frame")?,
+            },
+            Kind::LastValue(pfv) => AggregateFunc::LastValue {
+                order_by: pfv
+                    .order_by
+                    .into_rust_if_some("ProtoFramedWindowFunc::order_by")?,
+                window_frame: pfv
+                    .window_frame
+                    .into_rust_if_some("ProtoFramedWindowFunc::window_frame")?,
+            },
+            Kind::WindowAggregate(paf) => AggregateFunc::WindowAggregate {
+                wrapped_aggregate: paf
+                    .wrapped_aggregate
+                    .into_rust_if_some("ProtoWindowAggregate::wrapped_aggregate")?,
+                order_by: paf
+                    .order_by
+                    .into_rust_if_some("ProtoWindowAggregate::order_by")?,
+                window_frame: paf
+                    .window_frame
+                    .into_rust_if_some("ProtoWindowAggregate::window_frame")?,
+            },
+            Kind::FusedValueWindowFunc(fvwf) => AggregateFunc::FusedValueWindowFunc {
+                funcs: fvwf.funcs.into_rust()?,
+                order_by: fvwf
+                    .order_by
+                    .into_rust_if_some("ProtoFusedValueWindowFunc::order_by")?,
+            },
+            Kind::FusedWindowAggregate(fwa) => AggregateFunc::FusedWindowAggregate {
+                wrapped_aggregates: fwa.wrapped_aggregates.into_rust()?,
+                order_by: fwa
+                    .order_by
+                    .into_rust_if_some("ProtoFusedWindowAggregate::order_by")?,
+                window_frame: fwa
+                    .window_frame
+                    .into_rust_if_some("ProtoFusedWindowAggregate::window_frame")?,
+            },
+            Kind::Dummy(()) => AggregateFunc::Dummy,
+        })
+    }
 }
 
 impl AggregateFunc {
@@ -668,47 +2345,220 @@ impl AggregateFunc {
         I: IntoIterator<Item = Datum<'a>>,
     {
         match self {
-            AggregateFunc::MaxNumeric => max_numeric(datums),
-            AggregateFunc::MaxInt16 => max_int16(datums),
-            AggregateFunc::MaxInt32 => max_int32(datums),
-            AggregateFunc::MaxInt64 => max_int64(datums),
-            AggregateFunc::MaxFloat32 => max_float32(datums),
-            AggregateFunc::MaxFloat64 => max_float64(datums),
-            AggregateFunc::MaxBool => max_bool(datums),
+            AggregateFunc::MaxNumeric => {
+                max_datum::<'a, I, OrderedDecimal<numeric::Numeric>>(datums)
+            }
+            AggregateFunc::MaxInt16 => max_datum::<'a, I, i16>(datums),
+            AggregateFunc::MaxInt32 => max_datum::<'a, I, i32>(datums),
+            AggregateFunc::MaxInt64 => max_datum::<'a, I, i64>(datums),
+            AggregateFunc::MaxUInt16 => max_datum::<'a, I, u16>(datums),
+            AggregateFunc::MaxUInt32 => max_datum::<'a, I, u32>(datums),
+            AggregateFunc::MaxUInt64 => max_datum::<'a, I, u64>(datums),
+            AggregateFunc::MaxMzTimestamp => max_datum::<'a, I, mz_repr::Timestamp>(datums),
+            AggregateFunc::MaxFloat32 => max_datum::<'a, I, OrderedFloat<f32>>(datums),
+            AggregateFunc::MaxFloat64 => max_datum::<'a, I, OrderedFloat<f64>>(datums),
+            AggregateFunc::MaxBool => max_datum::<'a, I, bool>(datums),
             AggregateFunc::MaxString => max_string(datums),
-            AggregateFunc::MaxDate => max_date(datums),
-            AggregateFunc::MaxTimestamp => max_timestamp(datums),
-            AggregateFunc::MaxTimestampTz => max_timestamptz(datums),
-            AggregateFunc::MinNumeric => min_numeric(datums),
-            AggregateFunc::MinInt16 => min_int16(datums),
-            AggregateFunc::MinInt32 => min_int32(datums),
-            AggregateFunc::MinInt64 => min_int64(datums),
-            AggregateFunc::MinFloat32 => min_float32(datums),
-            AggregateFunc::MinFloat64 => min_float64(datums),
-            AggregateFunc::MinBool => min_bool(datums),
+            AggregateFunc::MaxDate => max_datum::<'a, I, Date>(datums),
+            AggregateFunc::MaxTimestamp => {
+                max_datum::<'a, I, CheckedTimestamp<NaiveDateTime>>(datums)
+            }
+            AggregateFunc::MaxTimestampTz => {
+                max_datum::<'a, I, CheckedTimestamp<DateTime<Utc>>>(datums)
+            }
+            AggregateFunc::MaxInterval => max_datum::<'a, I, Interval>(datums),
+            AggregateFunc::MaxTime => max_datum::<'a, I, NaiveTime>(datums),
+            AggregateFunc::MinNumeric => {
+                min_datum::<'a, I, OrderedDecimal<numeric::Numeric>>(datums)
+            }
+            AggregateFunc::MinInt16 => min_datum::<'a, I, i16>(datums),
+            AggregateFunc::MinInt32 => min_datum::<'a, I, i32>(datums),
+            AggregateFunc::MinInt64 => min_datum::<'a, I, i64>(datums),
+            AggregateFunc::MinUInt16 => min_datum::<'a, I, u16>(datums),
+            AggregateFunc::MinUInt32 => min_datum::<'a, I, u32>(datums),
+            AggregateFunc::MinUInt64 => min_datum::<'a, I, u64>(datums),
+            AggregateFunc::MinMzTimestamp => min_datum::<'a, I, mz_repr::Timestamp>(datums),
+            AggregateFunc::MinFloat32 => min_datum::<'a, I, OrderedFloat<f32>>(datums),
+            AggregateFunc::MinFloat64 => min_datum::<'a, I, OrderedFloat<f64>>(datums),
+            AggregateFunc::MinBool => min_datum::<'a, I, bool>(datums),
             AggregateFunc::MinString => min_string(datums),
-            AggregateFunc::MinDate => min_date(datums),
-            AggregateFunc::MinTimestamp => min_timestamp(datums),
-            AggregateFunc::MinTimestampTz => min_timestamptz(datums),
-            AggregateFunc::SumInt16 => sum_int16(datums),
-            AggregateFunc::SumInt32 => sum_int32(datums),
-            AggregateFunc::SumInt64 => sum_int64(datums),
-            AggregateFunc::SumFloat32 => sum_float32(datums),
-            AggregateFunc::SumFloat64 => sum_float64(datums),
+            AggregateFunc::MinDate => min_datum::<'a, I, Date>(datums),
+            AggregateFunc::MinTimestamp => {
+                min_datum::<'a, I, CheckedTimestamp<NaiveDateTime>>(datums)
+            }
+            AggregateFunc::MinTimestampTz => {
+                min_datum::<'a, I, CheckedTimestamp<DateTime<Utc>>>(datums)
+            }
+            AggregateFunc::MinInterval => min_datum::<'a, I, Interval>(datums),
+            AggregateFunc::MinTime => min_datum::<'a, I, NaiveTime>(datums),
+            AggregateFunc::SumInt16 => sum_datum::<'a, I, i16, i64>(datums),
+            AggregateFunc::SumInt32 => sum_datum::<'a, I, i32, i64>(datums),
+            AggregateFunc::SumInt64 => sum_datum::<'a, I, i64, i128>(datums),
+            AggregateFunc::SumUInt16 => sum_datum::<'a, I, u16, u64>(datums),
+            AggregateFunc::SumUInt32 => sum_datum::<'a, I, u32, u64>(datums),
+            AggregateFunc::SumUInt64 => sum_datum::<'a, I, u64, u128>(datums),
+            AggregateFunc::SumFloat32 => sum_datum::<'a, I, f32, f32>(datums),
+            AggregateFunc::SumFloat64 => sum_datum::<'a, I, f64, f64>(datums),
             AggregateFunc::SumNumeric => sum_numeric(datums),
             AggregateFunc::Count => count(datums),
             AggregateFunc::Any => any(datums),
             AggregateFunc::All => all(datums),
             AggregateFunc::JsonbAgg { order_by } => jsonb_agg(datums, temp_storage, order_by),
-            AggregateFunc::JsonbObjectAgg { order_by } => {
-                jsonb_object_agg(datums, temp_storage, order_by)
+            AggregateFunc::MapAgg { order_by, .. } | AggregateFunc::JsonbObjectAgg { order_by } => {
+                dict_agg(datums, temp_storage, order_by)
             }
             AggregateFunc::ArrayConcat { order_by } => array_concat(datums, temp_storage, order_by),
             AggregateFunc::ListConcat { order_by } => list_concat(datums, temp_storage, order_by),
             AggregateFunc::StringAgg { order_by } => string_agg(datums, temp_storage, order_by),
             AggregateFunc::RowNumber { order_by } => row_number(datums, temp_storage, order_by),
+            AggregateFunc::Rank { order_by } => rank(datums, temp_storage, order_by),
+            AggregateFunc::DenseRank { order_by } => dense_rank(datums, temp_storage, order_by),
+            AggregateFunc::LagLead {
+                order_by,
+                lag_lead: lag_lead_type,
+                ignore_nulls,
+            } => lag_lead(datums, temp_storage, order_by, lag_lead_type, ignore_nulls),
+            AggregateFunc::FirstValue {
+                order_by,
+                window_frame,
+            } => first_value(datums, temp_storage, order_by, window_frame),
+            AggregateFunc::LastValue {
+                order_by,
+                window_frame,
+            } => last_value(datums, temp_storage, order_by, window_frame),
+            AggregateFunc::WindowAggregate {
+                wrapped_aggregate,
+                order_by,
+                window_frame,
+            } => window_aggr::<_, NaiveOneByOneAggr>(
+                datums,
+                temp_storage,
+                wrapped_aggregate,
+                order_by,
+                window_frame,
+            ),
+            AggregateFunc::FusedValueWindowFunc { funcs, order_by } => {
+                fused_value_window_func(datums, temp_storage, funcs, order_by)
+            }
+            AggregateFunc::FusedWindowAggregate {
+                wrapped_aggregates,
+                order_by,
+                window_frame,
+            } => fused_window_aggr::<_, NaiveOneByOneAggr>(
+                datums,
+                temp_storage,
+                wrapped_aggregates,
+                order_by,
+                window_frame,
+            ),
             AggregateFunc::Dummy => Datum::Dummy,
         }
+    }
+
+    /// Like `eval`, but it's given a [OneByOneAggr]. If `self` is a `WindowAggregate`, then
+    /// the given [OneByOneAggr] will be used to evaluate the wrapped aggregate inside the
+    /// `WindowAggregate`. If `self` is not a `WindowAggregate`, then it simply calls `eval`.
+    pub fn eval_with_fast_window_agg<'a, I, W>(
+        &self,
+        datums: I,
+        temp_storage: &'a RowArena,
+    ) -> Datum<'a>
+    where
+        I: IntoIterator<Item = Datum<'a>>,
+        W: OneByOneAggr,
+    {
+        match self {
+            AggregateFunc::WindowAggregate {
+                wrapped_aggregate,
+                order_by,
+                window_frame,
+            } => window_aggr::<_, W>(
+                datums,
+                temp_storage,
+                wrapped_aggregate,
+                order_by,
+                window_frame,
+            ),
+            AggregateFunc::FusedWindowAggregate {
+                wrapped_aggregates,
+                order_by,
+                window_frame,
+            } => fused_window_aggr::<_, W>(
+                datums,
+                temp_storage,
+                wrapped_aggregates,
+                order_by,
+                window_frame,
+            ),
+            _ => self.eval(datums, temp_storage),
+        }
+    }
+
+    pub fn eval_with_unnest_list<'a, I, W>(
+        &self,
+        datums: I,
+        temp_storage: &'a RowArena,
+    ) -> impl Iterator<Item = Datum<'a>>
+    where
+        I: IntoIterator<Item = Datum<'a>>,
+        W: OneByOneAggr,
+    {
+        // TODO: Use `enum_dispatch` to construct a unified iterator instead of `collect_vec`.
+        assert!(self.can_fuse_with_unnest_list());
+        match self {
+            AggregateFunc::RowNumber { order_by } => {
+                row_number_no_list(datums, temp_storage, order_by).collect_vec()
+            }
+            AggregateFunc::Rank { order_by } => {
+                rank_no_list(datums, temp_storage, order_by).collect_vec()
+            }
+            AggregateFunc::DenseRank { order_by } => {
+                dense_rank_no_list(datums, temp_storage, order_by).collect_vec()
+            }
+            AggregateFunc::LagLead {
+                order_by,
+                lag_lead: lag_lead_type,
+                ignore_nulls,
+            } => lag_lead_no_list(datums, temp_storage, order_by, lag_lead_type, ignore_nulls)
+                .collect_vec(),
+            AggregateFunc::FirstValue {
+                order_by,
+                window_frame,
+            } => first_value_no_list(datums, temp_storage, order_by, window_frame).collect_vec(),
+            AggregateFunc::LastValue {
+                order_by,
+                window_frame,
+            } => last_value_no_list(datums, temp_storage, order_by, window_frame).collect_vec(),
+            AggregateFunc::FusedValueWindowFunc { funcs, order_by } => {
+                fused_value_window_func_no_list(datums, temp_storage, funcs, order_by).collect_vec()
+            }
+            AggregateFunc::WindowAggregate {
+                wrapped_aggregate,
+                order_by,
+                window_frame,
+            } => window_aggr_no_list::<_, W>(
+                datums,
+                temp_storage,
+                wrapped_aggregate,
+                order_by,
+                window_frame,
+            )
+            .collect_vec(),
+            AggregateFunc::FusedWindowAggregate {
+                wrapped_aggregates,
+                order_by,
+                window_frame,
+            } => fused_window_aggr_no_list::<_, W>(
+                datums,
+                temp_storage,
+                wrapped_aggregates,
+                order_by,
+                window_frame,
+            )
+            .collect_vec(),
+            _ => unreachable!("asserted above that `can_fuse_with_unnest_list`"),
+        }
+        .into_iter()
     }
 
     /// Returns the output of the aggregation function when applied on an empty
@@ -732,8 +2582,130 @@ impl AggregateFunc {
             AggregateFunc::Dummy => Datum::Dummy,
             AggregateFunc::ArrayConcat { .. } => Datum::empty_array(),
             AggregateFunc::ListConcat { .. } => Datum::empty_list(),
-            AggregateFunc::RowNumber { .. } => Datum::empty_list(),
-            _ => Datum::Null,
+            AggregateFunc::RowNumber { .. }
+            | AggregateFunc::Rank { .. }
+            | AggregateFunc::DenseRank { .. }
+            | AggregateFunc::LagLead { .. }
+            | AggregateFunc::FirstValue { .. }
+            | AggregateFunc::LastValue { .. }
+            | AggregateFunc::WindowAggregate { .. }
+            | AggregateFunc::FusedValueWindowFunc { .. }
+            | AggregateFunc::FusedWindowAggregate { .. } => Datum::empty_list(),
+            AggregateFunc::MaxNumeric
+            | AggregateFunc::MaxInt16
+            | AggregateFunc::MaxInt32
+            | AggregateFunc::MaxInt64
+            | AggregateFunc::MaxUInt16
+            | AggregateFunc::MaxUInt32
+            | AggregateFunc::MaxUInt64
+            | AggregateFunc::MaxMzTimestamp
+            | AggregateFunc::MaxFloat32
+            | AggregateFunc::MaxFloat64
+            | AggregateFunc::MaxBool
+            | AggregateFunc::MaxString
+            | AggregateFunc::MaxDate
+            | AggregateFunc::MaxTimestamp
+            | AggregateFunc::MaxTimestampTz
+            | AggregateFunc::MaxInterval
+            | AggregateFunc::MaxTime
+            | AggregateFunc::MinNumeric
+            | AggregateFunc::MinInt16
+            | AggregateFunc::MinInt32
+            | AggregateFunc::MinInt64
+            | AggregateFunc::MinUInt16
+            | AggregateFunc::MinUInt32
+            | AggregateFunc::MinUInt64
+            | AggregateFunc::MinMzTimestamp
+            | AggregateFunc::MinFloat32
+            | AggregateFunc::MinFloat64
+            | AggregateFunc::MinBool
+            | AggregateFunc::MinString
+            | AggregateFunc::MinDate
+            | AggregateFunc::MinTimestamp
+            | AggregateFunc::MinTimestampTz
+            | AggregateFunc::MinInterval
+            | AggregateFunc::MinTime
+            | AggregateFunc::SumInt16
+            | AggregateFunc::SumInt32
+            | AggregateFunc::SumInt64
+            | AggregateFunc::SumUInt16
+            | AggregateFunc::SumUInt32
+            | AggregateFunc::SumUInt64
+            | AggregateFunc::SumFloat32
+            | AggregateFunc::SumFloat64
+            | AggregateFunc::SumNumeric
+            | AggregateFunc::Count
+            | AggregateFunc::JsonbAgg { .. }
+            | AggregateFunc::JsonbObjectAgg { .. }
+            | AggregateFunc::MapAgg { .. }
+            | AggregateFunc::StringAgg { .. } => Datum::Null,
+        }
+    }
+
+    pub fn can_fuse_with_unnest_list(&self) -> bool {
+        match self {
+            AggregateFunc::RowNumber { .. }
+            | AggregateFunc::Rank { .. }
+            | AggregateFunc::DenseRank { .. }
+            | AggregateFunc::LagLead { .. }
+            | AggregateFunc::FirstValue { .. }
+            | AggregateFunc::LastValue { .. }
+            | AggregateFunc::WindowAggregate { .. }
+            | AggregateFunc::FusedValueWindowFunc { .. }
+            | AggregateFunc::FusedWindowAggregate { .. } => true,
+            AggregateFunc::ArrayConcat { .. }
+            | AggregateFunc::ListConcat { .. }
+            | AggregateFunc::Any
+            | AggregateFunc::All
+            | AggregateFunc::Dummy
+            | AggregateFunc::MaxNumeric
+            | AggregateFunc::MaxInt16
+            | AggregateFunc::MaxInt32
+            | AggregateFunc::MaxInt64
+            | AggregateFunc::MaxUInt16
+            | AggregateFunc::MaxUInt32
+            | AggregateFunc::MaxUInt64
+            | AggregateFunc::MaxMzTimestamp
+            | AggregateFunc::MaxFloat32
+            | AggregateFunc::MaxFloat64
+            | AggregateFunc::MaxBool
+            | AggregateFunc::MaxString
+            | AggregateFunc::MaxDate
+            | AggregateFunc::MaxTimestamp
+            | AggregateFunc::MaxTimestampTz
+            | AggregateFunc::MaxInterval
+            | AggregateFunc::MaxTime
+            | AggregateFunc::MinNumeric
+            | AggregateFunc::MinInt16
+            | AggregateFunc::MinInt32
+            | AggregateFunc::MinInt64
+            | AggregateFunc::MinUInt16
+            | AggregateFunc::MinUInt32
+            | AggregateFunc::MinUInt64
+            | AggregateFunc::MinMzTimestamp
+            | AggregateFunc::MinFloat32
+            | AggregateFunc::MinFloat64
+            | AggregateFunc::MinBool
+            | AggregateFunc::MinString
+            | AggregateFunc::MinDate
+            | AggregateFunc::MinTimestamp
+            | AggregateFunc::MinTimestampTz
+            | AggregateFunc::MinInterval
+            | AggregateFunc::MinTime
+            | AggregateFunc::SumInt16
+            | AggregateFunc::SumInt32
+            | AggregateFunc::SumInt64
+            | AggregateFunc::SumUInt16
+            | AggregateFunc::SumUInt32
+            | AggregateFunc::SumUInt64
+            | AggregateFunc::SumFloat32
+            | AggregateFunc::SumFloat64
+            | AggregateFunc::SumNumeric
+            | AggregateFunc::Count
+            | AggregateFunc::JsonbAgg { .. }
+            | AggregateFunc::JsonbObjectAgg { .. }
+            | AggregateFunc::MapAgg { .. }
+            | AggregateFunc::StringAgg { .. } => false,
         }
     }
 
@@ -751,50 +2723,305 @@ impl AggregateFunc {
             AggregateFunc::JsonbObjectAgg { .. } => ScalarType::Jsonb,
             AggregateFunc::SumInt16 => ScalarType::Int64,
             AggregateFunc::SumInt32 => ScalarType::Int64,
-            AggregateFunc::SumInt64 => ScalarType::Numeric { scale: Some(0) },
+            AggregateFunc::SumInt64 => ScalarType::Numeric {
+                max_scale: Some(NumericMaxScale::ZERO),
+            },
+            AggregateFunc::SumUInt16 => ScalarType::UInt64,
+            AggregateFunc::SumUInt32 => ScalarType::UInt64,
+            AggregateFunc::SumUInt64 => ScalarType::Numeric {
+                max_scale: Some(NumericMaxScale::ZERO),
+            },
+            AggregateFunc::MapAgg { value_type, .. } => ScalarType::Map {
+                value_type: Box::new(value_type.clone()),
+                custom_id: None,
+            },
             AggregateFunc::ArrayConcat { .. } | AggregateFunc::ListConcat { .. } => {
                 match input_type.scalar_type {
                     // The input is wrapped in a Record if there's an ORDER BY, so extract it out.
-                    ScalarType::Record { fields, .. } => fields[0].1.scalar_type.clone(),
+                    ScalarType::Record { ref fields, .. } => fields[0].1.scalar_type.clone(),
                     _ => unreachable!(),
                 }
             }
             AggregateFunc::StringAgg { .. } => ScalarType::String,
-            AggregateFunc::RowNumber { .. } => match input_type.scalar_type {
-                ScalarType::Record { fields, .. } => ScalarType::List {
+            AggregateFunc::RowNumber { .. } => {
+                AggregateFunc::output_type_ranking_window_funcs(&input_type, "?row_number?")
+            }
+            AggregateFunc::Rank { .. } => {
+                AggregateFunc::output_type_ranking_window_funcs(&input_type, "?rank?")
+            }
+            AggregateFunc::DenseRank { .. } => {
+                AggregateFunc::output_type_ranking_window_funcs(&input_type, "?dense_rank?")
+            }
+            AggregateFunc::LagLead { lag_lead: lag_lead_type, .. } => {
+                // The input type for Lag is ((OriginalRow, EncodedArgs), OrderByExprs...)
+                let fields = input_type.scalar_type.unwrap_record_element_type();
+                let original_row_type = fields[0].unwrap_record_element_type()[0]
+                    .clone()
+                    .nullable(false);
+                let output_type_inner = Self::lag_lead_output_type_inner_from_encoded_args(fields[0].unwrap_record_element_type()[1]);
+                let column_name = Self::lag_lead_result_column_name(lag_lead_type);
+
+                ScalarType::List {
                     element_type: Box::new(ScalarType::Record {
-                        fields: vec![
-                            (
-                                ColumnName::from("?row_number?"),
-                                ScalarType::Int64.nullable(false),
-                            ),
-                            (ColumnName::from("?record?"), {
-                                let inner = match &fields[0].1.scalar_type {
-                                    ScalarType::List { element_type, .. } => element_type.clone(),
-                                    _ => unreachable!(),
-                                };
-                                inner.nullable(false)
-                            }),
-                        ],
-                        custom_oid: None,
-                        custom_name: None,
+                        fields: [
+                            (column_name, output_type_inner),
+                            (ColumnName::from("?orig_row?"), original_row_type),
+                        ].into(),
+                        custom_id: None,
                     }),
-                    custom_oid: None,
-                },
-                _ => unreachable!(),
-            },
+                    custom_id: None,
+                }
+            }
+            AggregateFunc::FirstValue { .. } => {
+                // The input type for FirstValue is ((OriginalRow, Arg), OrderByExprs...)
+                let fields = input_type.scalar_type.unwrap_record_element_type();
+                let original_row_type = fields[0].unwrap_record_element_type()[0]
+                    .clone()
+                    .nullable(false);
+                let value_type = fields[0].unwrap_record_element_type()[1]
+                    .clone()
+                    .nullable(true); // null when the partition is empty
+
+                ScalarType::List {
+                    element_type: Box::new(ScalarType::Record {
+                        fields: [
+                            (ColumnName::from("?first_value?"), value_type),
+                            (ColumnName::from("?orig_row?"), original_row_type),
+                        ].into(),
+                        custom_id: None,
+                    }),
+                    custom_id: None,
+                }
+            }
+            AggregateFunc::LastValue { .. } => {
+                // The input type for LastValue is ((OriginalRow, Arg), OrderByExprs...)
+                let fields = input_type.scalar_type.unwrap_record_element_type();
+                let original_row_type = fields[0].unwrap_record_element_type()[0]
+                    .clone()
+                    .nullable(false);
+                let value_type = fields[0].unwrap_record_element_type()[1]
+                    .clone()
+                    .nullable(true); // null when the partition is empty
+
+                ScalarType::List {
+                    element_type: Box::new(ScalarType::Record {
+                        fields: [
+                            (ColumnName::from("?last_value?"), value_type),
+                            (ColumnName::from("?orig_row?"), original_row_type),
+                        ].into(),
+                        custom_id: None,
+                    }),
+                    custom_id: None,
+                }
+            }
+            AggregateFunc::WindowAggregate {
+                wrapped_aggregate, ..
+            } => {
+                // The input type for a window aggregate is ((OriginalRow, Arg), OrderByExprs...)
+                let fields = input_type.scalar_type.unwrap_record_element_type();
+                let original_row_type = fields[0].unwrap_record_element_type()[0]
+                    .clone()
+                    .nullable(false);
+                let arg_type = fields[0].unwrap_record_element_type()[1]
+                    .clone()
+                    .nullable(true);
+                let wrapped_aggr_out_type = wrapped_aggregate.output_type(arg_type);
+
+                ScalarType::List {
+                    element_type: Box::new(ScalarType::Record {
+                        fields: [
+                            (ColumnName::from("?window_agg?"), wrapped_aggr_out_type),
+                            (ColumnName::from("?orig_row?"), original_row_type),
+                        ].into(),
+                        custom_id: None,
+                    }),
+                    custom_id: None,
+                }
+            }
+            AggregateFunc::FusedWindowAggregate {
+                wrapped_aggregates, ..
+            } => {
+                // The input type for a fused window aggregate is ((OriginalRow, Args), OrderByExprs...)
+                // where `Args` is a record.
+                let fields = input_type.scalar_type.unwrap_record_element_type();
+                let original_row_type = fields[0].unwrap_record_element_type()[0]
+                    .clone()
+                    .nullable(false);
+                let args_type = fields[0].unwrap_record_element_type()[1];
+                let arg_types = args_type.unwrap_record_element_type();
+                let out_fields = arg_types.iter().zip_eq(wrapped_aggregates).map(|(arg_type, wrapped_agg)| {
+                    (
+                        ColumnName::from(wrapped_agg.name()),
+                        wrapped_agg.output_type((**arg_type).clone().nullable(true)),
+                    )
+                }).collect_vec();
+
+                ScalarType::List {
+                    element_type: Box::new(ScalarType::Record {
+                        fields: [
+                            (ColumnName::from("?fused_window_agg?"), ScalarType::Record {
+                                fields: out_fields.into(),
+                                custom_id: None,
+                            }.nullable(false)),
+                            (ColumnName::from("?orig_row?"), original_row_type),
+                        ].into(),
+                        custom_id: None,
+                    }),
+                    custom_id: None,
+                }
+            }
+            AggregateFunc::FusedValueWindowFunc { funcs, order_by: _ } => {
+                // The input type is ((OriginalRow, EncodedArgs), OrderByExprs...)
+                // where EncodedArgs is a record, where each element is the argument to one of the
+                // function calls that got fused. This is a record for lag/lead, and a simple type
+                // for first_value/last_value.
+                let fields = input_type.scalar_type.unwrap_record_element_type();
+                let original_row_type = fields[0].unwrap_record_element_type()[0]
+                    .clone()
+                    .nullable(false);
+                let encoded_args_type = fields[0].unwrap_record_element_type()[1].unwrap_record_element_type();
+
+                ScalarType::List {
+                    element_type: Box::new(ScalarType::Record {
+                        fields: [
+                            (ColumnName::from("?fused_value_window_func?"), ScalarType::Record {
+                                fields: encoded_args_type.into_iter().zip_eq(funcs).map(|(arg_type, func)| {
+                                    match func {
+                                        AggregateFunc::LagLead { lag_lead: lag_lead_type, .. } => {
+                                            (
+                                                Self::lag_lead_result_column_name(lag_lead_type),
+                                                Self::lag_lead_output_type_inner_from_encoded_args(arg_type)
+                                            )
+                                        },
+                                        AggregateFunc::FirstValue { .. } => {
+                                            (
+                                                ColumnName::from("?first_value?"),
+                                                arg_type.clone().nullable(true),
+                                            )
+                                        }
+                                        AggregateFunc::LastValue { .. } => {
+                                            (
+                                                ColumnName::from("?last_value?"),
+                                                arg_type.clone().nullable(true),
+                                            )
+                                        }
+                                        _ => panic!("FusedValueWindowFunc has an unknown function"),
+                                    }
+                                }).collect(),
+                                custom_id: None,
+                            }.nullable(false)),
+                            (ColumnName::from("?orig_row?"), original_row_type),
+                        ].into(),
+                        custom_id: None,
+                    }),
+                    custom_id: None,
+                }
+            }
+            AggregateFunc::Dummy
+            | AggregateFunc::MaxNumeric
+            | AggregateFunc::MaxInt16
+            | AggregateFunc::MaxInt32
+            | AggregateFunc::MaxInt64
+            | AggregateFunc::MaxUInt16
+            | AggregateFunc::MaxUInt32
+            | AggregateFunc::MaxUInt64
+            | AggregateFunc::MaxMzTimestamp
+            | AggregateFunc::MaxFloat32
+            | AggregateFunc::MaxFloat64
+            | AggregateFunc::MaxBool
             // Note AggregateFunc::MaxString, MinString rely on returning input
             // type as output type to support the proper return type for
             // character input.
-            _ => input_type.scalar_type,
+            | AggregateFunc::MaxString
+            | AggregateFunc::MaxDate
+            | AggregateFunc::MaxTimestamp
+            | AggregateFunc::MaxTimestampTz
+            | AggregateFunc::MaxInterval
+            | AggregateFunc::MaxTime
+            | AggregateFunc::MinNumeric
+            | AggregateFunc::MinInt16
+            | AggregateFunc::MinInt32
+            | AggregateFunc::MinInt64
+            | AggregateFunc::MinUInt16
+            | AggregateFunc::MinUInt32
+            | AggregateFunc::MinUInt64
+            | AggregateFunc::MinMzTimestamp
+            | AggregateFunc::MinFloat32
+            | AggregateFunc::MinFloat64
+            | AggregateFunc::MinBool
+            | AggregateFunc::MinString
+            | AggregateFunc::MinDate
+            | AggregateFunc::MinTimestamp
+            | AggregateFunc::MinTimestampTz
+            | AggregateFunc::MinInterval
+            | AggregateFunc::MinTime
+            | AggregateFunc::SumFloat32
+            | AggregateFunc::SumFloat64
+            | AggregateFunc::SumNumeric => input_type.scalar_type.clone(),
         };
         // Count never produces null, and other aggregations only produce
         // null in the presence of null inputs.
         let nullable = match self {
             AggregateFunc::Count => false,
+            // Use the nullability of the underlying column being aggregated, not the Records wrapping it
+            AggregateFunc::StringAgg { .. } => match input_type.scalar_type {
+                // The outer Record wraps the input in the first position, and any ORDER BY expressions afterwards
+                ScalarType::Record { fields, .. } => match &fields[0].1.scalar_type {
+                    // The inner Record is a (value, separator) tuple
+                    ScalarType::Record { fields, .. } => fields[0].1.nullable,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
             _ => input_type.nullable,
         };
         scalar_type.nullable(nullable)
+    }
+
+    /// Compute output type for ROW_NUMBER, RANK, DENSE_RANK
+    fn output_type_ranking_window_funcs(input_type: &ColumnType, col_name: &str) -> ScalarType {
+        match input_type.scalar_type {
+            ScalarType::Record { ref fields, .. } => ScalarType::List {
+                element_type: Box::new(ScalarType::Record {
+                    fields: [
+                        (
+                            ColumnName::from(col_name),
+                            ScalarType::Int64.nullable(false),
+                        ),
+                        (ColumnName::from("?orig_row?"), {
+                            let inner = match &fields[0].1.scalar_type {
+                                ScalarType::List { element_type, .. } => element_type.clone(),
+                                _ => unreachable!(),
+                            };
+                            inner.nullable(false)
+                        }),
+                    ]
+                    .into(),
+                    custom_id: None,
+                }),
+                custom_id: None,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Given the `EncodedArgs` part of `((OriginalRow, EncodedArgs), OrderByExprs...)`,
+    /// this computes the type of the first field of the output type. (The first field is the
+    /// real result, the rest is the original row.)
+    fn lag_lead_output_type_inner_from_encoded_args(encoded_args_type: &ScalarType) -> ColumnType {
+        // lag/lead have 3 arguments, and the output type is
+        // the same as the first of these, but always nullable. (It's null when the
+        // lag/lead computation reaches over the bounds of the window partition.)
+        encoded_args_type.unwrap_record_element_type()[0]
+            .clone()
+            .nullable(true)
+    }
+
+    fn lag_lead_result_column_name(lag_lead_type: &LagLeadType) -> ColumnName {
+        ColumnName::from(match lag_lead_type {
+            LagLeadType::Lag => "?lag?",
+            LagLeadType::Lead => "?lead?",
+        })
     }
 
     /// Returns true if the non-null constraint on the aggregation can be
@@ -807,6 +3034,10 @@ impl AggregateFunc {
             | AggregateFunc::MaxInt16
             | AggregateFunc::MaxInt32
             | AggregateFunc::MaxInt64
+            | AggregateFunc::MaxUInt16
+            | AggregateFunc::MaxUInt32
+            | AggregateFunc::MaxUInt64
+            | AggregateFunc::MaxMzTimestamp
             | AggregateFunc::MaxFloat32
             | AggregateFunc::MaxFloat64
             | AggregateFunc::MaxBool
@@ -818,6 +3049,10 @@ impl AggregateFunc {
             | AggregateFunc::MinInt16
             | AggregateFunc::MinInt32
             | AggregateFunc::MinInt64
+            | AggregateFunc::MinUInt16
+            | AggregateFunc::MinUInt32
+            | AggregateFunc::MinUInt64
+            | AggregateFunc::MinMzTimestamp
             | AggregateFunc::MinFloat32
             | AggregateFunc::MinFloat64
             | AggregateFunc::MinBool
@@ -828,6 +3063,9 @@ impl AggregateFunc {
             | AggregateFunc::SumInt16
             | AggregateFunc::SumInt32
             | AggregateFunc::SumInt64
+            | AggregateFunc::SumUInt16
+            | AggregateFunc::SumUInt32
+            | AggregateFunc::SumUInt64
             | AggregateFunc::SumFloat32
             | AggregateFunc::SumFloat64
             | AggregateFunc::SumNumeric
@@ -847,7 +3085,7 @@ fn jsonb_each<'a>(
     // First produce a map, so that a common iterator can be returned.
     let map = match a {
         Datum::Map(dict) => dict,
-        _ => repr::DatumMap::empty(),
+        _ => mz_repr::DatumMap::empty(),
     };
 
     map.iter().map(move |(k, mut v)| {
@@ -861,7 +3099,7 @@ fn jsonb_each<'a>(
 fn jsonb_object_keys<'a>(a: Datum<'a>) -> impl Iterator<Item = (Row, Diff)> + 'a {
     let map = match a {
         Datum::Map(dict) => dict,
-        _ => repr::DatumMap::empty(),
+        _ => mz_repr::DatumMap::empty(),
     };
 
     map.iter()
@@ -875,7 +3113,7 @@ fn jsonb_array_elements<'a>(
 ) -> impl Iterator<Item = (Row, Diff)> + 'a {
     let list = match a {
         Datum::List(list) => list,
-        _ => repr::DatumList::empty(),
+        _ => mz_repr::DatumList::empty(),
     };
     list.iter().map(move |mut e| {
         if stringify {
@@ -907,7 +3145,7 @@ where
 {
     if step == N::zero() {
         return Err(EvalError::InvalidParameterValue(
-            "step size cannot equal zero".to_owned(),
+            "step size cannot equal zero".into(),
         ));
     }
     Ok(num::range_step_inclusive(start, stop, step)
@@ -918,28 +3156,29 @@ where
 /// [`num::range_step_inclusive`](https://github.com/rust-num/num-iter/blob/ddb14c1e796d401014c6c7a727de61d8109ad986/src/lib.rs#L279),
 /// but for our timestamp types using [`Interval`] for `step`.xwxw
 #[derive(Clone)]
-pub struct TimestampRangeStepInclusive {
-    state: NaiveDateTime,
-    stop: NaiveDateTime,
+pub struct TimestampRangeStepInclusive<T> {
+    state: CheckedTimestamp<T>,
+    stop: CheckedTimestamp<T>,
     step: Interval,
     rev: bool,
     done: bool,
 }
 
-impl Iterator for TimestampRangeStepInclusive {
-    type Item = NaiveDateTime;
+impl<T: TimestampLike> Iterator for TimestampRangeStepInclusive<T> {
+    type Item = CheckedTimestamp<T>;
 
     #[inline]
-    fn next(&mut self) -> Option<NaiveDateTime> {
+    fn next(&mut self) -> Option<CheckedTimestamp<T>> {
         if !self.done
             && ((self.rev && self.state >= self.stop) || (!self.rev && self.state <= self.stop))
         {
             let result = self.state.clone();
-            match add_timestamp_months(self.state, self.step.months) {
+            match add_timestamp_months(self.state.deref(), self.step.months) {
                 Ok(state) => match state.checked_add_signed(self.step.duration_as_chrono()) {
-                    Some(v) => {
-                        self.state = v;
-                    }
+                    Some(v) => match CheckedTimestamp::from_timestamplike(v) {
+                        Ok(v) => self.state = v,
+                        Err(_) => self.done = true,
+                    },
                     None => self.done = true,
                 },
                 Err(..) => {
@@ -954,20 +3193,21 @@ impl Iterator for TimestampRangeStepInclusive {
     }
 }
 
-fn generate_series_ts(
-    start: NaiveDateTime,
-    stop: NaiveDateTime,
+fn generate_series_ts<T: TimestampLike>(
+    start: CheckedTimestamp<T>,
+    stop: CheckedTimestamp<T>,
     step: Interval,
-    conv: fn(NaiveDateTime) -> Datum<'static>,
+    conv: fn(CheckedTimestamp<T>) -> Datum<'static>,
 ) -> Result<impl Iterator<Item = (Row, Diff)>, EvalError> {
-    if step.months == 0 && step.duration == 0 {
+    let normalized_step = step.as_microseconds();
+    if normalized_step == 0 {
         return Err(EvalError::InvalidParameterValue(
-            "step size cannot equal zero".to_owned(),
+            "step size cannot equal zero".into(),
         ));
     }
-    let rev = step.duration < 0;
+    let rev = normalized_step < 0;
 
-    let tsri = TimestampRangeStepInclusive {
+    let trsi = TimestampRangeStepInclusive {
         state: start,
         stop,
         step,
@@ -975,7 +3215,7 @@ fn generate_series_ts(
         done: false,
     };
 
-    Ok(tsri.map(move |i| (Row::pack_slice(&[conv(i)]), 1)))
+    Ok(trsi.map(move |i| (Row::pack_slice(&[conv(i)]), 1)))
 }
 
 fn generate_subscripts_array(
@@ -989,17 +3229,16 @@ fn generate_subscripts_array(
     match a.unwrap_array().dims().into_iter().nth(
         (dim - 1)
             .try_into()
-            .map_err(|_| EvalError::Int32OutOfRange)?,
+            .map_err(|_| EvalError::Int32OutOfRange((dim - 1).to_string().into()))?,
     ) {
         Some(requested_dim) => Ok(Box::new(generate_series::<i32>(
-            requested_dim
-                .lower_bound
-                .try_into()
-                .map_err(|_| EvalError::Int32OutOfRange)?,
+            requested_dim.lower_bound.try_into().map_err(|_| {
+                EvalError::Int32OutOfRange(requested_dim.lower_bound.to_string().into())
+            })?,
             requested_dim
                 .length
                 .try_into()
-                .map_err(|_| EvalError::Int32OutOfRange)?,
+                .map_err(|_| EvalError::Int32OutOfRange(requested_dim.length.to_string().into()))?,
             1,
         )?)),
         None => Ok(Box::new(iter::empty())),
@@ -1019,64 +3258,236 @@ fn unnest_list<'a>(a: Datum<'a>) -> impl Iterator<Item = (Row, Diff)> + 'a {
         .map(move |e| (Row::pack_slice(&[e]), 1))
 }
 
-impl fmt::Display for AggregateFunc {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+fn unnest_map<'a>(a: Datum<'a>) -> impl Iterator<Item = (Row, Diff)> + 'a {
+    a.unwrap_map()
+        .iter()
+        .map(move |(k, v)| (Row::pack_slice(&[Datum::from(k), v]), 1))
+}
+
+impl AggregateFunc {
+    /// The base function name without the `~[...]` suffix used when rendering
+    /// variants that represent a parameterized function family.
+    pub fn name(&self) -> &'static str {
         match self {
-            AggregateFunc::MaxNumeric => f.write_str("max"),
-            AggregateFunc::MaxInt16 => f.write_str("max"),
-            AggregateFunc::MaxInt32 => f.write_str("max"),
-            AggregateFunc::MaxInt64 => f.write_str("max"),
-            AggregateFunc::MaxFloat32 => f.write_str("max"),
-            AggregateFunc::MaxFloat64 => f.write_str("max"),
-            AggregateFunc::MaxBool => f.write_str("max"),
-            AggregateFunc::MaxString => f.write_str("max"),
-            AggregateFunc::MaxDate => f.write_str("max"),
-            AggregateFunc::MaxTimestamp => f.write_str("max"),
-            AggregateFunc::MaxTimestampTz => f.write_str("max"),
-            AggregateFunc::MinNumeric => f.write_str("min"),
-            AggregateFunc::MinInt16 => f.write_str("min"),
-            AggregateFunc::MinInt32 => f.write_str("min"),
-            AggregateFunc::MinInt64 => f.write_str("min"),
-            AggregateFunc::MinFloat32 => f.write_str("min"),
-            AggregateFunc::MinFloat64 => f.write_str("min"),
-            AggregateFunc::MinBool => f.write_str("min"),
-            AggregateFunc::MinString => f.write_str("min"),
-            AggregateFunc::MinDate => f.write_str("min"),
-            AggregateFunc::MinTimestamp => f.write_str("min"),
-            AggregateFunc::MinTimestampTz => f.write_str("min"),
-            AggregateFunc::SumInt16 => f.write_str("sum"),
-            AggregateFunc::SumInt32 => f.write_str("sum"),
-            AggregateFunc::SumInt64 => f.write_str("sum"),
-            AggregateFunc::SumFloat32 => f.write_str("sum"),
-            AggregateFunc::SumFloat64 => f.write_str("sum"),
-            AggregateFunc::SumNumeric => f.write_str("sum"),
-            AggregateFunc::Count => f.write_str("count"),
-            AggregateFunc::Any => f.write_str("any"),
-            AggregateFunc::All => f.write_str("all"),
-            AggregateFunc::JsonbAgg { .. } => f.write_str("jsonb_agg"),
-            AggregateFunc::JsonbObjectAgg { .. } => f.write_str("jsonb_object_agg"),
-            AggregateFunc::ArrayConcat { .. } => f.write_str("array_agg"),
-            AggregateFunc::ListConcat { .. } => f.write_str("list_agg"),
-            AggregateFunc::StringAgg { .. } => f.write_str("string_agg"),
-            AggregateFunc::RowNumber { .. } => f.write_str("row_number"),
-            AggregateFunc::Dummy => f.write_str("dummy"),
+            Self::MaxNumeric => "max",
+            Self::MaxInt16 => "max",
+            Self::MaxInt32 => "max",
+            Self::MaxInt64 => "max",
+            Self::MaxUInt16 => "max",
+            Self::MaxUInt32 => "max",
+            Self::MaxUInt64 => "max",
+            Self::MaxMzTimestamp => "max",
+            Self::MaxFloat32 => "max",
+            Self::MaxFloat64 => "max",
+            Self::MaxBool => "max",
+            Self::MaxString => "max",
+            Self::MaxDate => "max",
+            Self::MaxTimestamp => "max",
+            Self::MaxTimestampTz => "max",
+            Self::MaxInterval => "max",
+            Self::MaxTime => "max",
+            Self::MinNumeric => "min",
+            Self::MinInt16 => "min",
+            Self::MinInt32 => "min",
+            Self::MinInt64 => "min",
+            Self::MinUInt16 => "min",
+            Self::MinUInt32 => "min",
+            Self::MinUInt64 => "min",
+            Self::MinMzTimestamp => "min",
+            Self::MinFloat32 => "min",
+            Self::MinFloat64 => "min",
+            Self::MinBool => "min",
+            Self::MinString => "min",
+            Self::MinDate => "min",
+            Self::MinTimestamp => "min",
+            Self::MinTimestampTz => "min",
+            Self::MinInterval => "min",
+            Self::MinTime => "min",
+            Self::SumInt16 => "sum",
+            Self::SumInt32 => "sum",
+            Self::SumInt64 => "sum",
+            Self::SumUInt16 => "sum",
+            Self::SumUInt32 => "sum",
+            Self::SumUInt64 => "sum",
+            Self::SumFloat32 => "sum",
+            Self::SumFloat64 => "sum",
+            Self::SumNumeric => "sum",
+            Self::Count => "count",
+            Self::Any => "any",
+            Self::All => "all",
+            Self::JsonbAgg { .. } => "jsonb_agg",
+            Self::JsonbObjectAgg { .. } => "jsonb_object_agg",
+            Self::MapAgg { .. } => "map_agg",
+            Self::ArrayConcat { .. } => "array_agg",
+            Self::ListConcat { .. } => "list_agg",
+            Self::StringAgg { .. } => "string_agg",
+            Self::RowNumber { .. } => "row_number",
+            Self::Rank { .. } => "rank",
+            Self::DenseRank { .. } => "dense_rank",
+            Self::LagLead {
+                lag_lead: LagLeadType::Lag,
+                ..
+            } => "lag",
+            Self::LagLead {
+                lag_lead: LagLeadType::Lead,
+                ..
+            } => "lead",
+            Self::FirstValue { .. } => "first_value",
+            Self::LastValue { .. } => "last_value",
+            Self::WindowAggregate { .. } => "window_agg",
+            Self::FusedValueWindowFunc { .. } => "fused_value_window_func",
+            Self::FusedWindowAggregate { .. } => "fused_window_agg",
+            Self::Dummy => "dummy",
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+impl<'a, M> fmt::Display for HumanizedExpr<'a, AggregateFunc, M>
+where
+    M: HumanizerMode,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use AggregateFunc::*;
+        let name = self.expr.name();
+        match self.expr {
+            JsonbAgg { order_by }
+            | JsonbObjectAgg { order_by }
+            | MapAgg { order_by, .. }
+            | ArrayConcat { order_by }
+            | ListConcat { order_by }
+            | StringAgg { order_by }
+            | RowNumber { order_by }
+            | Rank { order_by }
+            | DenseRank { order_by } => {
+                let order_by = order_by.iter().map(|col| self.child(col));
+                write!(f, "{}[order_by=[{}]]", name, separated(", ", order_by))
+            }
+            LagLead {
+                lag_lead: _,
+                ignore_nulls,
+                order_by,
+            } => {
+                let order_by = order_by.iter().map(|col| self.child(col));
+                f.write_str(name)?;
+                f.write_str("[")?;
+                if *ignore_nulls {
+                    f.write_str("ignore_nulls=true, ")?;
+                }
+                write!(f, "order_by=[{}]", separated(", ", order_by))?;
+                f.write_str("]")
+            }
+            FirstValue {
+                order_by,
+                window_frame,
+            } => {
+                let order_by = order_by.iter().map(|col| self.child(col));
+                f.write_str(name)?;
+                f.write_str("[")?;
+                write!(f, "order_by=[{}]", separated(", ", order_by))?;
+                if *window_frame != WindowFrame::default() {
+                    write!(f, " {}", window_frame)?;
+                }
+                f.write_str("]")
+            }
+            LastValue {
+                order_by,
+                window_frame,
+            } => {
+                let order_by = order_by.iter().map(|col| self.child(col));
+                f.write_str(name)?;
+                f.write_str("[")?;
+                write!(f, "order_by=[{}]", separated(", ", order_by))?;
+                if *window_frame != WindowFrame::default() {
+                    write!(f, " {}", window_frame)?;
+                }
+                f.write_str("]")
+            }
+            WindowAggregate {
+                wrapped_aggregate,
+                order_by,
+                window_frame,
+            } => {
+                let order_by = order_by.iter().map(|col| self.child(col));
+                let wrapped_aggregate = self.child(wrapped_aggregate.deref());
+                f.write_str(name)?;
+                f.write_str("[")?;
+                write!(f, "{} ", wrapped_aggregate)?;
+                write!(f, "order_by=[{}]", separated(", ", order_by))?;
+                if *window_frame != WindowFrame::default() {
+                    write!(f, " {}", window_frame)?;
+                }
+                f.write_str("]")
+            }
+            FusedValueWindowFunc { funcs, order_by } => {
+                let order_by = order_by.iter().map(|col| self.child(col));
+                let funcs = separated(", ", funcs.iter().map(|func| self.child(func)));
+                f.write_str(name)?;
+                f.write_str("[")?;
+                write!(f, "{} ", funcs)?;
+                write!(f, "order_by=[{}]", separated(", ", order_by))?;
+                f.write_str("]")
+            }
+            _ => f.write_str(name),
+        }
+    }
+}
+
+#[derive(
+    Arbitrary, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzReflect,
+)]
 pub struct CaptureGroupDesc {
     pub index: u32,
     pub name: Option<String>,
     pub nullable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
-pub struct AnalyzedRegex(ReprRegex, Vec<CaptureGroupDesc>);
+impl RustType<ProtoCaptureGroupDesc> for CaptureGroupDesc {
+    fn into_proto(&self) -> ProtoCaptureGroupDesc {
+        ProtoCaptureGroupDesc {
+            index: self.index,
+            name: self.name.clone(),
+            nullable: self.nullable,
+        }
+    }
+
+    fn from_proto(proto: ProtoCaptureGroupDesc) -> Result<Self, TryFromProtoError> {
+        Ok(Self {
+            index: proto.index,
+            name: proto.name,
+            nullable: proto.nullable,
+        })
+    }
+}
+
+#[derive(
+    Arbitrary, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzReflect,
+)]
+pub struct AnalyzedRegex(
+    #[proptest(strategy = "mz_repr::adt::regex::any_regex()")] ReprRegex,
+    Vec<CaptureGroupDesc>,
+);
+
+impl RustType<ProtoAnalyzedRegex> for AnalyzedRegex {
+    fn into_proto(&self) -> ProtoAnalyzedRegex {
+        ProtoAnalyzedRegex {
+            regex: Some(self.0.into_proto()),
+            groups: self.1.into_proto(),
+        }
+    }
+
+    fn from_proto(proto: ProtoAnalyzedRegex) -> Result<Self, TryFromProtoError> {
+        Ok(AnalyzedRegex(
+            proto.regex.into_rust_if_some("ProtoAnalyzedRegex::regex")?,
+            proto.groups.into_rust()?,
+        ))
+    }
+}
 
 impl AnalyzedRegex {
     pub fn new(s: &str) -> Result<Self, regex::Error> {
-        let r = regex::Regex::new(s)?;
+        let r = ReprRegex::new(s, false)?;
+        // TODO(benesch): remove potentially dangerous usage of `as`.
+        #[allow(clippy::as_conversions)]
         let descs: Vec<_> = r
             .capture_names()
             .enumerate()
@@ -1089,11 +3500,11 @@ impl AnalyzedRegex {
                 index: i as u32,
                 name: name.map(String::from),
                 // TODO -- we can do better.
-                // https://github.com/MaterializeInc/materialize/issues/1685
+                // https://github.com/MaterializeInc/database-issues/issues/612
                 nullable: true,
             })
             .collect();
-        Ok(Self(ReprRegex(r), descs))
+        Ok(Self(r, descs))
     }
     pub fn capture_groups_len(&self) -> usize {
         self.1.len()
@@ -1102,7 +3513,7 @@ impl AnalyzedRegex {
         self.1.iter()
     }
     pub fn inner(&self) -> &Regex {
-        &(self.0).0
+        &(self.0).regex
     }
 }
 
@@ -1114,15 +3525,15 @@ pub fn csv_extract(a: Datum, n_cols: usize) -> impl Iterator<Item = (Row, Diff)>
         .from_reader(bytes);
     csv_reader.into_records().filter_map(move |res| match res {
         Ok(sr) if sr.len() == n_cols => {
-            row.extend(sr.iter().map(Datum::String));
-            Some((row.finish_and_reuse(), 1))
+            row.packer().extend(sr.iter().map(Datum::String));
+            Some((row.clone(), 1))
         }
         _ => None,
     })
 }
 
 pub fn repeat(a: Datum) -> Option<(Row, Diff)> {
-    let n = Diff::cast_from(a.unwrap_int64());
+    let n = a.unwrap_int64();
     if n != 0 {
         Some((Row::default(), n))
     } else {
@@ -1134,8 +3545,62 @@ fn wrap<'a>(datums: &'a [Datum<'a>], width: usize) -> impl Iterator<Item = (Row,
     datums.chunks(width).map(|chunk| (Row::pack(chunk), 1))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzEnumReflect)]
+fn acl_explode<'a>(
+    acl_items: Datum<'a>,
+    temp_storage: &'a RowArena,
+) -> Result<impl Iterator<Item = (Row, Diff)> + 'a, EvalError> {
+    let acl_items = acl_items.unwrap_array();
+    let mut res = Vec::new();
+    for acl_item in acl_items.elements().iter() {
+        if acl_item.is_null() {
+            return Err(EvalError::AclArrayNullElement);
+        }
+        let acl_item = acl_item.unwrap_acl_item();
+        for privilege in acl_item.acl_mode.explode() {
+            let row = [
+                Datum::UInt32(acl_item.grantor.0),
+                Datum::UInt32(acl_item.grantee.0),
+                Datum::String(temp_storage.push_string(privilege.to_string())),
+                // GRANT OPTION is not implemented, so we hardcode false.
+                Datum::False,
+            ];
+            res.push((Row::pack_slice(&row), 1));
+        }
+    }
+    Ok(res.into_iter())
+}
+
+fn mz_acl_explode<'a>(
+    mz_acl_items: Datum<'a>,
+    temp_storage: &'a RowArena,
+) -> Result<impl Iterator<Item = (Row, Diff)> + 'a, EvalError> {
+    let mz_acl_items = mz_acl_items.unwrap_array();
+    let mut res = Vec::new();
+    for mz_acl_item in mz_acl_items.elements().iter() {
+        if mz_acl_item.is_null() {
+            return Err(EvalError::MzAclArrayNullElement);
+        }
+        let mz_acl_item = mz_acl_item.unwrap_mz_acl_item();
+        for privilege in mz_acl_item.acl_mode.explode() {
+            let row = [
+                Datum::String(temp_storage.push_string(mz_acl_item.grantor.to_string())),
+                Datum::String(temp_storage.push_string(mz_acl_item.grantee.to_string())),
+                Datum::String(temp_storage.push_string(privilege.to_string())),
+                // GRANT OPTION is not implemented, so we hardcode false.
+                Datum::False,
+            ];
+            res.push((Row::pack_slice(&row), 1));
+        }
+    }
+    Ok(res.into_iter())
+}
+
+#[derive(
+    Arbitrary, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzReflect,
+)]
 pub enum TableFunc {
+    AclExplode,
+    MzAclExplode,
     JsonbEach {
         stringify: bool,
     },
@@ -1156,6 +3621,9 @@ pub enum TableFunc {
     UnnestList {
         el_typ: ScalarType,
     },
+    UnnestMap {
+        value_type: ScalarType,
+    },
     /// Given `n` input expressions, wraps them into `n / width` rows, each of
     /// `width` columns.
     ///
@@ -1166,6 +3634,91 @@ pub enum TableFunc {
         width: usize,
     },
     GenerateSubscriptsArray,
+    /// Execute some arbitrary scalar function as a table function.
+    TabletizedScalar {
+        name: String,
+        relation: RelationType,
+    },
+}
+
+impl RustType<ProtoTableFunc> for TableFunc {
+    fn into_proto(&self) -> ProtoTableFunc {
+        use proto_table_func::{Kind, ProtoWrap};
+
+        ProtoTableFunc {
+            kind: Some(match self {
+                TableFunc::AclExplode => Kind::AclExplode(()),
+                TableFunc::MzAclExplode => Kind::MzAclExplode(()),
+                TableFunc::JsonbEach { stringify } => Kind::JsonbEach(*stringify),
+                TableFunc::JsonbObjectKeys => Kind::JsonbObjectKeys(()),
+                TableFunc::JsonbArrayElements { stringify } => Kind::JsonbArrayElements(*stringify),
+                TableFunc::RegexpExtract(x) => Kind::RegexpExtract(x.into_proto()),
+                TableFunc::CsvExtract(x) => Kind::CsvExtract(x.into_proto()),
+                TableFunc::GenerateSeriesInt32 => Kind::GenerateSeriesInt32(()),
+                TableFunc::GenerateSeriesInt64 => Kind::GenerateSeriesInt64(()),
+                TableFunc::GenerateSeriesTimestamp => Kind::GenerateSeriesTimestamp(()),
+                TableFunc::GenerateSeriesTimestampTz => Kind::GenerateSeriesTimestampTz(()),
+                TableFunc::Repeat => Kind::Repeat(()),
+                TableFunc::UnnestArray { el_typ } => Kind::UnnestArray(el_typ.into_proto()),
+                TableFunc::UnnestList { el_typ } => Kind::UnnestList(el_typ.into_proto()),
+                TableFunc::UnnestMap { value_type } => Kind::UnnestMap(value_type.into_proto()),
+                TableFunc::Wrap { types, width } => Kind::Wrap(ProtoWrap {
+                    types: types.into_proto(),
+                    width: width.into_proto(),
+                }),
+                TableFunc::GenerateSubscriptsArray => Kind::GenerateSubscriptsArray(()),
+                TableFunc::TabletizedScalar { name, relation } => {
+                    Kind::TabletizedScalar(ProtoTabletizedScalar {
+                        name: name.into_proto(),
+                        relation: Some(relation.into_proto()),
+                    })
+                }
+            }),
+        }
+    }
+
+    fn from_proto(proto: ProtoTableFunc) -> Result<Self, TryFromProtoError> {
+        use proto_table_func::Kind;
+
+        let kind = proto
+            .kind
+            .ok_or_else(|| TryFromProtoError::missing_field("ProtoTableFunc::Kind"))?;
+
+        Ok(match kind {
+            Kind::AclExplode(()) => TableFunc::AclExplode,
+            Kind::MzAclExplode(()) => TableFunc::MzAclExplode,
+            Kind::JsonbEach(stringify) => TableFunc::JsonbEach { stringify },
+            Kind::JsonbObjectKeys(()) => TableFunc::JsonbObjectKeys,
+            Kind::JsonbArrayElements(stringify) => TableFunc::JsonbArrayElements { stringify },
+            Kind::RegexpExtract(x) => TableFunc::RegexpExtract(x.into_rust()?),
+            Kind::CsvExtract(x) => TableFunc::CsvExtract(x.into_rust()?),
+            Kind::GenerateSeriesInt32(()) => TableFunc::GenerateSeriesInt32,
+            Kind::GenerateSeriesInt64(()) => TableFunc::GenerateSeriesInt64,
+            Kind::GenerateSeriesTimestamp(()) => TableFunc::GenerateSeriesTimestamp,
+            Kind::GenerateSeriesTimestampTz(()) => TableFunc::GenerateSeriesTimestampTz,
+            Kind::Repeat(()) => TableFunc::Repeat,
+            Kind::UnnestArray(x) => TableFunc::UnnestArray {
+                el_typ: x.into_rust()?,
+            },
+            Kind::UnnestList(x) => TableFunc::UnnestList {
+                el_typ: x.into_rust()?,
+            },
+            Kind::UnnestMap(value_type) => TableFunc::UnnestMap {
+                value_type: value_type.into_rust()?,
+            },
+            Kind::Wrap(x) => TableFunc::Wrap {
+                width: x.width.into_rust()?,
+                types: x.types.into_rust()?,
+            },
+            Kind::GenerateSubscriptsArray(()) => TableFunc::GenerateSubscriptsArray,
+            Kind::TabletizedScalar(v) => TableFunc::TabletizedScalar {
+                name: v.name,
+                relation: v
+                    .relation
+                    .into_rust_if_some("ProtoTabletizedScalar::relation")?,
+            },
+        })
+    }
 }
 
 impl TableFunc {
@@ -1178,6 +3731,8 @@ impl TableFunc {
             return Ok(Box::new(vec![].into_iter()));
         }
         match self {
+            TableFunc::AclExplode => Ok(Box::new(acl_explode(datums[0], temp_storage)?)),
+            TableFunc::MzAclExplode => Ok(Box::new(mz_acl_explode(datums[0], temp_storage)?)),
             TableFunc::JsonbEach { stringify } => {
                 Ok(Box::new(jsonb_each(datums[0], temp_storage, *stringify)))
             }
@@ -1206,7 +3761,7 @@ impl TableFunc {
                 Ok(Box::new(res))
             }
             TableFunc::GenerateSeriesTimestamp => {
-                fn pass_through<'a>(d: NaiveDateTime) -> Datum<'a> {
+                fn pass_through<'a>(d: CheckedTimestamp<NaiveDateTime>) -> Datum<'a> {
                     Datum::from(d)
                 }
                 let res = generate_series_ts(
@@ -1218,12 +3773,12 @@ impl TableFunc {
                 Ok(Box::new(res))
             }
             TableFunc::GenerateSeriesTimestampTz => {
-                fn gen_ts_tz<'a>(d: NaiveDateTime) -> Datum<'a> {
-                    Datum::from(DateTime::<Utc>::from_utc(d, Utc))
+                fn gen_ts_tz<'a>(d: CheckedTimestamp<DateTime<Utc>>) -> Datum<'a> {
+                    Datum::from(d)
                 }
                 let res = generate_series_ts(
-                    datums[0].unwrap_timestamptz().naive_utc(),
-                    datums[1].unwrap_timestamptz().naive_utc(),
+                    datums[0].unwrap_timestamptz(),
+                    datums[1].unwrap_timestamptz(),
                     datums[2].unwrap_interval(),
                     gen_ts_tz,
                 )?;
@@ -1235,54 +3790,153 @@ impl TableFunc {
             TableFunc::Repeat => Ok(Box::new(repeat(datums[0]).into_iter())),
             TableFunc::UnnestArray { .. } => Ok(Box::new(unnest_array(datums[0]))),
             TableFunc::UnnestList { .. } => Ok(Box::new(unnest_list(datums[0]))),
-            TableFunc::Wrap { width, .. } => Ok(Box::new(wrap(&datums, *width))),
+            TableFunc::UnnestMap { .. } => Ok(Box::new(unnest_map(datums[0]))),
+            TableFunc::Wrap { width, .. } => Ok(Box::new(wrap(datums, *width))),
+            TableFunc::TabletizedScalar { .. } => {
+                let r = Row::pack_slice(datums);
+                Ok(Box::new(std::iter::once((r, 1))))
+            }
         }
     }
 
     pub fn output_type(&self) -> RelationType {
-        RelationType::new(match self {
-            TableFunc::JsonbEach { stringify: true } => vec![
-                ScalarType::String.nullable(false),
-                ScalarType::String.nullable(true),
-            ],
-            TableFunc::JsonbEach { stringify: false } => vec![
-                ScalarType::String.nullable(false),
-                ScalarType::Jsonb.nullable(false),
-            ],
-            TableFunc::JsonbObjectKeys => vec![ScalarType::String.nullable(false)],
+        let (column_types, keys) = match self {
+            TableFunc::AclExplode => {
+                let column_types = vec![
+                    ScalarType::Oid.nullable(false),
+                    ScalarType::Oid.nullable(false),
+                    ScalarType::String.nullable(false),
+                    ScalarType::Bool.nullable(false),
+                ];
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::MzAclExplode => {
+                let column_types = vec![
+                    ScalarType::String.nullable(false),
+                    ScalarType::String.nullable(false),
+                    ScalarType::String.nullable(false),
+                    ScalarType::Bool.nullable(false),
+                ];
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::JsonbEach { stringify: true } => {
+                let column_types = vec![
+                    ScalarType::String.nullable(false),
+                    ScalarType::String.nullable(true),
+                ];
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::JsonbEach { stringify: false } => {
+                let column_types = vec![
+                    ScalarType::String.nullable(false),
+                    ScalarType::Jsonb.nullable(false),
+                ];
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::JsonbObjectKeys => {
+                let column_types = vec![ScalarType::String.nullable(false)];
+                let keys = vec![];
+                (column_types, keys)
+            }
             TableFunc::JsonbArrayElements { stringify: true } => {
-                vec![ScalarType::String.nullable(true)]
+                let column_types = vec![ScalarType::String.nullable(true)];
+                let keys = vec![];
+                (column_types, keys)
             }
             TableFunc::JsonbArrayElements { stringify: false } => {
-                vec![ScalarType::Jsonb.nullable(false)]
+                let column_types = vec![ScalarType::Jsonb.nullable(false)];
+                let keys = vec![];
+                (column_types, keys)
             }
-            TableFunc::RegexpExtract(a) => a
-                .capture_groups_iter()
-                .map(|cg| ScalarType::String.nullable(cg.nullable))
-                .collect(),
-            TableFunc::CsvExtract(n_cols) => iter::repeat(ScalarType::String.nullable(false))
-                .take(*n_cols)
-                .collect(),
+            TableFunc::RegexpExtract(a) => {
+                let column_types = a
+                    .capture_groups_iter()
+                    .map(|cg| ScalarType::String.nullable(cg.nullable))
+                    .collect();
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::CsvExtract(n_cols) => {
+                let column_types = iter::repeat(ScalarType::String.nullable(false))
+                    .take(*n_cols)
+                    .collect();
+                let keys = vec![];
+                (column_types, keys)
+            }
             TableFunc::GenerateSeriesInt32 => {
-                vec![ScalarType::Int32.nullable(false)]
+                let column_types = vec![ScalarType::Int32.nullable(false)];
+                let keys = vec![vec![0]];
+                (column_types, keys)
             }
             TableFunc::GenerateSeriesInt64 => {
-                vec![ScalarType::Int64.nullable(false)]
+                let column_types = vec![ScalarType::Int64.nullable(false)];
+                let keys = vec![vec![0]];
+                (column_types, keys)
             }
-            TableFunc::GenerateSeriesTimestamp => vec![ScalarType::Timestamp.nullable(false)],
-            TableFunc::GenerateSeriesTimestampTz => vec![ScalarType::TimestampTz.nullable(false)],
+            TableFunc::GenerateSeriesTimestamp => {
+                let column_types = vec![ScalarType::Timestamp { precision: None }.nullable(false)];
+                let keys = vec![vec![0]];
+                (column_types, keys)
+            }
+            TableFunc::GenerateSeriesTimestampTz => {
+                let column_types =
+                    vec![ScalarType::TimestampTz { precision: None }.nullable(false)];
+                let keys = vec![vec![0]];
+                (column_types, keys)
+            }
             TableFunc::GenerateSubscriptsArray => {
-                vec![ScalarType::Int32.nullable(false)]
+                let column_types = vec![ScalarType::Int32.nullable(false)];
+                let keys = vec![vec![0]];
+                (column_types, keys)
             }
-            TableFunc::Repeat => vec![],
-            TableFunc::UnnestArray { el_typ } => vec![el_typ.clone().nullable(true)],
-            TableFunc::UnnestList { el_typ } => vec![el_typ.clone().nullable(true)],
-            TableFunc::Wrap { types, .. } => types.clone(),
-        })
+            TableFunc::Repeat => {
+                let column_types = vec![];
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::UnnestArray { el_typ } => {
+                let column_types = vec![el_typ.clone().nullable(true)];
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::UnnestList { el_typ } => {
+                let column_types = vec![el_typ.clone().nullable(true)];
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::UnnestMap { value_type } => {
+                let column_types = vec![
+                    ScalarType::String.nullable(false),
+                    value_type.clone().nullable(true),
+                ];
+                let keys = vec![vec![0]];
+                (column_types, keys)
+            }
+            TableFunc::Wrap { types, .. } => {
+                let column_types = types.clone();
+                let keys = vec![];
+                (column_types, keys)
+            }
+            TableFunc::TabletizedScalar { relation, .. } => {
+                return relation.clone();
+            }
+        };
+
+        if !keys.is_empty() {
+            RelationType::new(column_types).with_keys(keys)
+        } else {
+            RelationType::new(column_types)
+        }
     }
 
     pub fn output_arity(&self) -> usize {
         match self {
+            TableFunc::AclExplode => 4,
+            TableFunc::MzAclExplode => 4,
             TableFunc::JsonbEach { .. } => 2,
             TableFunc::JsonbObjectKeys => 1,
             TableFunc::JsonbArrayElements { .. } => 1,
@@ -1296,13 +3950,17 @@ impl TableFunc {
             TableFunc::Repeat => 0,
             TableFunc::UnnestArray { .. } => 1,
             TableFunc::UnnestList { .. } => 1,
+            TableFunc::UnnestMap { .. } => 2,
             TableFunc::Wrap { width, .. } => *width,
+            TableFunc::TabletizedScalar { relation, .. } => relation.column_types.len(),
         }
     }
 
     pub fn empty_on_null_input(&self) -> bool {
         match self {
-            TableFunc::JsonbEach { .. }
+            TableFunc::AclExplode
+            | TableFunc::MzAclExplode
+            | TableFunc::JsonbEach { .. }
             | TableFunc::JsonbObjectKeys
             | TableFunc::JsonbArrayElements { .. }
             | TableFunc::GenerateSeriesInt32
@@ -1314,8 +3972,10 @@ impl TableFunc {
             | TableFunc::CsvExtract(_)
             | TableFunc::Repeat
             | TableFunc::UnnestArray { .. }
-            | TableFunc::UnnestList { .. } => true,
+            | TableFunc::UnnestList { .. }
+            | TableFunc::UnnestMap { .. } => true,
             TableFunc::Wrap { .. } => false,
+            TableFunc::TabletizedScalar { .. } => false,
         }
     }
 
@@ -1324,6 +3984,8 @@ impl TableFunc {
         // Most variants preserve monotonicity, but all variants are enumerated to
         // ensure that added variants at least check that this is the case.
         match self {
+            TableFunc::AclExplode => false,
+            TableFunc::MzAclExplode => false,
             TableFunc::JsonbEach { .. } => true,
             TableFunc::JsonbObjectKeys => true,
             TableFunc::JsonbArrayElements { .. } => true,
@@ -1337,7 +3999,9 @@ impl TableFunc {
             TableFunc::Repeat => false,
             TableFunc::UnnestArray { .. } => true,
             TableFunc::UnnestList { .. } => true,
+            TableFunc::UnnestMap { .. } => true,
             TableFunc::Wrap { .. } => true,
+            TableFunc::TabletizedScalar { .. } => true,
         }
     }
 }
@@ -1345,6 +4009,8 @@ impl TableFunc {
 impl fmt::Display for TableFunc {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            TableFunc::AclExplode => f.write_str("aclexplode"),
+            TableFunc::MzAclExplode => f.write_str("mz_aclexplode"),
             TableFunc::JsonbEach { .. } => f.write_str("jsonb_each"),
             TableFunc::JsonbObjectKeys => f.write_str("jsonb_object_keys"),
             TableFunc::JsonbArrayElements { .. } => f.write_str("jsonb_array_elements"),
@@ -1358,7 +4024,37 @@ impl fmt::Display for TableFunc {
             TableFunc::Repeat => f.write_str("repeat_row"),
             TableFunc::UnnestArray { .. } => f.write_str("unnest_array"),
             TableFunc::UnnestList { .. } => f.write_str("unnest_list"),
+            TableFunc::UnnestMap { .. } => f.write_str("unnest_map"),
             TableFunc::Wrap { width, .. } => write!(f, "wrap{}", width),
+            TableFunc::TabletizedScalar { name, .. } => f.write_str(name),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AggregateFunc, ProtoAggregateFunc, ProtoTableFunc, TableFunc};
+    use mz_ore::assert_ok;
+    use mz_proto::protobuf_roundtrip;
+    use proptest::prelude::*;
+
+    proptest! {
+       #[mz_ore::test]
+        #[cfg_attr(miri, ignore)] // too slow
+        fn aggregate_func_protobuf_roundtrip(expect in any::<AggregateFunc>() ) {
+            let actual = protobuf_roundtrip::<_, ProtoAggregateFunc>(&expect);
+            assert_ok!(actual);
+            assert_eq!(actual.unwrap(), expect);
+        }
+    }
+
+    proptest! {
+       #[mz_ore::test]
+        #[cfg_attr(miri, ignore)] // too slow
+        fn table_func_protobuf_roundtrip(expect in any::<TableFunc>() ) {
+            let actual = protobuf_roundtrip::<_, ProtoTableFunc>(&expect);
+            assert_ok!(actual);
+            assert_eq!(actual.unwrap(), expect);
         }
     }
 }

@@ -71,10 +71,14 @@
 # Make sure the plan for those queries actually involve the TopK operator
 $ set-regex match=u\d+ replacement=UID
 
-? EXPLAIN SELECT * FROM (SELECT * FROM char_table ORDER BY f1 LIMIT 1 OFFSET 0)
-%0 =
-| Get materialize.public.char_table (UID)
-| TopK group=() order=(#0 asc) limit=1 offset=0
+? EXPLAIN SELECT * FROM (SELECT * FROM char_table ORDER BY f1 NULLS FIRST LIMIT 1 OFFSET 0)
+Explained Query:
+  TopK order_by=[#0 asc nulls_first] limit=1
+    ReadStorage materialize.public.char_table
+
+Source materialize.public.char_table
+
+Target cluster: quickstart
 
 > SELECT * FROM (SELECT * FROM char_table ORDER BY f1 LIMIT 1 OFFSET 0)
 "                    " "empty string"

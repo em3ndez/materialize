@@ -47,25 +47,38 @@
 //! work around condition 1 by pushing down an inner reduce through the join
 //! while retaining the original outer reduce.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::iter::FromIterator;
 
-use crate::TransformArgs;
-use expr::{AggregateExpr, JoinInputMapper, MirRelationExpr, MirScalarExpr};
+use mz_expr::visit::Visit;
+use mz_expr::{AggregateExpr, JoinInputMapper, MirRelationExpr, MirScalarExpr};
+
+use crate::TransformCtx;
 
 /// Pushes Reduce operators toward sources.
 #[derive(Debug)]
 pub struct ReductionPushdown;
 
 impl crate::Transform for ReductionPushdown {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "ReductionPushdown"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "reduction_pushdown")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         // `try_visit_mut_pre` is used here because after pushing down a reduction,
         // we want to see if we can push the same reduction further down.
-        relation.try_visit_mut_pre(&mut |e| self.action(e))
+        let result = relation.try_visit_mut_pre(&mut |e| self.action(e));
+        mz_repr::explain::trace_plan(&*relation);
+        result
     }
 }
 
@@ -98,30 +111,30 @@ impl ReductionPushdown {
                 for index in 0..scalars.len() {
                     let (lower, upper) = scalars.split_at_mut(index);
                     upper[0].visit_mut_post(&mut |e| {
-                        if let expr::MirScalarExpr::Column(c) = e {
+                        if let mz_expr::MirScalarExpr::Column(c) = e {
                             if *c >= arity {
                                 *e = lower[*c - arity].clone();
                             }
                         }
-                    });
+                    })?;
                 }
                 for key in group_key.iter_mut() {
                     key.visit_mut_post(&mut |e| {
-                        if let expr::MirScalarExpr::Column(c) = e {
+                        if let mz_expr::MirScalarExpr::Column(c) = e {
                             if *c >= arity {
                                 *e = scalars[*c - arity].clone();
                             }
                         }
-                    });
+                    })?;
                 }
                 for agg in aggregates.iter_mut() {
                     agg.expr.visit_mut_post(&mut |e| {
-                        if let expr::MirScalarExpr::Column(c) = e {
+                        if let mz_expr::MirScalarExpr::Column(c) = e {
                             if *c >= arity {
                                 *e = scalars[*c - arity].clone();
                             }
                         }
-                    });
+                    })?;
                 }
 
                 **input = inner.take_dangerous()
@@ -154,7 +167,7 @@ fn try_push_reduce_through_join(
     group_key: &Vec<MirScalarExpr>,
     aggregates: &Vec<AggregateExpr>,
     monotonic: bool,
-    expected_group_size: Option<usize>,
+    expected_group_size: Option<u64>,
 ) -> Option<MirRelationExpr> {
     // Variable name details:
     // The goal is to turn `old` (`Reduce { Join { <inputs> }}`) into
@@ -170,13 +183,12 @@ fn try_push_reduce_through_join(
     // `<component>` is either `Join {<subset of inputs>}` or
     // `<element of inputs>`.
 
-    let old_join_mapper =
-        JoinInputMapper::new_from_input_types(&inputs.iter().map(|i| i.typ()).collect::<Vec<_>>());
+    let old_join_mapper = JoinInputMapper::new(inputs.as_slice());
     // 1) Partition the join constraints into constraints containing a group
-    //    key and onstraints that don't.
+    //    key and constraints that don't.
     let (new_join_equivalences, component_equivalences): (Vec<_>, Vec<_>) = equivalences
-        .to_vec()
-        .into_iter()
+        .iter()
+        .cloned()
         .partition(|cls| cls.iter().any(|expr| group_key.contains(expr)));
 
     // 2) Find the connected components that remain after removing constraints
@@ -185,7 +197,7 @@ fn try_push_reduce_through_join(
     let mut components = (0..inputs.len()).map(Component::new).collect::<Vec<_>>();
     for equivalence in component_equivalences {
         // a) Find the inputs referenced by the constraint.
-        let inputs_to_connect = HashSet::<usize>::from_iter(
+        let inputs_to_connect = BTreeSet::<usize>::from_iter(
             equivalence
                 .iter()
                 .flat_map(|expr| old_join_mapper.lookup_inputs(expr)),
@@ -217,7 +229,7 @@ fn try_push_reduce_through_join(
     // ```
 
     // Maps (input idxs from old join) -> (idx of component it belongs to)
-    let input_component_map = HashMap::from_iter(
+    let input_component_map = BTreeMap::from_iter(
         components
             .iter()
             .enumerate()
@@ -291,22 +303,21 @@ fn try_push_reduce_through_join(
         {
             if !agg.distinct {
                 // TODO: support non-distinct aggs.
-                // For more details, see https://github.com/MaterializeInc/materialize/issues/9604
+                // For more details, see https://github.com/MaterializeInc/database-issues/issues/2924
                 return None;
             }
             new_projection.push((component, new_reduces[component].arity()));
             new_reduces[component].add_aggregate(agg.clone());
         } else {
             // TODO: support multi- and zero- component aggs
-            // For more details, see https://github.com/MaterializeInc/materialize/issues/9604
+            // For more details, see https://github.com/MaterializeInc/database-issues/issues/2924
             return None;
         }
     }
 
     // 4) Construct the new `MirRelationExpr`.
-    let new_join_mapper = JoinInputMapper::new_from_input_arities(
-        new_reduces.iter().map(|builder| builder.arity()).collect(),
-    );
+    let new_join_mapper =
+        JoinInputMapper::new_from_input_arities(new_reduces.iter().map(|builder| builder.arity()));
 
     let new_inputs = new_reduces
         .into_iter()
@@ -329,23 +340,21 @@ fn try_push_reduce_through_join(
         .map(|(idx, col)| new_join_mapper.map_column_to_global(col, idx))
         .collect::<Vec<_>>();
 
-    return Some(
-        MirRelationExpr::join_scalars(new_inputs, new_equivalences).project(new_projection),
-    );
+    Some(MirRelationExpr::join_scalars(new_inputs, new_equivalences).project(new_projection))
 }
 
 /// Returns None if `expr` does not belong to exactly one component.
 fn lookup_corresponding_component(
     expr: &MirScalarExpr,
     old_join_mapper: &JoinInputMapper,
-    input_component_map: &HashMap<usize, usize>,
+    input_component_map: &BTreeMap<usize, usize>,
 ) -> Option<usize> {
     let mut dedupped = old_join_mapper
         .lookup_inputs(expr)
         .map(|i| input_component_map[&i])
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     if dedupped.len() == 1 {
-        dedupped.drain().next()
+        dedupped.pop_first()
     } else {
         None
     }
@@ -388,7 +397,7 @@ struct ReduceBuilder {
     group_key: Vec<MirScalarExpr>,
     aggregates: Vec<AggregateExpr>,
     /// Maps (global column relative to old join) -> (local column relative to `input`)
-    localize_map: HashMap<usize, usize>,
+    localize_map: BTreeMap<usize, usize>,
 }
 
 impl ReduceBuilder {
@@ -403,7 +412,7 @@ impl ReduceBuilder {
             .flat_map(|i| old_join_mapper.global_columns(*i))
             .enumerate()
             .map(|(local, global)| (global, local))
-            .collect::<HashMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         // Convert the subjoin from the `Component` representation to a
         // `MirRelationExpr` representation.
         let mut inputs = component
@@ -418,7 +427,21 @@ impl ReduceBuilder {
             }
         }
         let input = if inputs.len() == 1 {
-            inputs.pop().unwrap()
+            let mut predicates = Vec::new();
+            for class in component.constraints {
+                for expr in class[1..].iter() {
+                    predicates.push(
+                        class[0]
+                            .clone()
+                            .call_binary(expr.clone(), mz_expr::BinaryFunc::Eq)
+                            .or(class[0]
+                                .clone()
+                                .call_is_null()
+                                .and(expr.clone().call_is_null())),
+                    );
+                }
+            }
+            inputs.pop().unwrap().filter(predicates)
         } else {
             MirRelationExpr::join_scalars(inputs, component.constraints)
         };
@@ -447,7 +470,7 @@ impl ReduceBuilder {
     fn construct_reduce(
         self,
         monotonic: bool,
-        expected_group_size: Option<usize>,
+        expected_group_size: Option<u64>,
     ) -> MirRelationExpr {
         MirRelationExpr::Reduce {
             input: Box::new(self.input),

@@ -69,25 +69,62 @@ macro_rules! bail_unsupported {
     ($feature:expr) => {
         return Err(crate::plan::error::PlanError::Unsupported {
             feature: $feature.to_string(),
-            issue_no: None,
+            discussion_no: None,
         }
         .into())
     };
-    ($issue:expr, $feature:expr) => {
+    ($discussion_no:expr, $feature:expr) => {
         return Err(crate::plan::error::PlanError::Unsupported {
             feature: $feature.to_string(),
-            issue_no: Some($issue),
+            discussion_no: Some($discussion_no),
         }
         .into())
     };
 }
 
-// TODO(benesch): delete this once we use structured errors everywhere.
+macro_rules! bail_never_supported {
+    ($feature:expr, $docs:expr, $details:expr) => {
+        return Err(crate::plan::error::PlanError::NeverSupported {
+            feature: $feature.to_string(),
+            documentation_link: Some($docs.to_string()),
+            details: Some($details.to_string()),
+        }
+        .into())
+    };
+    ($feature:expr, $docs:expr) => {
+        return Err(crate::plan::error::PlanError::NeverSupported {
+            feature: $feature.to_string(),
+            documentation_link: Some($docs.to_string()),
+            details: None,
+        }
+        .into())
+    };
+    ($feature:expr) => {
+        return Err(crate::plan::error::PlanError::NeverSupported {
+            feature: $feature.to_string(),
+            documentation_link: None,
+            details: None,
+        }
+        .into())
+    };
+}
+
+// TODO(benesch): delete these macros once we use structured errors everywhere.
 macro_rules! sql_bail {
     ($($e:expr),* $(,)?) => {
-        return Err(crate::plan::error::PlanError::Unstructured(format!($($e),*)))
+        return Err(sql_err!($($e),*))
     }
 }
+macro_rules! sql_err {
+    ($($e:expr),* $(,)?) => {
+        crate::plan::error::PlanError::Unstructured(format!($($e),*))
+    }
+}
+
+pub const DEFAULT_SCHEMA: &str = "public";
+
+/// The number of concurrent requests we allow at once for webhook sources.
+pub const WEBHOOK_CONCURRENCY_LIMIT: usize = 500;
 
 pub mod ast;
 pub mod catalog;
@@ -96,7 +133,9 @@ pub mod kafka_util;
 pub mod names;
 #[macro_use]
 pub mod normalize;
+pub mod optimizer_metrics;
 pub mod parse;
 pub mod plan;
 pub mod pure;
-pub mod query_model;
+pub mod rbac;
+pub mod session;

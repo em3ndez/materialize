@@ -10,14 +10,18 @@
 //! Utility functions to transform parts of a single `MirRelationExpr`
 //! into canonical form.
 
-use crate::{func, BinaryFunc, MirScalarExpr, UnaryFunc};
-use repr::{Datum, RelationType, ScalarType};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use mz_ore::soft_assert_or_log;
+use mz_repr::{ColumnType, ScalarType};
+
+use crate::visit::Visit;
+use crate::{func, MirScalarExpr, UnaryFunc, VariadicFunc};
 
 /// Canonicalize equivalence classes of a join and expressions contained in them.
 ///
-/// `input_types` can be the `RelationType` of the join or the `RelationType` of
+/// `input_types` can be the [ColumnType]s of the join or the [ColumnType]s of
 /// the individual inputs of the join in order.
 ///
 /// This function:
@@ -30,20 +34,15 @@ use std::collections::HashSet;
 ///   expression, and repeat indefinitely.
 /// * reduces all expressions contained in `equivalences`.
 /// * Does everything that [canonicalize_equivalence_classes] does.
-pub fn canonicalize_equivalences(
+pub fn canonicalize_equivalences<'a, I>(
     equivalences: &mut Vec<Vec<MirScalarExpr>>,
-    input_types: &[RelationType],
-) {
-    // This only aggregates the column types of each input, not the
-    // keys of the inputs. It is unnecessary to aggregate the keys
-    // of the inputs since input keys are unnecessary for reducing
-    // `MirScalarExpr`s.
-    let input_typ = input_types
-        .iter()
-        .fold(RelationType::empty(), |mut typ, i| {
-            typ.column_types.extend_from_slice(&i.column_types[..]);
-            typ
-        });
+    input_column_types: I,
+) where
+    I: Iterator<Item = &'a Vec<ColumnType>>,
+{
+    let column_types = input_column_types
+        .flat_map(|f| f.clone())
+        .collect::<Vec<_>>();
     // Calculate the number of non-leaves for each expression.
     let mut to_reduce = equivalences
         .drain(..)
@@ -72,7 +71,8 @@ pub fn canonicalize_equivalences(
             // which will then replace `to_reduce[i]`.
             let mut new_equivalence = Vec::with_capacity(to_reduce[i].len());
             while let Some((_, mut popped_expr)) = to_reduce[i].pop() {
-                popped_expr.visit_mut_post(&mut |e: &mut MirScalarExpr| {
+                #[allow(deprecated)]
+                popped_expr.visit_mut_post_nolimit(&mut |e: &mut MirScalarExpr| {
                     // If a simpler expression can be found that is equivalent
                     // to e,
                     if let Some(simpler_e) = to_reduce.iter().find_map(|cls| {
@@ -87,7 +87,7 @@ pub fn canonicalize_equivalences(
                         expressions_rewritten = true;
                     }
                 });
-                popped_expr.reduce(&input_typ);
+                popped_expr.reduce(&column_types);
                 new_equivalence.push((rank_complexity(&popped_expr), popped_expr));
             }
             new_equivalence.sort();
@@ -111,8 +111,8 @@ pub fn canonicalize_equivalences(
 /// * ensures the same expression appears in only one equivalence class.
 /// * ensures the equivalence classes are sorted and dedupped.
 /// ```rust
-/// use expr::MirScalarExpr;
-/// use expr::canonicalize::canonicalize_equivalence_classes;
+/// use mz_expr::MirScalarExpr;
+/// use mz_expr::canonicalize::canonicalize_equivalence_classes;
 ///
 /// let mut equivalences = vec![
 ///     vec![MirScalarExpr::Column(1), MirScalarExpr::Column(4)],
@@ -130,7 +130,7 @@ pub fn canonicalize_equivalences(
 /// assert_eq!(expected, equivalences)
 /// ````
 pub fn canonicalize_equivalence_classes(equivalences: &mut Vec<Vec<MirScalarExpr>>) {
-    // Fuse equivalence classes containing the same exprssion.
+    // Fuse equivalence classes containing the same expression.
     for index in 1..equivalences.len() {
         for inner in 0..index {
             if equivalences[index]
@@ -176,12 +176,22 @@ fn rank_complexity(expr: &MirScalarExpr) -> usize {
         return 0;
     }
     let mut non_literal_count = 1;
-    expr.visit_post(&mut |e| {
+    expr.visit_pre(|e| {
         if !e.is_literal() {
             non_literal_count += 1
         }
     });
     non_literal_count
+}
+
+/// Applies a flat_map on a Vec, and overwrites the vec with the result.
+fn flat_map_modify<T, I, F>(v: &mut Vec<T>, f: F)
+where
+    F: FnMut(T) -> I,
+    I: IntoIterator<Item = T>,
+{
+    let mut xx = v.drain(..).flat_map(f).collect();
+    v.append(&mut xx);
 }
 
 /// Canonicalize predicates of a filter.
@@ -193,35 +203,35 @@ fn rank_complexity(expr: &MirScalarExpr) -> usize {
 ///
 /// Additionally, it also removes IS NOT NULL predicates if there is another
 /// null rejecting predicate for the same sub-expression.
-pub fn canonicalize_predicates(predicates: &mut Vec<MirScalarExpr>, input_type: &RelationType) {
+pub fn canonicalize_predicates(predicates: &mut Vec<MirScalarExpr>, column_types: &[ColumnType]) {
+    soft_assert_or_log!(
+        predicates
+            .iter()
+            .all(|p| p.typ(column_types).scalar_type == ScalarType::Bool),
+        "cannot canonicalize predicates that are not of type bool"
+    );
+
     // 1) Reduce each individual predicate.
-    let mut pending_predicates = predicates
-        .drain(..)
-        .map(|mut p| {
-            p.reduce(&input_type);
-            return p;
-        })
-        .collect::<Vec<MirScalarExpr>>();
+    predicates.iter_mut().for_each(|p| p.reduce(column_types));
 
     // 2) Split "A and B" into two predicates: "A" and "B"
-    while let Some(expr) = pending_predicates.pop() {
-        if let MirScalarExpr::CallBinary {
-            func: BinaryFunc::And,
-            expr1,
-            expr2,
-        } = expr
+    // Relies on the `reduce` above having flattened nested ANDs.
+    flat_map_modify(predicates, |p| {
+        if let MirScalarExpr::CallVariadic {
+            func: VariadicFunc::And,
+            exprs,
+        } = p
         {
-            pending_predicates.push(*expr1);
-            pending_predicates.push(*expr2);
+            exprs
         } else {
-            predicates.push(expr);
+            vec![p]
         }
-    }
+    });
 
     // 3) Make non-null requirements explicit as predicates in order for
     // step 4) to be able to simplify AND/OR expressions with IS NULL
     // sub-predicates. This redundancy is removed later by step 5).
-    let mut non_null_columns = HashSet::new();
+    let mut non_null_columns = BTreeSet::new();
     for p in predicates.iter() {
         p.non_null_requirements(&mut non_null_columns);
     }
@@ -276,7 +286,7 @@ pub fn canonicalize_predicates(predicates: &mut Vec<MirScalarExpr>, input_type: 
                             other_predicate,
                             expr,
                             constant_bool,
-                            input_type,
+                            column_types,
                         );
                     }
                     for other_idx in (0..completed.len()).rev() {
@@ -284,7 +294,7 @@ pub fn canonicalize_predicates(predicates: &mut Vec<MirScalarExpr>, input_type: 
                             &mut completed[other_idx],
                             expr,
                             constant_bool,
-                            input_type,
+                            column_types,
                         ) {
                             // If a predicate in the `completed` list has
                             // been simplified, stick it back into the `todo` list.
@@ -302,15 +312,9 @@ pub fn canonicalize_predicates(predicates: &mut Vec<MirScalarExpr>, input_type: 
             expr,
         } = &predicate_to_apply
         {
-            replace_subexpr_other_predicates(
-                expr,
-                &MirScalarExpr::literal_ok(Datum::False, ScalarType::Bool),
-            )
+            replace_subexpr_other_predicates(expr, &MirScalarExpr::literal_false())
         } else {
-            replace_subexpr_other_predicates(
-                &predicate_to_apply,
-                &MirScalarExpr::literal_ok(Datum::True, ScalarType::Bool),
-            );
+            replace_subexpr_other_predicates(&predicate_to_apply, &MirScalarExpr::literal_true());
         }
         completed.push(predicate_to_apply);
     }
@@ -340,26 +344,28 @@ pub fn canonicalize_predicates(predicates: &mut Vec<MirScalarExpr>, input_type: 
                 .chain(completed.iter_mut())
                 .any(|p| is_null_rejecting_predicate(p, expr))
             {
-                completed.push(MirScalarExpr::literal_ok(Datum::False, ScalarType::Bool));
+                completed.push(MirScalarExpr::literal_false());
                 break;
             }
         }
         completed.push(predicate_to_apply);
     }
 
-    if completed
-        .iter()
-        .any(|p| p.is_literal_false() || p.is_literal_null())
-    {
+    if completed.iter().any(|p| {
+        (p.is_literal_false() || p.is_literal_null()) &&
+        // This extra check is only needed if we determine that the soft-assert
+        // at the top of this function would ever fail for a good reason.
+        p.typ(column_types).scalar_type == ScalarType::Bool
+    }) {
         // all rows get filtered away if any predicate is null or false.
-        *predicates = vec![MirScalarExpr::literal_ok(Datum::False, ScalarType::Bool)]
+        *predicates = vec![MirScalarExpr::literal_false()]
     } else {
         // Remove any predicates that have been reduced to "true"
         completed.retain(|p| !p.is_literal_true());
         *predicates = completed;
     }
 
-    // 4) Sort and dedup predicates.
+    // 6) Sort and dedup predicates.
     predicates.sort_by(compare_predicates);
     predicates.dedup();
 }
@@ -370,10 +376,11 @@ fn replace_subexpr_and_reduce(
     predicate: &mut MirScalarExpr,
     replace_if_equal_to: &MirScalarExpr,
     replace_with: &MirScalarExpr,
-    input_type: &RelationType,
+    column_types: &[ColumnType],
 ) -> bool {
     let mut changed = false;
-    predicate.visit_mut_pre_post(
+    #[allow(deprecated)]
+    predicate.visit_mut_pre_post_nolimit(
         &mut |e| {
             // The `cond` of an if statement is not visited to prevent `then`
             // or `els` from being evaluated before `cond`, resulting in a
@@ -413,7 +420,7 @@ fn replace_subexpr_and_reduce(
         },
     );
     if changed {
-        predicate.reduce(input_type);
+        predicate.reduce(column_types);
     }
     changed
 }
@@ -445,10 +452,15 @@ fn is_null_rejecting_predicate(predicate: &MirScalarExpr, operand: &MirScalarExp
 fn propagates_null_from_subexpression(expr: &MirScalarExpr, operand: &MirScalarExpr) -> bool {
     if operand == expr {
         true
+    } else if let MirScalarExpr::CallVariadic { func, exprs } = &expr {
+        func.propagates_nulls()
+            && (exprs
+                .iter()
+                .any(|e| propagates_null_from_subexpression(e, operand)))
     } else if let MirScalarExpr::CallBinary { func, expr1, expr2 } = &expr {
         func.propagates_nulls()
-            && (propagates_null_from_subexpression(&expr1, operand)
-                || propagates_null_from_subexpression(&expr2, operand))
+            && (propagates_null_from_subexpression(expr1, operand)
+                || propagates_null_from_subexpression(expr2, operand))
     } else if let MirScalarExpr::CallUnary { func, expr } = &expr {
         func.propagates_nulls() && propagates_null_from_subexpression(expr, operand)
     } else {
@@ -460,4 +472,26 @@ fn propagates_null_from_subexpression(expr: &MirScalarExpr, operand: &MirScalarE
 /// number of non-literal expression nodes within the expression.
 fn compare_predicates(x: &MirScalarExpr, y: &MirScalarExpr) -> Ordering {
     (rank_complexity(x), x).cmp(&(rank_complexity(y), y))
+}
+
+/// For each equivalence class, it finds the simplest expression, which will be the canonical one.
+/// Returns a Map that maps from each expression in each equivalence class to the canonical
+/// expression in the same equivalence class.
+pub fn get_canonicalizer_map(
+    equivalences: &Vec<Vec<MirScalarExpr>>,
+) -> BTreeMap<MirScalarExpr, MirScalarExpr> {
+    let mut canonicalizer_map = BTreeMap::new();
+    for equivalence in equivalences {
+        // The unwrap is ok, because a join equivalence class can't be empty.
+        let canonical_expr = equivalence
+            .iter()
+            .min_by(|a, b| compare_predicates(*a, *b))
+            .unwrap();
+        for e in equivalence {
+            if e != canonical_expr {
+                canonicalizer_map.insert(e.clone(), canonical_expr.clone());
+            }
+        }
+    }
+    canonicalizer_map
 }

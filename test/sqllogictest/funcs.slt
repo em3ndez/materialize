@@ -60,7 +60,7 @@ SELECT date_trunc('week', TIMESTAMP '2020-08-02 00:00:00')
 2020-07-27 00:00:00
 
 query error timestamp out of range
-SELECT date_trunc('week', make_timestamp(-262144, 1, 1, 0, 0, 0))
+SELECT date_trunc('week', make_timestamp(-262143, 1, 1, 0, 0, 0))
 
 query T
 SELECT date_trunc('month', TIMESTAMP '2019-11-26 15:56:46.241150')
@@ -163,6 +163,75 @@ INSERT INTO date_trunc_fields VALUES ('bad')
 query error unit 'bad' not recognized
 SELECT date_trunc(field, TIMESTAMP '2019-11-26 15:56:46.241150') FROM date_trunc_fields
 
+# date_trunc with interval
+query T
+SELECT date_trunc('microseconds',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months 23 days 23:59:12.123457
+
+query T
+SELECT date_trunc('milliseconds',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months 23 days 23:59:12.123
+
+query T
+SELECT date_trunc('milliseconds',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months 23 days 23:59:12.123
+
+query T
+SELECT date_trunc('seconds',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months 23 days 23:59:12
+
+query T
+SELECT date_trunc('minutes',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months 23 days 23:59:00
+
+query T
+SELECT date_trunc('hours',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months 23 days 23:00:00
+
+query T
+SELECT date_trunc('days',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months 23 days
+
+query error unit 'weeks' not recognized
+SELECT date_trunc('weeks',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+
+query T
+SELECT date_trunc('months',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years 11 months
+
+query T
+SELECT date_trunc('years',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1234 years
+
+query T
+SELECT date_trunc('decade',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1230 years
+
+query T
+SELECT date_trunc('millennium',  INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS t;
+----
+1000 years
+
+query T
+SELECT date_trunc('second', '2562047788:00:54.775807'::INTERVAL) AS t;
+----
+2562047788:00:54
+
+query T
+SELECT date_trunc('second', '-2562047788:00:54.775807'::INTERVAL) AS t;
+----
+-2562047788:00:54
+
 mode standard
 
 statement ok
@@ -171,30 +240,37 @@ CREATE TABLE date_trunc_timestamps (
 )
 
 query T multiline
-EXPLAIN PLAN FOR SELECT date_trunc('day', ts) FROM date_trunc_timestamps
+EXPLAIN WITH(arity, join implementations) SELECT date_trunc('day', ts) FROM date_trunc_timestamps
 ----
-%0 =
-| Get materialize.public.date_trunc_timestamps (u3)
-| Map date_trunc_day_ts(#0)
-| Project (#1)
+Explained Query:
+  Project (#1) // { arity: 1 }
+    Map (date_trunc_day_ts(#0)) // { arity: 2 }
+      ReadStorage materialize.public.date_trunc_timestamps // { arity: 1 }
+
+Source materialize.public.date_trunc_timestamps
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT date_trunc(field, ts) FROM date_trunc_fields, date_trunc_timestamps
+EXPLAIN WITH(arity, join implementations) SELECT date_trunc(field, ts) FROM date_trunc_fields, date_trunc_timestamps
 ----
-%0 =
-| Get materialize.public.date_trunc_fields (u1)
-| ArrangeBy ()
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map (date_truncts(#0, #1)) // { arity: 3 }
+      CrossJoin type=differential // { arity: 2 }
+        implementation
+          %0:date_trunc_fields[×] » %1:date_trunc_timestamps[×]
+        ArrangeBy keys=[[]] // { arity: 1 }
+          ReadStorage materialize.public.date_trunc_fields // { arity: 1 }
+        ArrangeBy keys=[[]] // { arity: 1 }
+          ReadStorage materialize.public.date_trunc_timestamps // { arity: 1 }
 
-%1 =
-| Get materialize.public.date_trunc_timestamps (u3)
+Source materialize.public.date_trunc_fields
+Source materialize.public.date_trunc_timestamps
 
-%2 =
-| Join %0 %1
-| | implementation = Differential %1 %0.()
-| Map date_truncts(#0, #1)
-| Project (#2)
+Target cluster: quickstart
 
 EOF
 
@@ -228,6 +304,11 @@ SELECT ceil(CAST (1.1 AS float))
 
 query RRRRR
 SELECT ceil(1.1), ceil(1.111), ceil(100.1), ceil(100.11), ceil(-4.1)
+----
+2  2  101  101  -4
+
+query RRRRR
+SELECT ceiling(1.1), ceiling(1.111), ceiling(100.1), ceiling(100.11), ceiling(-4.1)
 ----
 2  2  101  101  -4
 
@@ -325,29 +406,34 @@ SELECT cbrt(NULL)
 NULL
 
 query R
-SELECT cbrt(1.23783::float)
+SELECT cbrt(1.23783::float)::float4
 ----
-1.0737100084353584
+1.07371
 
 query R
-SELECT cbrt(1.23783::double)
+SELECT cbrt(1.23783::double)::float4
 ----
-1.0737100084353584
+1.07371
 
 query R
-SELECT cbrt(1.23783::decimal(15,5))
+SELECT cbrt(1.23783::decimal(15,5))::float4
 ----
-1.0737100084353584
+1.07371
 
 query R
-SELECT cbrt(-8::double)
+SELECT cbrt(-8::double)::float4
 ----
 -2
 
 query R
-SELECT cbrt(3::int)
+SELECT cbrt(3::int)::float4
 ----
-1.4422495703074083
+1.4422495
+
+query R
+SELECT cbrt(27::int)::float4
+----
+3
 
 # Test coalesce.
 query I
@@ -365,6 +451,48 @@ SELECT coalesce('hello', 'world', NULL)
 ----
 hello
 
+query T
+SELECT coalesce(row(5), row(10))
+----
+(5)
+
+query T
+SELECT coalesce(row(4, 3), row(2, 1))
+----
+(4,3)
+
+query T
+select coalesce(null::char(1), 'abc');
+----
+abc
+
+query T
+SELECT coalesce('abc', null::char(1));
+----
+abc
+
+query T
+SELECT coalesce(null::char(1),'abcde','abc');
+----
+abcde
+
+query T
+SELECT coalesce('abcde',null::char(1),'abc');
+----
+abcde
+
+# TODO(database-issues#3339)
+query error coalesce could not convert type record
+SELECT coalesce(row(1, 2), row(3), row(4, 5));
+
+statement ok
+CREATE TYPE custom_composite AS (i int);
+
+query T
+SELECT coalesce(row(1), row(1)::custom_composite)
+----
+(1)
+
 statement ok
 CREATE VIEW v AS SELECT 1 AS a
 
@@ -374,7 +502,149 @@ SELECT coalesce(1, 1 / 0, a) FROM v
 ----
 1
 
-# Tests issue #2355, that type information for Maps are correctly constructed
+query T
+select coalesce(null::char(1), 'abc');
+----
+abc
+
+query T
+SELECT coalesce('abc', null::char(1));
+----
+abc
+
+query T
+SELECT coalesce(null::char(1),'abcde','abc');
+----
+abcde
+
+query T
+SELECT coalesce('abcde',null::char(1),'abc');
+----
+abcde
+
+# Test greatest.
+query I
+SELECT greatest(1)
+----
+1
+
+query I
+SELECT greatest(1, 2)
+----
+2
+
+query I
+SELECT greatest(3, 1)
+----
+3
+
+query I
+SELECT greatest(NULL)
+----
+NULL
+
+query I
+SELECT greatest(1, NULL, -1)
+----
+1
+
+query T
+SELECT greatest((3), (0), (-1));
+----
+3
+
+query T
+SELECT greatest(row(4, 3), row(4, 2), row(4, 4));
+----
+(4,4)
+
+query T
+SELECT greatest(row(2, 3), row(1, 4), row(5, 0));
+----
+(5,0)
+
+query T
+SELECT greatest(row(row(2, 4), 5), row(row(0, 10), 10), row(row(4, 3), 4));
+----
+("(4,3)",4)
+
+# TODO(database-issues#3339)
+query error greatest could not convert type record
+SELECT greatest(row(1, 2), row(3), row(4, 5));
+
+query T
+SELECT greatest(row(1), row(1)::custom_composite)
+----
+(1)
+
+query error greatest could not convert type record\(f1: integer,f2: integer\) to text
+SELECT greatest(row(1, 2), 'hello');
+
+query error greatest types integer and text cannot be matched
+SELECT greatest(1::int, 2::text)
+
+# Test least.
+query I
+SELECT least(1)
+----
+1
+
+query I
+SELECT least(1, 2)
+----
+1
+
+query I
+SELECT least(3, 1)
+----
+1
+
+query I
+SELECT least(NULL)
+----
+NULL
+
+query I
+SELECT least(1, NULL, -1)
+----
+-1
+
+query T
+SELECT least((3), (0), (-1));
+----
+-1
+
+query T
+SELECT least(row(4, 3), row(4, 2), row(4, 4));
+----
+(4,2)
+
+query T
+SELECT least(row(2, 3), row(1, 4), row(5, 0));
+----
+(1,4)
+
+query T
+SELECT least(row(row(2, 4), 5), row(row(0, 10), 10), row(row(4, 3), 4));
+----
+("(0,10)",10)
+
+# TODO(database-issues#3339)
+query error least could not convert type record
+SELECT least(row(1, 2), row(3), row(4, 5));
+
+query error least could not convert type record\(f1: integer,f2: integer\) to text
+SELECT least(row(1, 2), 'hello');
+
+query T
+SELECT least(row(1), row(1)::custom_composite)
+----
+(1)
+
+query error least types integer and text cannot be matched
+SELECT least(1::int, 2::text)
+
+# Tests issue database-issues#827, that type information for Maps are correctly constructed
 # before being passed to expressions for optimization.
 statement ok
 CREATE VIEW bytes AS SELECT null::bytea AS data
@@ -429,6 +699,11 @@ SELECT trim('xy' FROM 'yxytrimyxy');
 trim
 
 query T
+SELECT trim(BOTH 'xy' FROM 'yxytrimyxy');
+----
+trim
+
+query T
 SELECT trim(TRAILING FROM 'yxytrimyxy  ');
 ----
 yxytrimyxy
@@ -439,7 +714,17 @@ SELECT trim(FROM '  yxytrimyxy  ');
 yxytrimyxy
 
 query T
+SELECT trim(BOTH FROM '  yxytrimyxy  ');
+----
+yxytrimyxy
+
+query T
 SELECT trim('   yxytrimyxy  ');
+----
+yxytrimyxy
+
+query T
+SELECT trim(BOTH '   yxytrimyxy  ');
 ----
 yxytrimyxy
 
@@ -462,32 +747,44 @@ CREATE TABLE t (
 )
 
 query T multiline
-EXPLAIN PLAN FOR SELECT a IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT a IS NULL FROM t
 ----
-%0 =
-| Get materialize.public.t (u9)
-| Map isnull(#0)
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((#0) IS NULL) // { arity: 3 }
+      ReadStorage materialize.public.t // { arity: 2 }
+
+Source materialize.public.t
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT a + a + a + a + a IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT a + a + a + a + a IS NULL FROM t
 ----
-%0 =
-| Get materialize.public.t (u9)
-| Map isnull(#0)
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((#0) IS NULL) // { arity: 3 }
+      ReadStorage materialize.public.t // { arity: 2 }
+
+Source materialize.public.t
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT a + b IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT a + b IS NULL FROM t
 ----
-%0 =
-| Get materialize.public.t (u9)
-| Map isnull(#0)
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map ((#0) IS NULL) // { arity: 3 }
+      ReadStorage materialize.public.t // { arity: 2 }
+
+Source materialize.public.t
+
+Target cluster: quickstart
 
 EOF
 
@@ -496,12 +793,16 @@ EOF
 # exist, but we do not support them yet. Similarly for OR.
 
 query T multiline
-EXPLAIN PLAN FOR SELECT (a::bool AND b::bool) IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT (a::bool AND b::bool) IS NULL FROM t
 ----
-%0 =
-| Get materialize.public.t (u9)
-| Map isnull((i32tobool(#0) && i32tobool(#1)))
-| Project (#2)
+Explained Query:
+  Project (#2) // { arity: 1 }
+    Map (((integer_to_boolean(#0) AND integer_to_boolean(#1))) IS NULL) // { arity: 3 }
+      ReadStorage materialize.public.t // { arity: 2 }
+
+Source materialize.public.t
+
+Target cluster: quickstart
 
 EOF
 
@@ -524,7 +825,7 @@ SELECT materialize.pg_catalog.abs(1)
 ----
 1
 
-query error function mz_catalog.abs\(integer\) does not exist
+query error db error: ERROR: function "mz_catalog\.abs" does not exist
 SELECT mz_catalog.abs(1)
 
 query error unknown database 'noexist'
@@ -543,7 +844,7 @@ SELECT pg_catalog.mod(7, 4)
 ----
 3
 
-query error function mz_catalog.mod\(integer, integer\) does not exist
+query error db error: ERROR: function "mz_catalog\.mod" does not exist
 SELECT mz_catalog.mod(7, 4)
 
 query error unknown database 'noexist'
@@ -653,7 +954,8 @@ SELECT array_upper(NULL::text[], 1)
 ----
 NULL
 
-query error Cannot call function array_upper\(unknown, integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+# TODO(fix)
+query error db error: ERROR: could not determine polymorphic type because input has type unknown
 SELECT array_upper(NULL, 1)
 
 query I
@@ -686,7 +988,10 @@ SELECT array_length(ARRAY[]::int[], 1)
 ----
 NULL
 
-# Test strange collapsing behavior of nested empty arrays. See #5545.
+query error could not determine polymorphic type because input has type unknown
+SELECT array_length(NULL, 1);
+
+# Test strange collapsing behavior of nested empty arrays. See database-issues#1709.
 
 query TIII
 SELECT arr, array_lower(arr, 1), array_upper(arr, 1), array_length(arr, 1) FROM
@@ -702,6 +1007,12 @@ SELECT arr, array_lower(arr, 1), array_upper(arr, 1), array_length(arr, 1) FROM
 {}  NULL  NULL  NULL
 {}  NULL  NULL  NULL
 
+query error could not determine polymorphic type because input has type unknown
+SELECT array_upper(NULL, 1)
+
+query error could not determine polymorphic type because input has type unknown
+SELECT array_lower(NULL, 1)
+
 query T
 SELECT upper('a1Bd')
 ----
@@ -712,7 +1023,7 @@ SELECT upper('ALREADYUP')
 ----
 ALREADYUP
 
-query error Cannot call function upper\(numeric\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function upper\(numeric\) does not exist
 SELECT upper(2.2)
 
 query T
@@ -725,7 +1036,7 @@ SELECT lower('alreadylow')
 ----
 alreadylow
 
-query error Cannot call function lower\(interval\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function lower\(interval\) does not exist
 SELECT lower('1ms'::interval)
 
 # Test trigonometric functions.
@@ -767,6 +1078,36 @@ SELECT tanh(NULL)
 NULL
 
 query R
+SELECT asin(NULL)
+----
+NULL
+
+query R
+SELECT asinh(NULL)
+----
+NULL
+
+query R
+SELECT acos(NULL)
+----
+NULL
+
+query R
+SELECT acosh(NULL)
+----
+NULL
+
+query R
+SELECT atan(NULL)
+----
+NULL
+
+query R
+SELECT atanh(NULL)
+----
+NULL
+
+query R
 SELECT cot(NULL)
 ----
 NULL
@@ -802,6 +1143,36 @@ SELECT tanh('NaN'::double)
 NaN
 
 query R
+SELECT asin('NaN'::double)
+----
+NaN
+
+query R
+SELECT asinh('NaN'::double)
+----
+NaN
+
+query R
+SELECT acos('NaN'::double)
+----
+NaN
+
+query R
+SELECT acosh('NaN'::double)
+----
+NaN
+
+query R
+SELECT atan('NaN'::double)
+----
+NaN
+
+query R
+SELECT atanh('NaN'::double)
+----
+NaN
+
+query R
 SELECT cot('NaN'::double)
 ----
 NaN
@@ -833,6 +1204,34 @@ SELECT tan(0::double)
 
 query R
 SELECT tanh(0::double)
+----
+0.000
+
+query R
+SELECT asin(0::double)
+----
+0.000
+
+query R
+SELECT asinh(0::double)
+----
+0.000
+
+query R
+SELECT acos(0::double)
+----
+1.571
+
+query error function acosh is defined for numbers greater than or equal to 1
+SELECT acosh(0::double)
+
+query R
+SELECT atan(0::double)
+----
+0.000
+
+query R
+SELECT atanh(0::double)
 ----
 0.000
 
@@ -877,6 +1276,36 @@ SELECT tanh(1::double)
 0.762
 
 query R
+SELECT asin(1::double)
+----
+1.571
+
+query R
+SELECT asinh(1::double)
+----
+0.881
+
+query R
+SELECT acos(1::double)
+----
+0.000
+
+query R
+SELECT acosh(1::double)
+----
+0.000
+
+query R
+SELECT atan(1::double)
+----
+0.785
+
+query R
+SELECT atanh(1::double)
+----
+inf
+
+query R
 SELECT cot(1.01::double)
 ----
 0.628
@@ -884,16 +1313,32 @@ SELECT cot(1.01::double)
 query error function sin is only defined for finite arguments
 SELECT sin('inf'::double)
 
+query error function asin is defined for numbers between -1 and 1 inclusive
+SELECT asin('inf'::double)
+
 query R
 SELECT sinh('inf'::double)
+----
+inf
+
+query R
+SELECT asinh('inf'::double)
 ----
 inf
 
 query error function cos is only defined for finite arguments
 SELECT cos('inf'::double)
 
+query error function acos is defined for numbers between -1 and 1 inclusive
+SELECT acos('inf'::double)
+
 query R
 SELECT cosh('inf'::double)
+----
+inf
+
+query R
+SELECT acosh('inf'::double)
 ----
 inf
 
@@ -901,9 +1346,17 @@ query error function tan is only defined for finite arguments
 SELECT tan('inf'::double)
 
 query R
+SELECT atan('inf'::double)
+----
+1.571
+
+query R
 SELECT tanh('inf'::double)
 ----
 1.000
+
+query error function atanh is defined for numbers between -1 and 1 inclusive
+SELECT atanh('inf'::double)
 
 query error function cot is only defined for finite arguments
 SELECT cot('inf'::double)
@@ -911,26 +1364,48 @@ SELECT cot('inf'::double)
 query error function sin is only defined for finite arguments
 SELECT sin('-inf'::double)
 
+query error function asin is defined for numbers between -1 and 1 inclusive
+SELECT asin('-inf'::double)
+
 query R
 SELECT sinh('-inf'::double)
+----
+-inf
+
+query R
+SELECT asinh('-inf'::double)
 ----
 -inf
 
 query error function cos is only defined for finite arguments
 SELECT cos('-inf'::double)
 
+query error function acos is defined for numbers between -1 and 1 inclusive
+SELECT acos('-inf'::double)
+
 query R
 SELECT cosh('-inf'::double)
 ----
 inf
 
+query error function acosh is defined for numbers greater than or equal to 1
+SELECT acosh('-inf'::double)
+
 query error function tan is only defined for finite arguments
 SELECT tan('-inf'::double)
+
+query R
+SELECT atan('-inf'::double)
+----
+-1.571
 
 query R
 SELECT tanh('-inf'::double)
 ----
 -1.000
+
+query error atanh is defined for numbers between -1 and 1 inclusive
+SELECT atanh('-inf'::double)
 
 # Use the more reasonable number representation, as the standard mode
 # causes all sorts of weird representation issues with exp and log:
@@ -1022,6 +1497,12 @@ SELECT exp(ln(2::decimal(15, 5)))
 ----
 2
 
+query error value out of range: overflow
+SELECT exp(10000::float)
+
+query error value out of range: underflow
+SELECT exp(-10000::float)
+
 query R
 SELECT power(382, 5);
 ----
@@ -1058,6 +1539,17 @@ SELECT pow(9::decimal(15, 5), 0.5::decimal(15, 5));
 ----
 3
 
+query error value out of range: overflow
+SELECT pow(3::float, 10000)
+
+query T
+SELECT pow(0::float, 10000)
+----
+0.000
+
+query error value out of range: underflow
+SELECT pow(3::float, -10000)
+
 query T
 SELECT pg_column_size(NULL)
 ----
@@ -1066,12 +1558,12 @@ NULL
 query IIII
 SELECT pg_column_size(1::int4), pg_column_size(2::int8), pg_column_size('a'), pg_column_size('ab')
 ----
-5 9 3 4
+2 2 3 4
 
 query I
 SELECT pg_column_size((1, 2))
 ----
-19
+13
 
 statement ok
 CREATE TABLE col_size (a INT, b INT, c TEXT)
@@ -1082,7 +1574,7 @@ INSERT INTO col_size VALUES (1, 2, 'some string longer than 32 chars.'), (NULL, 
 query IIIIII
 SELECT a, b, pg_column_size(col_size.*), pg_column_size(col_size.a), pg_column_size(col_size.b), pg_column_size(col_size.c) FROM col_size ORDER BY a
 ----
-1  2  54  5  5  35
+1  2  48  2  2  35
 NULL  NULL  12  NULL  NULL  NULL
 
 statement error mz_row_size requires a record type
@@ -1098,23 +1590,140 @@ NULL
 query III
 SELECT mz_row_size((1, 2)), mz_row_size((1, 2, 3, 4)), mz_row_size((1, 2, 3, 4, 5))
 ----
-32  32  57
+24  24  24
+
+statement ok
+CREATE TABLE ts_size (t TEXT)
+
+statement ok
+INSERT INTO ts_size VALUES ('2023-10-30T13:47:11Z')
+
+query I
+SELECT mz_row_size(ts_size.*) FROM ts_size
+----
+24
 
 query III
 SELECT a, b, mz_row_size(col_size.*) FROM col_size ORDER BY a
 ----
-1  2  77
-NULL  NULL  32
+1  2  63
+NULL  NULL  24
 
 query error mz_errored
-SELECT mz_internal.mz_error_if_null(NULL, 'mz_errored')
+SELECT mz_unsafe.mz_error_if_null(NULL, 'mz_errored')
 
 query I
-SELECT mz_internal.mz_error_if_null(1, '')
+SELECT mz_unsafe.mz_error_if_null(1, '')
 ----
 1
 
+# Confirm that `mz_error_if_null` can be seen to be non-null.
+query T multiline
+EXPLAIN SELECT mz_unsafe.mz_error_if_null(t, '') IS NULL FROM ts_size;
+----
+Explained Query:
+  Project (#1)
+    Map (false)
+      ReadStorage materialize.public.ts_size
+
+Source materialize.public.ts_size
+
+Target cluster: quickstart
+
+EOF
+
+query error unexpected NULL
+SELECT mz_unsafe.mz_error_if_null(NULL, NULL)
+
+query B
+SELECT pg_backend_pid() > 0
+----
+true
+
+query B
+SELECT pg_is_in_recovery()
+----
+false
+
+query B
+SELECT pg_tablespace_location(0) IS NULL
+----
+true
+
+query B
+SELECT pg_get_ruledef(0) IS NULL
+----
+true
+
 query I
-SELECT pg_backend_pid()
+SELECT pg_relation_size('pg_views'::regclass)
 ----
 -1
+
+query I
+SELECT pg_relation_size('pg_views'::regclass::oid)
+----
+-1
+
+query I
+SELECT pg_relation_size('pg_views'::regclass, 'main')
+----
+-1
+
+query I
+SELECT pg_relation_size('pg_views'::regclass::oid, 'main')
+----
+-1
+
+query I
+SELECT pg_stat_get_numscans('pg_views'::regclass::oid)
+----
+-1
+
+# mz_unsafe functions can't be executed with the enable_unsafe_functions flag turned off
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_unsafe_functions = false
+----
+COMPLETE 0
+
+statement error executing potentially dangerous functions is not supported
+SELECT mz_unsafe.mz_sleep(10)
+
+statement error executing potentially dangerous functions is not supported
+SELECT mz_unsafe.mz_panic('hello')
+
+statement ok
+SELECT mz_internal.is_rbac_enabled()
+
+statement ok
+CREATE TABLE dangerous_table (a INT, b TEXT)
+
+statement ok
+INSERT INTO dangerous_table (a) VALUES (1)
+
+statement error executing potentially dangerous functions is not supported
+SELECT mz_unsafe.mz_any(a) FROM dangerous_table
+
+statement error executing potentially dangerous functions is not supported
+INSERT INTO dangerous_table (b) VALUES (mz_unsafe.mz_panic('hello'))
+
+statement ok
+DROP TABLE dangerous_table
+
+statement ok
+SELECT * FROM mz_internal.mz_resolve_object_name('regclass', 't');
+
+statement ok
+SELECT mz_internal.mz_resolve_object_name('regclass', 't');
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_unsafe_functions = true
+----
+COMPLETE 0
+
+query error function textrecv\(\) does not exist
+SELECT textrecv()
+
+query error cannot call function with arguments of type internal
+SELECT textrecv('abc')

@@ -7,105 +7,118 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::collections::BTreeMap;
 use std::iter;
-use std::rc::Rc;
+use std::sync::LazyLock;
+
+use differential_dataflow::lattice::Lattice;
+use differential_dataflow::operators::arrange::Arranged;
+use differential_dataflow::trace::cursor::IntoOwned;
+use differential_dataflow::trace::{Batch, BatchReader, Cursor, TraceReader};
+use differential_dataflow::{AsCollection, Collection};
+use itertools::{EitherOrBoth, Itertools};
+use maplit::btreemap;
+use mz_ore::cast::CastFrom;
+use mz_repr::{CatalogItemId, ColumnName, ColumnType, Datum, Diff, Row, RowPacker, ScalarType};
+use timely::dataflow::channels::pact::Pipeline;
+use timely::dataflow::operators::Operator;
+use timely::dataflow::{Scope, Stream};
 
 use crate::avro::DiffPair;
-use crate::encode::column_names_and_types;
-use differential_dataflow::{
-    lattice::Lattice,
-    trace::BatchReader,
-    trace::{implementations::ord::OrdValBatch, Cursor},
-};
-use differential_dataflow::{AsCollection, Collection};
-use itertools::Itertools;
-use ore::collections::CollectionExt;
-use repr::{ColumnType, Datum, Diff, RelationDesc, RelationType, Row, ScalarType};
-use timely::dataflow::{channels::pact::Pipeline, operators::Operator, Scope, Stream};
 
-/// Given a stream of batches, produce a stream of (vectors of) DiffPairs, in timestamp order.
-// This is useful for some sink envelopes (e.g., Debezium and Upsert), which need
-// to do specific logic based on the _entire_ set of before/after diffs at a given timestamp.
-pub fn combine_at_timestamp<G: Scope>(
-    batches: Stream<G, Rc<OrdValBatch<Option<Row>, Row, G::Timestamp, Diff>>>,
+/// Given a stream of batches, produce a stream of groups of DiffPairs, grouped
+/// by key, at each timestamp.
+///
+// This is useful for some sink envelopes (e.g., Debezium and Upsert), which
+// need to do specific logic based on the _entire_ set of before/after diffs for
+// a given key at each timestamp.
+pub fn combine_at_timestamp<G: Scope, Tr>(
+    arranged: Arranged<G, Tr>,
 ) -> Collection<G, (Option<Row>, Vec<DiffPair<Row>>), Diff>
 where
     G::Timestamp: Lattice + Copy,
+    Tr: Clone
+        + for<'a> TraceReader<
+            Key<'a> = &'a Option<Row>,
+            Val<'a> = &'a Row,
+            Time = G::Timestamp,
+            Diff = Diff,
+        >,
+    Tr::Batch: Batch,
+    for<'a> Tr::TimeGat<'a>: Ord,
 {
-    let mut rows_buf = vec![];
-    let x: Stream<G, ((Option<Row>, Vec<DiffPair<Row>>), G::Timestamp, Diff)> =
-        batches.unary(Pipeline, "combine_at_timestamp", move |_, _| {
+    let x: Stream<G, ((Option<Row>, Vec<DiffPair<Row>>), G::Timestamp, Diff)> = arranged
+        .stream
+        .unary(Pipeline, "combine_at_timestamp", move |_, _| {
             move |input, output| {
                 while let Some((cap, batches)) = input.next() {
                     let mut session = output.session(&cap);
-                    batches.swap(&mut rows_buf);
-                    for batch in rows_buf.drain(..) {
-                        let mut cursor = batch.cursor();
-                        let mut buf: Vec<(G::Timestamp, Option<&Row>, Diff, &Row)> = vec![];
+                    for batch in batches.drain(..) {
+                        let mut befores = vec![];
+                        let mut afters = vec![];
 
-                        // This batch is valid for a range of timestamps, but it might not present things in timestamp order.
-                        // Slurp it into a vector, so we can sort that by timestamps.
+                        let mut cursor = batch.cursor();
                         while cursor.key_valid(&batch) {
                             let k = cursor.key(&batch);
+
+                            // Partition updates into retractions (befores)
+                            // and insertions (afters).
                             while cursor.val_valid(&batch) {
-                                let val = cursor.val(&batch);
-                                cursor.map_times(&batch, |&t, &diff| {
-                                    buf.push((t, k.as_ref(), diff, val));
+                                let v = cursor.val(&batch);
+                                cursor.map_times(&batch, |t, diff| {
+                                    let diff = diff.into_owned();
+                                    let update = (
+                                        t.into_owned(),
+                                        v.clone(),
+                                        usize::cast_from(diff.unsigned_abs()),
+                                    );
+                                    if diff < 0 {
+                                        befores.push(update);
+                                    } else {
+                                        afters.push(update);
+                                    }
                                 });
                                 cursor.step_val(&batch);
                             }
-                            cursor.step_key(&batch);
-                        }
-                        // For each (timestamp, key) we've seen,
-                        // we need to generate a series of (before, after) pairs.
-                        //
-                        // Steps to do this:
-                        // (1) sort by ts, diff (so that for each ts, diffs appear in ascending order).
-                        // (2) in each (ts, key), find the point where negative and positive diffs meet, using binary search.
-                        // (3) The (ts, entry, diff) elements before that point will go into "before" fields in DiffPairs;
-                        //     the ones after that point will go in "after".
 
-                        // Step (1) above)
+                            // Sort by timestamp.
+                            befores.sort_by_key(|(t, _v, _diff)| *t);
+                            afters.sort_by_key(|(t, _v, _diff)| *t);
 
-                        // Because `sort_by_key` is stable, it will not reorder equal elements. Therefore, elements with the smae
-                        // key will stay grouped together.
-                        buf.sort_by_key(|(t, _k, diff, _row)| (*t, *diff));
-                        for ((t, k), group) in &buf
-                            .into_iter()
-                            .group_by(|(t, k, _diff, _row)| (*t, k.clone()))
-                        {
-                            let mut out = vec![];
-                            let elts: Vec<(G::Timestamp, Option<&Row>, Diff, &Row)> =
-                                group.collect();
-                            // Step (2) above
-                            let pos_idx = elts
-                                .binary_search_by(|(_t, _k, diff, _row)| diff.cmp(&0))
-                                .expect_err("there should be no zero-multiplicity entries");
+                            // Convert diff into unary representation.
+                            let befores = befores
+                                .drain(..)
+                                .flat_map(|(t, v, cnt)| iter::repeat((t, v)).take(cnt));
+                            let afters = afters
+                                .drain(..)
+                                .flat_map(|(t, v, cnt)| iter::repeat((t, v)).take(cnt));
 
-                            // Step (3) above
-                            let befores = elts[0..pos_idx]
-                                .iter()
-                                .flat_map(|elt| iter::repeat(elt).take(elt.2.abs() as usize));
-                            let afters = elts[pos_idx..]
-                                .iter()
-                                .flat_map(|elt| iter::repeat(elt).take(elt.2 as usize));
-                            debug_assert!(befores.clone().all(|(_, _, diff, _)| *diff < 0));
-                            debug_assert!(afters.clone().all(|(_, _, diff, _)| *diff > 0));
-                            for pair in befores.zip_longest(afters) {
-                                let (before, after) = match pair {
-                                    itertools::EitherOrBoth::Both(before, after) => {
-                                        (Some(before.3.clone()), Some(after.3.clone()))
-                                    }
-                                    itertools::EitherOrBoth::Left(before) => {
-                                        (Some(before.3.clone()), None)
-                                    }
-                                    itertools::EitherOrBoth::Right(after) => {
-                                        (None, Some(after.3.clone()))
-                                    }
-                                };
-                                out.push(DiffPair { before, after });
+                            // At each timestamp, zip together the insertions
+                            // and retractions into diff pairs.
+                            let groups = itertools::merge_join_by(
+                                befores,
+                                afters,
+                                |(t1, _v1), (t2, _v2)| t1.cmp(t2),
+                            )
+                            .map(|pair| match pair {
+                                EitherOrBoth::Both((t, before), (_t, after)) => {
+                                    (t, Some(before.clone()), Some(after.clone()))
+                                }
+                                EitherOrBoth::Left((t, before)) => (t, Some(before.clone()), None),
+                                EitherOrBoth::Right((t, after)) => (t, None, Some(after.clone())),
+                            })
+                            .group_by(|(t, _before, _after)| *t);
+
+                            // For each timestamp, emit the group of
+                            // `DiffPair`s.
+                            for (t, group) in &groups {
+                                let group = group
+                                    .map(|(_t, before, after)| DiffPair { before, after })
+                                    .collect();
+                                session.give(((k.clone(), group), t, 1));
                             }
-                            session.give(((k.cloned(), out), t, 1));
+
+                            cursor.step_key(&batch);
                         }
                     }
                 }
@@ -114,21 +127,37 @@ where
     x.as_collection()
 }
 
-pub fn dbz_desc(desc: RelationDesc) -> RelationDesc {
-    let cols = column_names_and_types(desc);
+// NOTE(benesch): statically allocating transient IDs for the
+// transaction and row types is a bit of a hack to allow us to attach
+// custom names to these types in the generated Avro schema. In the
+// future, these types should be real types that get created in the
+// catalog with userspace IDs when the user creates the sink, and their
+// names and IDs should be plumbed in from the catalog at the moment
+// the sink is created.
+pub(crate) const TRANSACTION_TYPE_ID: CatalogItemId = CatalogItemId::Transient(1);
+pub(crate) const DBZ_ROW_TYPE_ID: CatalogItemId = CatalogItemId::Transient(2);
+
+pub static ENVELOPE_CUSTOM_NAMES: LazyLock<BTreeMap<CatalogItemId, String>> = LazyLock::new(|| {
+    btreemap! {
+        TRANSACTION_TYPE_ID => "transaction".into(),
+        DBZ_ROW_TYPE_ID => "row".into(),
+    }
+});
+
+pub(crate) fn dbz_envelope(
+    names_and_types: Vec<(ColumnName, ColumnType)>,
+) -> Vec<(ColumnName, ColumnType)> {
     let row = ColumnType {
         nullable: true,
         scalar_type: ScalarType::Record {
-            fields: cols.into_iter().collect(),
-            custom_oid: None,
-            custom_name: Some("row".to_owned()),
+            fields: names_and_types.into(),
+            custom_id: Some(DBZ_ROW_TYPE_ID),
         },
     };
-    let typ = RelationType::new(vec![row.clone(), row]);
-    RelationDesc::new(typ, ["before", "after"])
+    vec![("before".into(), row.clone()), ("after".into(), row)]
 }
 
-pub fn dbz_format(rp: &mut Row, dp: DiffPair<Row>) -> Row {
+pub fn dbz_format(rp: &mut RowPacker, dp: DiffPair<Row>) {
     if let Some(before) = dp.before {
         rp.push_list_with(|rp| rp.extend_by_row(&before));
     } else {
@@ -139,14 +168,4 @@ pub fn dbz_format(rp: &mut Row, dp: DiffPair<Row>) -> Row {
     } else {
         rp.push(Datum::Null);
     }
-    rp.finish_and_reuse()
-}
-
-pub fn upsert_format(dps: Vec<DiffPair<Row>>) -> Option<Row> {
-    let dp = dps.expect_element(
-        "primary key error: expected at most one update \
-          per key and timestamp. This can happen when the configured sink key is \
-          not a primary key of the sinked relation.",
-    );
-    dp.after
 }

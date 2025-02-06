@@ -1,0 +1,46 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+mode cockroach
+
+# Objects in the mz_internal schema are unstable.
+
+statement error cannot create view with unstable dependencies
+CREATE VIEW v AS SELECT id, object_type, comment FROM mz_internal.mz_comments
+
+# Objects in the mz_introspection schema are unstable.
+
+statement error cannot create view with unstable dependencies
+CREATE VIEW v AS SELECT export_id, dataflow_id FROM mz_introspection.mz_compute_exports
+
+# Other system tables are stable.
+
+statement ok
+CREATE VIEW v AS SELECT id, oid, schema_id, name FROM mz_tables
+
+# SELECTs from unstable objects are allowed.
+
+statement ok
+SELECT id, object_type, comment FROM mz_internal.mz_comments
+
+# Test the compatibility mechanism that automatically translates reads from
+# `mz_internal` relations that have been moved out of that schema to their new
+# schemas.
+
+statement ok
+SELECT * FROM mz_internal.mz_compute_exports
+
+statement ok
+SET search_path = mz_internal
+
+statement ok
+SELECT * FROM mz_compute_exports
+
+statement ok
+RESET search_path

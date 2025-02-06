@@ -19,6 +19,11 @@
 
 mode cockroach
 
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_table_keys = true
+----
+COMPLETE 0
+
 statement ok
 CREATE TABLE t (
   a INT PRIMARY KEY,
@@ -189,7 +194,7 @@ query I
 query error pgcode 42601 multiple ORDER BY clauses not allowed
 ((SELECT a FROM t ORDER BY a)) ORDER BY a
 
-query error CASE cannot be cast to uniform type: integer vs boolean
+query error CASE types integer and boolean cannot be matched
 SELECT CASE a WHEN 1 THEN b ELSE c END as val FROM t ORDER BY val
 
 query error pgcode 42P10 column reference 0 in ORDER BY clause is out of range \(1 - 3\)
@@ -228,7 +233,6 @@ CREATE TABLE abc (
 statement ok
 INSERT INTO abc VALUES (1, 2, 3, 'one'), (4, 5, 6, 'Two')
 
-skipif postgresql # TODO(benesch): support lower.
 query T
 SELECT d FROM abc ORDER BY lower(d)
 ----
@@ -370,7 +374,7 @@ SELECT k FROM (SELECT @1, @1 FROM generate_series(1,10)) AS kv(k,v) ORDER BY PRI
 statement error no data source matches prefix: test.public.kv
 CREATE TABLE unrelated(x INT); SELECT * FROM unrelated ORDER BY PRIMARY KEY kv
 
-# Check that prepare doesn't crash on ORDER BY PK clauses #17312
+# Check that prepare doesn't crash on ORDER BY PK clauses materialize#17312
 statement ok
 PREPARE a AS (TABLE kv) ORDER BY PRIMARY KEY kv
 

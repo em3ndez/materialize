@@ -33,7 +33,7 @@
 //! parsed, the underlying [`Row`] can be extracted with [`Jsonb::into_row`].
 //!
 //! ```
-//! # use repr::adt::jsonb::Jsonb;
+//! # use mz_repr::adt::jsonb::Jsonb;
 //! let jsonb: Jsonb = r#"{"a": 1, "b": 2}"#.parse()?;
 //! let row = jsonb.into_row();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -42,7 +42,7 @@
 //! If the source JSON is in bytes, use [`Jsonb::from_slice`] instead:
 //!
 //! ```
-//! # use repr::adt::jsonb::Jsonb;
+//! # use mz_repr::adt::jsonb::Jsonb;
 //! let jsonb = Jsonb::from_slice(br#"{"a": 1, "b": 2}"#);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -53,7 +53,7 @@
 //! The alternate format produces pretty output.
 //!
 //! ```
-//! # use repr::adt::jsonb::Jsonb;
+//! # use mz_repr::adt::jsonb::Jsonb;
 //! # let jsonb: Jsonb = "null".parse().unwrap();
 //! format!("compressed: {}", jsonb);
 //! format!("pretty: {:#}", jsonb);
@@ -66,27 +66,26 @@
 //! copy.
 //!
 //! ```rust
-//! # use repr::adt::jsonb::JsonbPacker;
-//! # use repr::{Datum, Row};
+//! # use mz_repr::adt::jsonb::JsonbPacker;
+//! # use mz_repr::{Datum, Row};
 //! let mut row = Row::default();
-//! row.push(Datum::Int32(42));
-//! row = JsonbPacker::new(row).pack_str("[1, 2]")?;
+//! let mut packer = row.packer();
+//! packer.push(Datum::Int32(42));
+//! JsonbPacker::new(&mut packer).pack_str("[1, 2]")?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 use std::borrow::Cow;
-use std::fmt;
-use std::io;
 use std::str::{self, FromStr};
+use std::{fmt, io};
 
 use dec::OrderedDecimal;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, SerializeStruct, Serializer};
 
-use self::vec_stack::VecStack;
+use crate::adt::jsonb::vec_stack::VecStack;
 use crate::adt::numeric::Numeric;
-use crate::strconv;
-use crate::{Datum, Row};
+use crate::{strconv, Datum, Row, RowPacker, SharedRow};
 
 /// An owned JSON value backed by a [`Row`].
 ///
@@ -95,28 +94,30 @@ use crate::{Datum, Row};
 /// All numbers are represented as [`f64`]s. It is not possible to construct a
 /// `Jsonb` from a JSON object that contains integers that cannot be represented
 /// exactly as `f64`s.
-#[derive(Debug, Clone, PartialOrd, PartialEq)]
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub struct Jsonb {
     row: Row,
 }
 
 impl Jsonb {
     /// Constructs a new `Jsonb` from a [`serde_json::Value`].
-    ///
-    /// Errors if any of the contained integers cannot be represented exactly as
-    /// an [`f64`].
     pub fn from_serde_json(val: serde_json::Value) -> Result<Self, anyhow::Error> {
-        let row = JsonbPacker::new(Row::default()).pack_serde_json(val)?;
+        let mut row = Row::default();
+        JsonbPacker::new(&mut row.packer()).pack_serde_json(val)?;
         Ok(Jsonb { row })
     }
 
     /// Parses a `Jsonb` from a byte slice `buf`.
     ///
-    /// Errors if the slice is not valid JSON or if any of the contained
-    /// integers cannot be represented exactly as an [`f64`].
+    /// Errors if the slice is not valid JSON.
     pub fn from_slice(buf: &[u8]) -> Result<Jsonb, anyhow::Error> {
-        let row = JsonbPacker::new(Row::default()).pack_slice(buf)?;
-        Ok(Jsonb { row })
+        let binding = SharedRow::get();
+        let mut row_builder = binding.borrow_mut();
+        let mut packer = row_builder.packer();
+        JsonbPacker::new(&mut packer).pack_slice(buf)?;
+        Ok(Jsonb {
+            row: row_builder.clone(),
+        })
     }
 
     /// Constructs a [`JsonbRef`] that references the JSON in this `Jsonb`.
@@ -126,9 +127,22 @@ impl Jsonb {
         }
     }
 
+    /// Constructs a `Jsonb` from a [`Row`] containing a single [`Datum`].
+    ///
+    /// Note that `row` is not checked for validity. Not all `Datum`s are
+    /// valid JSON.
+    pub fn from_row(row: Row) -> Jsonb {
+        Jsonb { row }
+    }
+
     /// Consumes this `Jsonb` and returns the underlying [`Row`].
     pub fn into_row(self) -> Row {
         self.row
+    }
+
+    /// Returns a reference to the underlying [`Row`].
+    pub fn row(&self) -> &Row {
+        &self.row
     }
 }
 
@@ -136,7 +150,8 @@ impl FromStr for Jsonb {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let row = JsonbPacker::new(Row::default()).pack_str(s)?;
+        let mut row = Row::default();
+        JsonbPacker::new(&mut row.packer()).pack_str(s)?;
         Ok(Jsonb { row })
     }
 }
@@ -150,18 +165,23 @@ impl fmt::Display for Jsonb {
 /// A borrowed JSON value.
 ///
 /// `JsonbRef` is to [`Jsonb`] as [`&str`](prim@str) is to [`String`].
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct JsonbRef<'a> {
     datum: Datum<'a>,
 }
 
-impl JsonbRef<'_> {
+impl<'a> JsonbRef<'a> {
     /// Constructs a `JsonbRef` from a [`Datum`].
     ///
     /// Note that `datum` is not checked for validity. Not all `Datum`s are
     /// valid JSON.
     pub fn from_datum(datum: Datum) -> JsonbRef {
         JsonbRef { datum }
+    }
+
+    /// Unwraps a `JsonbRef` and returns the inner [`Datum`].
+    pub fn into_datum(self) -> Datum<'a> {
+        self.datum
     }
 
     /// Constructs an owned [`Jsonb`] from this `JsonbRef`.
@@ -192,7 +212,7 @@ impl JsonbRef<'_> {
     /// Panics if this `JsonbRef` was constructed with a [`Datum`] that is not
     /// representable as JSON.
     pub fn to_serde_json(&self) -> serde_json::Value {
-        serde_json::to_value(&JsonbDatum(self.datum))
+        serde_json::to_value(JsonbDatum(self.datum))
             .expect("conversion to serde_json::Value known to be valid")
     }
 }
@@ -209,57 +229,48 @@ impl fmt::Display for JsonbRef<'_> {
     }
 }
 
-/// A JSON deserializer that decodes directly into an existing [`Row`].
-///
-/// The `JsonbPacker` takes ownership of the `Row` and returns ownership after
-/// successfully packing one JSON object. Packing multiple JSON objects in
-/// sequence requires constructing multiple `JsonbPacker`s. This somewhat
-/// irritating API is required to preserve the safety properties of the `Row`,
-/// which require that no one observe the state of the `Row` after a decoding
-/// error.
+/// A JSON deserializer that decodes directly into an existing [`RowPacker`].
 #[derive(Debug)]
-pub struct JsonbPacker {
-    row: Row,
+pub struct JsonbPacker<'a, 'row> {
+    packer: &'a mut RowPacker<'row>,
 }
 
-impl JsonbPacker {
+impl<'a, 'row> JsonbPacker<'a, 'row> {
     /// Constructs a new `JsonbPacker` that will pack into `row`.
-    pub fn new(row: Row) -> JsonbPacker {
-        JsonbPacker { row }
+    pub fn new(packer: &'a mut RowPacker<'row>) -> JsonbPacker<'a, 'row> {
+        JsonbPacker { packer }
     }
 
     /// Packs a [`serde_json::Value`].
-    ///
-    /// Errors if any of the contained integers cannot be represented exactly as
-    /// an [`f64`].
-    pub fn pack_serde_json(self, val: serde_json::Value) -> Result<Row, anyhow::Error> {
+    pub fn pack_serde_json(self, val: serde_json::Value) -> Result<(), serde_json::Error> {
         let mut commands = vec![];
         Collector(&mut commands).deserialize(val)?;
-        Ok(pack(self.row, &commands))
+        pack(self.packer, &commands);
+        Ok(())
     }
 
     /// Parses and packs a JSON-formatted byte slice.
     ///
-    /// Errors if the slice is not valid JSON or if any of the contained
-    /// integers cannot be represented exactly as an [`f64`].
-    pub fn pack_slice(self, buf: &[u8]) -> Result<Row, anyhow::Error> {
+    /// Errors if the slice is not valid JSON.
+    pub fn pack_slice(self, buf: &[u8]) -> Result<(), serde_json::Error> {
         let mut commands = vec![];
         let mut deserializer = serde_json::Deserializer::from_slice(buf);
         Collector(&mut commands).deserialize(&mut deserializer)?;
         deserializer.end()?;
-        Ok(pack(self.row, &commands))
+        pack(self.packer, &commands);
+        Ok(())
     }
 
     /// Parses and packs a JSON-formatted string.
     ///
-    /// Errors if the string is not valid or JSON or if any of the contained
-    /// integers cannot be represented exactly as an [`f64`].
-    pub fn pack_str(self, s: &str) -> Result<Row, anyhow::Error> {
+    /// Errors if the string is not valid JSON.
+    pub fn pack_str(self, s: &str) -> Result<(), serde_json::Error> {
         let mut commands = vec![];
         let mut deserializer = serde_json::Deserializer::from_str(s);
         Collector(&mut commands).deserialize(&mut deserializer)?;
         deserializer.end()?;
-        Ok(pack(self.row, &commands))
+        pack(self.packer, &commands);
+        Ok(())
     }
 }
 
@@ -270,6 +281,86 @@ impl JsonbPacker {
 // See the comments in `JsonbDatum::Serialize` and `Collector::visit_map` for
 // details.
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+// To support arbitrary-precision numbers, serde_json pretends the JSON
+// contained a map like the following:
+//
+//     {"$serde_json::private::Number": "NUMBER AS STRING"}
+//
+// The code here sniffs out that special map and emits just the numeric
+// value.
+
+#[derive(Debug)]
+pub(crate) enum KeyClass<'de> {
+    Number,
+    MapKey(Cow<'de, str>),
+}
+
+pub(crate) struct KeyClassifier;
+
+impl<'de> DeserializeSeed<'de> for KeyClassifier {
+    type Value = KeyClass<'de>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for KeyClassifier {
+    type Value = KeyClass<'de>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a string key")
+    }
+
+    #[inline]
+    fn visit_borrowed_str<E>(self, key: &'de str) -> Result<Self::Value, E> {
+        match key {
+            SERDE_JSON_NUMBER_TOKEN => Ok(KeyClass::Number),
+            _ => Ok(KeyClass::MapKey(Cow::Borrowed(key))),
+        }
+    }
+
+    #[inline]
+    fn visit_str<E>(self, key: &str) -> Result<Self::Value, E> {
+        match key {
+            SERDE_JSON_NUMBER_TOKEN => Ok(KeyClass::Number),
+            _ => Ok(KeyClass::MapKey(Cow::Owned(key.to_owned()))),
+        }
+    }
+}
+
+pub(crate) struct NumberParser;
+
+impl<'de> DeserializeSeed<'de> for NumberParser {
+    type Value = OrderedDecimal<Numeric>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for NumberParser {
+    type Value = OrderedDecimal<Numeric>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a valid number")
+    }
+
+    #[inline]
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        strconv::parse_numeric(value).map_err(de::Error::custom)
+    }
+}
 
 #[derive(Debug)]
 enum Command<'de> {
@@ -366,86 +457,6 @@ impl<'a, 'de> Visitor<'de> for Collector<'a, 'de> {
     where
         V: MapAccess<'de>,
     {
-        // To support arbitrary-precision numbers, serde_json pretends the JSON
-        // contained a map like the following:
-        //
-        //     {"$serde_json::private::Number": "NUMBER AS STRING"}
-        //
-        // The code here sniffs out that special map and emits just the numeric
-        // value.
-
-        #[derive(Debug)]
-        enum KeyClass<'de> {
-            Number,
-            MapKey(Cow<'de, str>),
-        }
-
-        struct KeyClassifier;
-
-        impl<'de> DeserializeSeed<'de> for KeyClassifier {
-            type Value = KeyClass<'de>;
-
-            fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                deserializer.deserialize_str(self)
-            }
-        }
-
-        impl<'de> Visitor<'de> for KeyClassifier {
-            type Value = KeyClass<'de>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a string key")
-            }
-
-            #[inline]
-            fn visit_borrowed_str<E>(self, key: &'de str) -> Result<Self::Value, E> {
-                match key {
-                    SERDE_JSON_NUMBER_TOKEN => Ok(KeyClass::Number),
-                    _ => Ok(KeyClass::MapKey(Cow::Borrowed(key))),
-                }
-            }
-
-            #[inline]
-            fn visit_str<E>(self, key: &str) -> Result<Self::Value, E> {
-                match key {
-                    SERDE_JSON_NUMBER_TOKEN => Ok(KeyClass::Number),
-                    _ => Ok(KeyClass::MapKey(Cow::Owned(key.to_owned()))),
-                }
-            }
-        }
-
-        struct NumberParser;
-
-        impl<'de> DeserializeSeed<'de> for NumberParser {
-            type Value = OrderedDecimal<Numeric>;
-
-            fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                deserializer.deserialize_str(self)
-            }
-        }
-
-        impl<'de> Visitor<'de> for NumberParser {
-            type Value = OrderedDecimal<Numeric>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a valid number")
-            }
-
-            #[inline]
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                strconv::parse_numeric(value).map_err(de::Error::custom)
-            }
-        }
-
         match visitor.next_key_seed(KeyClassifier)? {
             Some(KeyClass::Number) => {
                 let n = visitor.next_value_seed(NumberParser)?;
@@ -473,15 +484,14 @@ struct DictEntry<'a> {
     val: &'a [Command<'a>],
 }
 
-fn pack(mut packer: Row, value: &[Command]) -> Row {
+fn pack(packer: &mut RowPacker, value: &[Command]) {
     let mut buf = vec![];
-    pack_value(&mut packer, VecStack::new(&mut buf), value);
-    packer
+    pack_value(packer, VecStack::new(&mut buf), value);
 }
 
 #[inline]
 fn pack_value<'a, 'scratch>(
-    packer: &mut Row,
+    packer: &mut RowPacker,
     scratch: VecStack<'scratch, DictEntry<'a>>,
     value: &'a [Command<'a>],
 ) {
@@ -503,14 +513,14 @@ fn pack_value<'a, 'scratch>(
 
 /// Packs a sequence of values as an ordered list.
 fn pack_list<'a, 'scratch>(
-    row: &mut Row,
+    packer: &mut RowPacker,
     mut scratch: VecStack<'scratch, DictEntry<'a>>,
     mut values: &'a [Command<'a>],
 ) {
-    row.push_list_with(|row| {
+    packer.push_list_with(|packer| {
         while !values.is_empty() {
             let value = extract_value(&mut values);
-            pack_value(row, scratch.fresh(), value);
+            pack_value(packer, scratch.fresh(), value);
         }
     })
 }
@@ -522,7 +532,7 @@ fn pack_list<'a, 'scratch>(
 /// Multiple values for the same key are detected and only
 /// the last value is kept.
 fn pack_dict<'a, 'scratch>(
-    row: &mut Row,
+    packer: &mut RowPacker,
     mut scratch: VecStack<'scratch, DictEntry<'a>>,
     mut entries: &'a [Command<'a>],
 ) {
@@ -541,12 +551,12 @@ fn pack_dict<'a, 'scratch>(
     // value for the key, as ordered by appearance in the source JSON, per
     // PostgreSQL's implementation.
     scratch.sort_by_key(|entry| entry.key);
-    row.push_dict_with(|row| {
+    packer.push_dict_with(|packer| {
         for i in 0..scratch.len() {
             if i == scratch.len() - 1 || scratch[i].key != scratch[i + 1].key {
                 let DictEntry { key, val } = scratch[i];
-                row.push(Datum::String(key));
-                pack_value(row, scratch.fresh(), val);
+                packer.push(Datum::String(key));
+                pack_value(packer, scratch.fresh(), val);
             }
         }
     });

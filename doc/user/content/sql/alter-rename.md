@@ -3,14 +3,12 @@ title: "ALTER ... RENAME"
 description: "`ALTER ... RENAME` renames an item."
 menu:
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
-
-{{< version-added v0.4.0 />}}
 
 `ALTER ... RENAME` renames an item, albeit with some [limitations](#details).
 
-Note that renaming schemas and databases are in development. {{% gh 3680 %}}
+Note that renaming databases is not supported {{% gh-discussion 29635 %}}.
 
 ## Syntax
 
@@ -42,7 +40,7 @@ You cannot rename items if:
     You can only rename either view named `v1` if every dependent view's query
     that contains references to both views fully qualifies all references, e.g.
 
-    ```sql
+    ```mzsql
     CREATE VIEW v2 AS
     SELECT *
     FROM db1.s1.v1
@@ -58,7 +56,7 @@ You cannot rename items if:
 
     In the following examples, `v1` could _not_ be renamed:
 
-    ```sql
+    ```mzsql
     CREATE VIEW v3 AS
     SELECT *
     FROM v1
@@ -66,13 +64,15 @@ You cannot rename items if:
     ON v1.a = v2.v1
     ```
 
-    ```sql
+    ```mzsql
     CREATE VIEW v4 AS
     SELECT *
     FROM v1
     JOIN v1.v2
     ON v1.a = v2.a
     ```
+
+- They are system clusters, such as `mz_system` and `mz_catalog_server`, or replicas in system clusters.
 
 ### New name limitations
 
@@ -81,7 +81,7 @@ whether that identifier is used implicitly or explicitly.
 
 Consider this example:
 
-```sql
+```mzsql
 CREATE VIEW v5 AS
 SELECT *
 FROM d1.s1.v2
@@ -102,7 +102,7 @@ However, you could rename `v1` to any other [legal identifier](/sql/identifiers)
 
 ## Examples
 
-```sql
+```mzsql
 SHOW VIEWS;
 ```
 ```nofmt
@@ -110,7 +110,7 @@ SHOW VIEWS;
 -------
  v1
 ```
-```sql
+```mzsql
 ALTER VIEW v1 RENAME TO v2;
 SHOW VIEWS;
 ```
@@ -120,10 +120,17 @@ SHOW VIEWS;
  v2
 ```
 
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of the object being renamed.
+
 ## See also
 
 - [`SHOW CREATE VIEW`](/sql/show-create-view)
 - [`SHOW VIEWS`](/sql/show-views)
 - [`SHOW SOURCES`](/sql/show-sources)
 - [`SHOW INDEXES`](/sql/show-indexes)
+- [`SHOW SECRETS`](/sql/show-secrets)
 - [`SHOW SINKS`](/sql/show-sinks)

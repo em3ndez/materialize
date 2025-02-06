@@ -1,37 +1,60 @@
 <div class="sidebar-wrapper">
   {{ $currentPage := . }}
   <nav role="navigation" class="sidebar">
-    <svg class="search-icon" width="13" height="13" viewBox="0 0 13 13" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path fill-rule="evenodd" clip-rule="evenodd" d="M5.529 10.058C8.0303 10.058 10.058 8.0303 10.058 5.529C10.058 3.0277 8.0303 1 5.529 1C3.0277 1 1 3.0277 1 5.529C1 8.0303 3.0277 10.058 5.529 10.058Z" stroke="url(#paint0_linear)" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M12 12L8.75201 8.75195" stroke="url(#paint1_linear)" stroke-linecap="round" stroke-linejoin="round"/>
-      <defs>
-      <linearGradient id="paint0_linear" x1="7.91395" y1="10.0815" x2="1.95483" y2="3.19243" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#5A34CB"/>
-      <stop offset="1" stop-color="#B634CB"/>
-      </linearGradient>
-      <linearGradient id="paint1_linear" x1="11.2312" y1="12.0084" x2="9.0944" y2="9.53811" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#5A34CB"/>
-      <stop offset="1" stop-color="#B634CB"/>
-      </linearGradient>
-      </defs>
-    </svg>
-    <input id="search-input" placeholder="Search">
-    <span class="search_shortcut">s</span>
-
     <ul>
+      <div id="docsearch">
+        <input type="button" value="Search the Docs/Ask AI" class="btn-ghost docs-search-button"
+        title="cmd+K (⌘+K/⊞+K)" />
+      </div>
+      <select id="version-select" class="version-dropdown" style="width: 100%; box-sizing: border-box;">
+      </select>
+
       {{ range .Site.Menus.main.ByWeight }}
-      <li class="level-1 {{if .HasChildren }}has-children{{end}}">
-        <a {{with .URL}}href="{{.}}"{{end}} class="{{if $currentPage.IsMenuCurrent "main" .}}active{{end}}">
-          {{.Name}}
-        </a>
+      <li class="level-1 {{if .HasChildren }}has-children{{ else }}no-children{{ end }}">
+          <a {{with .URL}}href="{{.}}"{{end}} class="{{if $currentPage.IsMenuCurrent "main" .}}active{{end}}">
+            {{- if .HasChildren }}
+              {{ readFile "static/images/icon_sidebar_expander.svg" | safeHTML }}
+            {{ end }}
+            {{.Name | markdownify}}
+          </a>
 
         {{- if .HasChildren }}
         <ul>
           {{- range .Children }}
-          <li class="level-2">
-            <a href="{{.URL}}" class="{{if $currentPage.IsMenuCurrent "main" .}}active{{end}}">
-              {{.Name}}
+          <li class="level-2 {{if .HasChildren }}has-children{{ else }}no-children{{ end }}">
+            <a {{with .URL}}href="{{.}}"{{end}} class="{{if $currentPage.IsMenuCurrent "main" .}}active{{end}}">
+              {{- if .HasChildren }}
+                {{ readFile "static/images/icon_sidebar_expander.svg" | safeHTML }}
+              {{ end }}
+              {{.Name | markdownify}}
             </a>
+
+            {{- if .HasChildren }}
+            <ul>
+              {{- range .Children }}
+              <li class="level-3 {{if .HasChildren }}has-children{{ else }}no-children{{ end }}">
+                <a {{with .URL}}href="{{.}}"{{end}} class="{{if $currentPage.IsMenuCurrent "main" .}}active{{end}}">
+                  {{- if .HasChildren }}
+                    {{ readFile "static/images/icon_sidebar_expander.svg" | safeHTML }}
+                  {{ end }}
+                  {{.Name | markdownify}}
+                </a>
+
+                {{- if .HasChildren }}
+                <ul>
+                  {{- range .Children }}
+                  <li class="level-4">
+                    <a href="{{.URL}}" class="{{if $currentPage.IsMenuCurrent "main" .}}active{{end}}">
+                      {{.Name | markdownify}}
+                    </a>
+                  </li>
+                  {{- end}}
+                </ul>
+                {{- end}}
+              </li>
+              {{- end}}
+            </ul>
+            {{- end}}
           </li>
           {{- end}}
         </ul>
@@ -40,18 +63,55 @@
       {{- end}}
     </ul>
   </nav>
+  <button class="close-topics" aria-label="Close the topics sidebar">
+    <svg xmlns="http://www.w3.org/2000/svg" class="ionicon" viewBox="0 0 512 512"><title>Close</title><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="32" d="M368 368L144 144M368 144L144 368"/></svg>
+  </button>
 </div>
 
 <script>
-// A plugin to expand and collapse submenus in the sidebar.
+  document.addEventListener('DOMContentLoaded', function () {
+    const versionSelect = document.getElementById('version-select');
+    const currentPath = window.location.pathname;
 
-// Add click handlers for all top-level items with children.
-const menus = $("nav[role=navigation] li.has-children");
-menus.find("> a").click(e => {
-    $(e.target).parent().toggleClass("open");
-    e.preventDefault();
-});
+    fetch('/docs/versions.json')
+      .then( response => {
+        if (!response.ok) {
+          throw new Error('File not found');
+        }
+        return response.json();
+      })
+      .catch(() => {
+        return fetch('{{ .Site.BaseURL }}versions.json')
+          .then(response => {
+            if (!response.ok) {
+              throw new Error('Fallback file not found');
+            }
+            return response.json();
+          });
+      })
+      .then(versions => {
+        versions.forEach(version => {
+          const option = document.createElement('option');
+          option.value = version.base_url;
+          option.textContent = version.name;
+          versionSelect.appendChild(option);
+        });
 
-// Open the submenu containing the current page by default.
-menus.has(".active").addClass("open");
+        const currentVersion = versions.filter(version => currentPath.includes(version.base_url))?.at(-1)?.base_url;
+
+        if (currentVersion) {
+          versionSelect.value = currentVersion;
+        }
+
+        versionSelect.addEventListener('change', function () {
+          const baseUrl = '{{ .Site.BaseURL }}';
+          const strippedBaseUrl = baseUrl.endsWith(currentVersion) ? baseUrl.slice(0, -currentVersion.length) : baseUrl;
+          const selectedBaseUrl = strippedBaseUrl + versionSelect.value;
+          if (selectedBaseUrl) {
+            window.location.href = selectedBaseUrl;
+          }
+        });
+      })
+      .catch(error => console.error('Error fetching versions:', error));
+  });
 </script>

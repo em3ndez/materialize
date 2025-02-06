@@ -9,10 +9,10 @@
 
 #[cfg(test)]
 mod tests {
-    use lowertest::{deserialize_optional, tokenize, GenericTestDeserializeContext};
-    use ore::str::separated;
-    use repr::ScalarType;
-    use repr_test_util::*;
+    use mz_lowertest::{deserialize_optional_generic, tokenize};
+    use mz_ore::str::separated;
+    use mz_repr::ScalarType;
+    use mz_repr_test_util::*;
 
     fn build_datum(s: &str) -> Result<String, String> {
         // 1) Convert test spec to the row containing the datum.
@@ -43,12 +43,8 @@ mod tests {
                 .next()
                 .ok_or_else(|| "Empty row spec".to_string())?,
         )?;
-        let scalar_types: Option<Vec<ScalarType>> = deserialize_optional(
-            &mut stream_iter,
-            "Vec<ScalarType>",
-            &RTI,
-            &mut GenericTestDeserializeContext::default(),
-        )?;
+        let scalar_types: Option<Vec<ScalarType>> =
+            deserialize_optional_generic(&mut stream_iter, "Vec<ScalarType>")?;
         let scalar_types = if let Some(scalar_types) = scalar_types {
             scalar_types
         } else {
@@ -81,7 +77,8 @@ mod tests {
         get_scalar_type_or_default("", &mut tokenize(s)?.into_iter())
     }
 
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `decContextDefault` on OS `linux`
     fn run() {
         datadriven::walk("tests/testdata", |f| {
             f.run(move |s| -> String {

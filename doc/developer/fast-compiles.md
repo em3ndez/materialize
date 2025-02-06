@@ -8,47 +8,60 @@ engineers when optimizing machines for compiling Rust.
 The most important step you can take to speed up Rust compilation times is to
 run Linux rather than macOS.
 
-First, your money goes much farther if you don't pay the Apple tax. For a given
+Your money goes much farther if you don't pay the Apple tax. For a given
 price point, you can usually build a Linux machine with twice as much compute,
 memory, and storage than a Mac.
 
-Second, the linkers on Linux are faster. Apple has not invested much in speeding
-up `ld` on macOS, and there are no alternatives. On Linux, you have your choice
-of three production-grade linkers: the standard `ld` (bfd), gold, and lld. lld
-in particular is blazing fast.
+A Linux machine will also allow you to run performance tests on your laptop.
+Our customer's production deployments are running on Linux, not macOS. While
+it's possible to get a rough sense of Materialize's performance on macOS,
+there have been more than a few occasions where apparent performance defects
+have disappeared when running the workload on Linux.
 
-Finally—and this is somewhat of an aside—a Linux machine will allow you to run
-performance tests on your laptop. Our customer's production deployments are
-running on Linux, not macOS. While it's possible to get a rough sense of
-Materialize's performance on macOS, there have been more than a few occasions
-where apparent perfomance defects have disappeared when running the workload on
-Linux.
+## Use mold
 
-### Use lld
+On Linux using mold instead of the standard linker will result in an impressive
+linking speedup. On macOS make sure to have an up-to-date system with at least
+Xcode 15 to use the new system linker, which is similarly fast.
 
-On Linux, using lld instead of the standard linker will result in an impressive
-linking speedup. You can install it from the standard package repository on
-Debian-based distributions:
+### Installation
+
+#### Linux
+
+On Debian-based distros, you can install mold from the standard package
+repository:
 
 ```shell
-sudo apt install lld
+sudo apt install mold
 ```
 
 You'll need to hunt down the equivalent instructions for your distribution if
 you don't use a Debian-based distribution.
 
-Then, tell Rust to use lld by setting the following environment variable:
+### Configuration
+
+To tell Rust to use mold, set the following environment variable:
 
 ```shell
-export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 ```
 
-### Disable debug info
+Alternatively, you can configure the linker through a
+[Cargo config file][cargo-config]:
 
-The fastest known way to compile on Linux is with lld and disabling debug info:
+```toml
+[build]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+[cargo-config]: https://doc.rust-lang.org/cargo/reference/config.html#configuration
+
+## Disable debug info
+
+The fastest known way to compile is with mold and disabling debug info:
 
 ```shell
-export RUSTFLAGS="-C link-arg=-fuse-ld=lld -C debuginfo=0"
+export RUSTFLAGS="-C link-arg=-fuse-ld=mold -C debuginfo=0"
 ```
 
 Ideally, set that in your `~/.bashrc` or equivalent so that it applies
@@ -99,86 +112,3 @@ here:
 [brson]: https://pingcap.com/blog/rust-compilation-model-calamity
 [endler]: https://endler.dev/2020/rust-compile-times/
 [nethercote]: https://nnethercote.github.io/perf-book/compile-times.html
-
-## Split Mac Debug Information
-
-Apparently, a significant part of the time spent compiling a macOS rust binary
-is creating the debug info, which previously required scanning the entire binary
-with the `dsymutil` tool. As of stable rust 1.51.0, the [new `split-debuginfo =
-"unpacked"` option][split-debuginfo-unpacked] allows for skipping this step and
-using the `.o` object files for backtraces, resulting in a link time decrease.
-Most debug tooling then "should work as long as you don't need to move the
-binary to a different location while retaining the debug information." In
-summary, as long as you're not moving the debug binary, this should be a free
-speedup.
-
-This can be enabled by setting the following option in cargo's `.config`:
-
-```yaml
-[profile.dev]
-  split-debuginfo = "unpacked"
-```
-
-On Ruchir's laptop after an initial compile:
-
-- With default options `touch src/materialized/src/bin/materialized/main.rs;
-  cargo run` (basically just relinking) takes ~1m15s
-- With this option, it takes ~30s
-
-[split-debuginfo-unpacked]: https://blog.rust-lang.org/2021/03/25/Rust-1.51.0.html#splitting-debug-information
-
-## Experimental Mac Linker
-
-The LLVM clang project has an old Mach-O (macOS) linker that seems to be
-generally discouraged, but about a year ago they started a [new one with an
-architecture similar to the linux one touted above][macho]. It's unclear how far
-along it is, but it's at least far along enough that the [Chromium project has
-added directions for trying it out][chromium]. As of 2021-04-06, there's a big
-experimental warning at the top of the page and a number of active known bugs,
-but they seem to indicate that Chromium builds with it.
-
-We'd absolutely use the normal macOS linker (`ld64`) for anything real, but
-initial results for the edit-compile-run cycle seem promising. On Ruchir's
-laptop after an initial compile:
-
-- With the stock linker `touch src/materialized/src/bin/materialized/main.rs;
-  cargo run` (basically just relinking) takes ~17s
-- With the experimental one, the same takes ~9s
-- With the stock linker `touch src/repr/src/lib.rs; cargo run`
-  (pseudo-representitive edit-compile-run example) takes ~32s
-- With the experimental one, the same takes  ~24s
-
-I've been using it for my first couple days and haven't seen any issues so far.
-
-There's enough recent bug fixes that you'd want to use a more recent version of
-clang than is available in brew. Instructions for using a pre-built one hosted
-by Chromium.
-
-```shell
-curl -s https://raw.githubusercontent.com/chromium/chromium/master/tools/clang/scripts/update.py | python - --output-dir=/tmp/clang
-curl -s https://raw.githubusercontent.com/chromium/chromium/master/tools/clang/scripts/update.py | python - --output-dir=/tmp/clang --package=lld_mac
-```
-
-Then add the dir you passed to `--output-dir` followed by `/bin` (so
-`/tmp/clang/bin`) to your `PATH` and `export RUSTFLAGS="-C
-link-arg=-fuse-ld=lld"` as above. If anything doesn't work the first time, try a
-`cargo clean`. If you stick with this, you'll want to move clang out of `/tmp`
-so the system doesn't garbage collect it for you (and updated your `PATH`
-accordingly).
-
-*Note:* This seems to depend on having a new enough version of code (11.5+ is
-known to work), which in turn requires Big Sur (maybe Catalina also works?). If
-you do an OS upgrade, you'll definitely need a `cargo clean`.
-
-*Note:* For some reason, the native arm64 version of clang you get by running
-the above commands passes different arguments to lld. You can still use the
-native arm64 version of experimental new lld with the following (`--host-os` is
-intentionally omitted from the second command):
-
-```shell
-curl -s https://raw.githubusercontent.com/chromium/chromium/master/tools/clang/scripts/update.py | python - --output-dir=/tmp/clang --host-os=mac
-curl -s https://raw.githubusercontent.com/chromium/chromium/master/tools/clang/scripts/update.py | python - --output-dir=/tmp/clang --package=lld_mac
-```
-
-[macho]: https://github.com/llvm/llvm-project/tree/main/lld/MachO
-[chromium]: https://github.com/chromium/chromium/blob/master/docs/mac_lld.md

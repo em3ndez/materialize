@@ -3,35 +3,22 @@ title: "ALTER INDEX"
 description: "`ALTER INDEX` changes the parameters of an index."
 menu:
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
-
-{{< version-added v0.4.3 />}}
 
 `ALTER INDEX` changes the parameters of an index.
 
 ## Syntax
 
-{{< diagram "alter-index.svg" >}}
+{{< diagram "alter-index-set.svg" >}}
+{{< diagram "alter-index-reset.svg" >}}
 
 Field | Use
 ------|-----
 _name_ | The identifier of the index you want to alter.
-**ENABLED** | [Enable](#enabling-indexes) the index, which lets Materialize use it again after being [disabled](/cli/#disable-user-indexes).
-_field_ | The name of the parameter you want to alter.
-_val_ | The new value for the parameter.
+_retention_period_ | ***Private preview.** This option has known performance or stability issues and is under active development.* <br>Duration for which Materialize retains historical data, which is useful to implement [durable subscriptions](/transform-data/patterns/durable-subscriptions/#history-retention-period).  **Note:** Configuring indexes to retain history is not recommended. As an alternative, consider creating a materialized view for your subscription query and configuring the history retention period on the view instead. See [durable subscriptions](/transform-data/patterns/durable-subscriptions/#history-retention-period). <br>Accepts positive [interval](/sql/types/interval/) values (e.g. `'1hr'`). <br>Default: `1s`.
 
 ## Details
-
-### Enabling indexes
-
-After booting Materialize in
-[`--disable-user-indexes`](/cli/#disable-user-indexes) mode, you can enable
-individual indexes. This lets Materialize use the index again, which:
-
-- Restarts the dataflow associated with the index, which can in turn e.g. start
-  ingesting data from sources or sending data to sinks
-- Allows inserting into tables
 
 #### Tables
 
@@ -40,27 +27,13 @@ the table's primary index, which was created at the same time as the table
 itself. Only after enabling the primary index can you enable any secondary
 indexes.
 
-### Available parameters
+## Privileges
 
-Name                        | Meaning
-----------------------------|--------
-`logical_compaction_window` | Overrides the [logical compaction window](/ops/memory#compaction) for the data stored in this index. The default value is controlled by the [`--logical-compaction-window`](/cli/#compaction-window) command-line option.
+The privileges required to execute this statement are:
 
-## Examples
+- Ownership of the index.
 
-To adjust the logical compaction window for the index named `some_primary_idx`:
-
-```sql
-ALTER INDEX some_primary_idx SET (logical_compaction_window = '500ms')
-```
-
-To reset the logical compaction window to its default value:
-
-```sql
-ALTER INDEX some_primary_idx RESET (logical_compaction_window)
-```
-
-## See also
+## Related pages
 
 - [`SHOW INDEXES`](/sql/show-indexes)
 - [`SHOW CREATE VIEW`](/sql/show-create-view)

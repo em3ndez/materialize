@@ -11,14 +11,4 @@
 #
 # lint-fast.sh — fast linters that don't require building any code.
 
-set -euo pipefail
-
-. misc/shlib/shlib.bash
-
-ci_init
-
-ci_try bin/lint
-ci_try cargo --locked fmt -- --check
-ci_try cargo --locked deny check licenses bans sources
-
-ci_status_report
+bin/lint --verbose

@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Make sure that reading an Avro buffer with a schema different from the one that was used
 # when it was written does not cause panics or anything like that.
@@ -33,13 +35,19 @@ $ kafka-create-topic topic=avro-types-null2int
 $ kafka-ingest format=avro topic=avro-types-null2int schema=${null} timestamp=1
 {"f1": null}
 
-> CREATE MATERIALIZED SOURCE avro_types_null2int
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-null2int-${testdrive.seed}'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE avro_types_null2int
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-null2int-${testdrive.seed}')
+
+> CREATE TABLE avro_types_null2int_tbl FROM SOURCE avro_types_null2int (REFERENCE "testdrive-avro-types-null2int-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE
 
-! SELECT * FROM avro_types_null2int
-avro deserialization error: IO error: UnexpectedEof
+! SELECT * FROM avro_types_null2int_tbl
+contains:avro deserialization error: unable to decode row : IO error: UnexpectedEof
 
 #
 # boolean -> int
@@ -51,13 +59,16 @@ $ kafka-ingest format=avro topic=avro-types-boolean2int schema=${boolean} timest
 {"f1": true}
 {"f1": false}
 
-> CREATE MATERIALIZED SOURCE avro_types_boolean2int
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-boolean2int-${testdrive.seed}'
+> CREATE SOURCE avro_types_boolean2int
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-boolean2int-${testdrive.seed}')
+
+> CREATE TABLE avro_types_boolean2int_tbl FROM SOURCE avro_types_boolean2int (REFERENCE "testdrive-avro-types-boolean2int-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE
 
 # Bogus result, but at least we do not panic
-> SELECT f1 FROM avro_types_boolean2int
+> SELECT f1 FROM avro_types_boolean2int_tbl
 -1
 0
 
@@ -70,12 +81,15 @@ $ kafka-create-topic topic=avro-types-int2long
 $ kafka-ingest format=avro topic=avro-types-int2long schema=${int} timestamp=1
 {"f1": 123}
 
-> CREATE MATERIALIZED SOURCE avro_types_int2long
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-int2long-${testdrive.seed}'
+> CREATE SOURCE avro_types_int2long
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-int2long-${testdrive.seed}')
+
+> CREATE TABLE avro_types_int2long_tbl FROM SOURCE avro_types_int2long (REFERENCE "testdrive-avro-types-int2long-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${long}'
   ENVELOPE NONE
 
-> SELECT * FROM avro_types_int2long
+> SELECT * FROM avro_types_int2long_tbl
 123
 
 #
@@ -87,13 +101,16 @@ $ kafka-create-topic topic=avro-types-int2float
 $ kafka-ingest format=avro topic=avro-types-int2float schema=${int} timestamp=1
 {"f1": 123}
 
-> CREATE MATERIALIZED SOURCE avro_types_int2float
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-int2float-${testdrive.seed}'
+> CREATE SOURCE avro_types_int2float
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-int2float-${testdrive.seed}')
+
+> CREATE TABLE avro_types_int2float_tbl FROM SOURCE avro_types_int2float (REFERENCE "testdrive-avro-types-int2float-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${float}'
   ENVELOPE NONE
 
-! SELECT * FROM avro_types_int2float
-avro deserialization error: IO error: UnexpectedEof
+! SELECT * FROM avro_types_int2float_tbl
+contains:avro deserialization error: unable to decode row : IO error: UnexpectedEof
 
 #
 # long -> float
@@ -104,13 +121,16 @@ $ kafka-create-topic topic=avro-types-long2float
 $ kafka-ingest format=avro topic=avro-types-long2float schema=${long} timestamp=1
 {"f1": 992147483647}
 
-> CREATE MATERIALIZED SOURCE avro_types_long2float
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-long2float-${testdrive.seed}'
+> CREATE SOURCE avro_types_long2float
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-long2float-${testdrive.seed}')
+
+> CREATE TABLE avro_types_long2float_tbl FROM SOURCE avro_types_long2float (REFERENCE "testdrive-avro-types-long2float-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${float}'
   ENVELOPE NONE
 
-! SELECT * FROM avro_types_long2float
-Unexpected bytes remaining
+! SELECT * FROM avro_types_long2float_tbl
+contains:Unexpected bytes remaining
 
 #
 # long -> int
@@ -121,13 +141,16 @@ $ kafka-create-topic topic=avro-types-long2int
 $ kafka-ingest format=avro topic=avro-types-long2int schema=${long} timestamp=1
 {"f1": 992147483647}
 
-> CREATE MATERIALIZED SOURCE avro_types_long2int
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-long2int-${testdrive.seed}'
+> CREATE SOURCE avro_types_long2int
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-long2int-${testdrive.seed}')
+
+> CREATE TABLE avro_types_long2int_tbl FROM SOURCE avro_types_long2int (REFERENCE "testdrive-avro-types-long2int-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE
 
-! SELECT * FROM avro_types_long2int
-avro deserialization error: Decode error: Decoding error: Expected i32, got: 992147483647
+! SELECT * FROM avro_types_long2int_tbl
+contains:Decoding error: Expected i32, got: 992147483647
 
 #
 # float -> double
@@ -138,13 +161,16 @@ $ kafka-create-topic topic=avro-types-float2double
 $ kafka-ingest format=avro topic=avro-types-float2double schema=${float} timestamp=1
 {"f1": 123456789.123456789}
 
-> CREATE MATERIALIZED SOURCE avro_types_float2double
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-float2double-${testdrive.seed}'
+> CREATE SOURCE avro_types_float2double
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-float2double-${testdrive.seed}')
+
+> CREATE TABLE avro_types_float2double_tbl FROM SOURCE avro_types_float2double (REFERENCE "testdrive-avro-types-float2double-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${double}'
   ENVELOPE NONE
 
-! SELECT * FROM avro_types_float2double
-avro deserialization error: IO error: UnexpectedEof
+! SELECT * FROM avro_types_float2double_tbl
+contains:avro deserialization error: unable to decode row : IO error: UnexpectedEof
 
 #
 # avro-typestion string -> bytes
@@ -155,10 +181,13 @@ $ kafka-create-topic topic=avro-types-string2bytes
 $ kafka-ingest format=avro topic=avro-types-string2bytes schema=${string} timestamp=1
 {"f1": "abc абц"}
 
-> CREATE MATERIALIZED SOURCE avro_types_string2bytes
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-types-string2bytes-${testdrive.seed}'
+> CREATE SOURCE avro_types_string2bytes
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-types-string2bytes-${testdrive.seed}')
+
+> CREATE TABLE avro_types_string2bytes_tbl FROM SOURCE avro_types_string2bytes (REFERENCE "testdrive-avro-types-string2bytes-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${bytes}'
   ENVELOPE NONE
 
-> SELECT * FROM avro_types_string2bytes
+> SELECT * FROM avro_types_string2bytes_tbl
 "abc \\xd0\\xb0\\xd0\\xb1\\xd1\\x86"

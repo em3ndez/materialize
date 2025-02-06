@@ -22,27 +22,42 @@
 #![warn(missing_docs, missing_debug_implementations)]
 #![cfg_attr(nightly_doc_features, feature(doc_cfg))]
 
-#[cfg_attr(nightly_doc_features, doc(cfg(feature = "test")))]
-#[cfg(feature = "test")]
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "assert")))]
+#[cfg(feature = "assert")]
 pub mod assert;
+pub mod bits;
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "bytes_")))]
+#[cfg(feature = "bytes_")]
+pub mod bytes;
 pub mod cast;
-pub mod cgroup;
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "async")))]
+#[cfg(feature = "async")]
+pub mod channel;
 #[cfg_attr(nightly_doc_features, doc(cfg(feature = "cli")))]
 #[cfg(feature = "cli")]
 pub mod cli;
-pub mod codegen;
 pub mod collections;
-pub mod display;
 pub mod env;
+pub mod error;
+#[cfg(feature = "flatcontainer")]
+pub mod flatcontainer;
 pub mod fmt;
-#[cfg_attr(nightly_doc_features, doc(cfg(feature = "network")))]
-#[cfg(feature = "network")]
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "async")))]
+#[cfg(feature = "async")]
 pub mod future;
+pub mod graph;
 pub mod hash;
 pub mod hint;
+#[cfg(feature = "id_gen")]
 pub mod id_gen;
 pub mod iter;
 pub mod lex;
+#[cfg_attr(
+    nightly_doc_features,
+    doc(cfg(all(feature = "bytes_", feature = "region")))
+)]
+#[cfg(all(feature = "bytes_", feature = "region", feature = "tracing_"))]
+pub mod lgbytes;
 #[cfg_attr(nightly_doc_features, doc(cfg(feature = "metrics")))]
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -50,19 +65,49 @@ pub mod metrics;
 #[cfg(feature = "network")]
 pub mod netio;
 pub mod now;
+pub mod num;
 pub mod option;
+#[cfg(not(target_family = "wasm"))]
 pub mod panic;
+pub mod path;
+pub mod permutations;
+#[cfg(feature = "process")]
+pub mod process;
+#[cfg(feature = "region")]
+pub mod region;
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "process")))]
 pub mod result;
-#[cfg_attr(nightly_doc_features, doc(cfg(feature = "network")))]
-#[cfg(feature = "network")]
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "async")))]
+#[cfg(feature = "async")]
 pub mod retry;
+pub mod serde;
 #[cfg_attr(nightly_doc_features, doc(cfg(feature = "stack")))]
 #[cfg(feature = "stack")]
 pub mod stack;
 pub mod stats;
 pub mod str;
-#[cfg_attr(nightly_doc_features, doc(cfg(feature = "test")))]
-#[cfg(feature = "test")]
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "async")))]
+#[cfg(feature = "async")]
+pub mod task;
+#[cfg_attr(nightly_doc_features, doc(cfg(any(test, feature = "test"))))]
+#[cfg(any(test, feature = "test"))]
 pub mod test;
 pub mod thread;
+pub mod time;
+#[cfg_attr(nightly_doc_features, doc(cfg(feature = "tracing_")))]
+#[cfg(feature = "tracing_")]
+pub mod tracing;
+pub mod url;
 pub mod vec;
+
+pub use mz_ore_proc::{instrument, static_list, test};
+
+#[doc(hidden)]
+pub mod __private {
+    #[cfg(feature = "tracing_")]
+    pub use tracing;
+}
+
+// Epoch: 1
+//
+// Bump this whenever we need to change the hash of a build without changing any code.

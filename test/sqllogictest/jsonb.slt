@@ -31,7 +31,7 @@ SELECT '{"a": 1, "a": 2, "a": 3}'::jsonb
 ----
 {"a":3}
 
-# Regression test for #5919, in which 64-bit integers could not be represented
+# Regression test for database-issues#1824, in which 64-bit integers could not be represented
 # in the jsonb type.
 query T
 SELECT '1614259308542846100'::jsonb
@@ -649,6 +649,11 @@ SELECT '{"a":[null]}'::JSONB#>>'{a,0}'::STRING[]
 ----
 NULL
 
+query T
+SELECT '{"a": [1]}'::jsonb #>> '{a,1}';
+----
+NULL
+
 query BB
 SELECT '{"a":1}'::JSONB ? 'a','{"a":1}'::JSONB ? 'b'
 ----
@@ -927,7 +932,7 @@ SELECT '[1,"1",1.0]'::JSONB - '1'
 # ----
 # {"b":[],"c":{"a":"b"}}
 
-# # Regression test for #34756.
+# # Regression test for cockroach#34756.
 # query T
 # SELECT '{"b":[],"c":{"a":"b"}}'::JSONB - array['foo',NULL]
 # ----
@@ -1047,10 +1052,96 @@ SELECT to_jsonb(1.234::FLOAT)
 ----
 1.234
 
-# query T
-# SELECT to_jsonb(1.234::DECIMAL)
-# ----
-# 1.234
+query T
+SELECT to_jsonb(null::int)
+----
+NULL
+
+query T
+SELECT to_jsonb(null::int[])
+----
+NULL
+
+query T
+SELECT to_jsonb(array[1]::int[])
+----
+[1]
+
+query T
+SELECT to_jsonb(array[1, 2]::int[])
+----
+[1,2]
+
+query T
+SELECT to_jsonb(array[1, null]::int[])
+----
+[1,null]
+
+query T
+SELECT to_jsonb(array[null]::int[])
+----
+[null]
+
+query T
+SELECT to_jsonb(array[array[1, 2], array[3, 4]]::int[])
+----
+[[1,2],[3,4]]
+
+query T
+SELECT to_jsonb(array[array[array[1, 2], array[3, 4]], array[array[5, 6], array[7, 8]]]::int[])
+----
+[[[1,2],[3,4]],[[5,6],[7,8]]]
+
+query T
+SELECT to_jsonb(array[1.2, .3]::float[])
+----
+[1.2,0.3]
+
+query T
+SELECT to_jsonb(array[row(1, 2), row(3, 4)])
+----
+[{"f1":1,"f2":2},{"f1":3,"f2":4}]
+
+query T
+SELECT to_jsonb(null::int list)
+----
+NULL
+
+query T
+SELECT to_jsonb(list[1]::int list)
+----
+[1]
+
+query T
+SELECT to_jsonb(list[1, 2]::int list)
+----
+[1,2]
+
+query T
+SELECT to_jsonb(list[list[1], list[3, 4]]::int list list)
+----
+[[1],[3,4]]
+
+query T
+SELECT to_jsonb(list[list[list[1, 2], list[3]], list[list[7, 8]]]::int list list list)
+----
+[[[1,2],[3]],[[7,8]]]
+
+query T
+SELECT to_jsonb(list[1.2, .3]::float list)
+----
+[1.2,0.3]
+
+query T
+SELECT to_jsonb(list[row(1, 2), row(3, 4)])
+----
+[{"f1":1,"f2":2},{"f1":3,"f2":4}]
+
+
+query T
+SELECT to_jsonb(1.234::DECIMAL)
+----
+1.234
 
 # query T
 # SELECT to_jsonb('10.1.0.0/16'::INET)
@@ -1062,40 +1153,40 @@ SELECT to_jsonb(1.234::FLOAT)
 # ----
 # [[1.0,2.0],[3.0,4.0]]
 
-# query T
-# SELECT to_jsonb('2014-05-28 12:22:35.614298'::TIMESTAMP)
-# ----
-# "2014-05-28T12:22:35.614298"
+query T
+SELECT to_jsonb('2014-05-28 12:22:35.614298'::TIMESTAMP)
+----
+"2014-05-28 12:22:35.614298"
 
-# query T
-# SELECT to_jsonb('2014-05-28 12:22:35.614298-04'::TIMESTAMPTZ)
-# ----
-# "2014-05-28T12:22:35.614298-04:00"
+query T
+SELECT to_jsonb('2014-05-28 12:22:35.614298-04'::TIMESTAMPTZ)
+----
+"2014-05-28 16:22:35.614298+00"
 
-# query T
-# SELECT to_jsonb('2014-05-28 12:22:35.614298-04'::TIMESTAMP)
-# ----
-# "2014-05-28T12:22:35.614298"
+query T
+SELECT to_jsonb('2014-05-28 12:22:35.614298-04'::TIMESTAMP)
+----
+"2014-05-28 12:22:35.614298"
 
-# query T
-# SELECT to_jsonb('2014-05-28'::DATE)
-# ----
-# "2014-05-28"
+query T
+SELECT to_jsonb('2014-05-28'::DATE)
+----
+"2014-05-28"
 
-# query T
-# SELECT to_jsonb('00:00:00'::TIME)
-# ----
-# "00:00:00"
+query T
+SELECT to_jsonb('00:00:00'::TIME)
+----
+"00:00:00"
 
-# query T
-# SELECT to_jsonb('2h45m2s234ms'::INTERVAL)
-# ----
-# "02:45:02.234"
+query T
+SELECT to_jsonb('02:45:02.234'::INTERVAL)
+----
+"02:45:02.234"
 
-# query T
-# SELECT to_jsonb((1,2,'hello',NULL,NULL))
-# ----
-# {"f1":1.0,"f2":2.0,"f3":"hello","f4":null,"f5":null}
+query T
+SELECT to_jsonb((1,2,'hello',NULL,NULL))
+----
+{"f1":1,"f2":2,"f3":"hello","f4":null,"f5":null}
 
 ## jsonb_array_elements
 
@@ -1221,6 +1312,17 @@ query T
 SELECT jsonb_build_object('a',2,'b',4)
 ----
 {"a":2,"b":4}
+
+query T
+SELECT jsonb_build_object('a',null,'b',4)
+----
+{"a":null,"b":4}
+
+query error key cannot be null
+SELECT jsonb_build_object(null, null)
+
+query error key cannot be null
+SELECT jsonb_build_object(null, 1)
 
 query T
 SELECT jsonb_build_object(true,'val',1,0,1.3,2,date '2019-02-03' - date '2019-01-01',4)
@@ -1354,6 +1456,21 @@ SELECT jsonb_build_array()
 []
 
 query T
+SELECT jsonb_build_array(1, 2, 3)
+----
+[1,2,3]
+
+query T
+SELECT jsonb_build_array(1, 2, NULL)
+----
+[1,2,null]
+
+query T
+SELECT jsonb_build_array(NULL)
+----
+[null]
+
+query T
 SELECT jsonb_build_array('\x0001'::BYTEA)
 ----
 ["\\x0001"]
@@ -1363,7 +1480,7 @@ SELECT jsonb_build_array('\x0001'::BYTEA)
 # ----
 # [1,1,1.2,null,["x","y"]]
 
-# # Regression for #37318
+# # Regression for cockroach#37318
 # query T
 # SELECT jsonb_build_array('+Inf'::FLOAT,'-Inf'::FLOAT,'NaN'::FLOAT)::STRING::JSONB
 # ----
@@ -1817,7 +1934,7 @@ SELECT ('1'::jsonb)::int;
 ----
 1
 
-query error integer out of range
+query error "9999999999999999999" integer out of range
 SELECT ('9999999999999999999'::jsonb)::int;
 
 # not a number
@@ -1863,6 +1980,31 @@ SELECT to_jsonb(TIMESTAMP '1969-06-01 10:10:10.41');
 ----
 "1969-06-01 10:10:10.41"
 
+query T
+SELECT to_jsonb(LIST[null]::int[] list)
+----
+[null]
+
+query T
+SELECT to_jsonb(LIST[ARRAY[]::int[]]::int[] list)
+----
+[[]]
+
+query T
+SELECT to_jsonb(LIST[ARRAY[]::int[], NULL]::int[] list)
+----
+[[],null]
+
+query T
+SELECT to_jsonb(LIST[ARRAY[]::int[], NULL, ARRAY[2, 3]]::int[] list)
+----
+[[],null,[2,3]]
+
+query T
+SELECT to_jsonb(LIST[ARRAY[ARRAY[1, 2], ARRAY[3, 4]]]::int[] list)
+----
+[[[1,2],[3,4]]]
+
 # jsonb_agg
 
 query T
@@ -1889,19 +2031,19 @@ SELECT jsonb_agg(a) FROM (select a from t1 where a IS NOT NULL)
 query T
 SELECT jsonb_agg(a) FROM t1
 ----
-[null,1,2,3]
+[1,2,3,null]
 
 query T
 SELECT jsonb_agg(a::text::jsonb) FROM t1
 ----
-[null,1,2,3]
+[1,2,3,null]
 
 query T
 SELECT jsonb_agg(a) FILTER (WHERE a IS NOT NULL) FROM t1
 ----
 [1,2,3]
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function jsonb_agg\(integer, integer\) does not exist
 SELECT jsonb_agg(1, 2)
 
 statement ok
@@ -1918,7 +2060,7 @@ SELECT jsonb_agg((a, b)) FROM t2
 query TTT
 SELECT jsonb_agg((a, b)), jsonb_agg(a), jsonb_agg(b) FROM t2
 ----
-[{"f1":null,"f2":"2020-01-02"},{"f1":1,"f2":"2020-01-01"}]  [null,1]  ["2020-01-01","2020-01-02"]
+[{"f1":null,"f2":"2020-01-02"},{"f1":1,"f2":"2020-01-01"}]  [1,null]  ["2020-01-01","2020-01-02"]
 
 # jsonb_object_agg
 
@@ -1967,7 +2109,7 @@ SELECT jsonb_object_agg(a, a) FILTER (WHERE a IS NOT NULL) FROM t1
 ----
 {"1":1,"2":2,"3":3}
 
-# Null casts. Protects against #7183.
+# Null casts. Protects against database-issues#2244.
 query TTTTTTT
 SELECT
     NULL::jsonb::text,
@@ -1979,3 +2121,18 @@ SELECT
     NULL::jsonb::bool
 ----
 NULL NULL NULL NULL NULL NULL NULL
+
+query T
+SELECT '{}'::JSONB ->> -9223372036854775808;
+----
+NULL
+
+query T
+SELECT '{}'::JSONB - -9223372036854775808;
+----
+NULL
+
+query T
+SELECT '{}'::JSONB #> '{-9223372036854775808}';
+----
+NULL

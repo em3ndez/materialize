@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 $ set-sql-timeout duration=60s
 
 $ set schema={
@@ -22,18 +24,26 @@ $ kafka-create-topic topic=data partitions=2
 
 $ kafka-create-topic topic=data2 partitions=2
 
-> CREATE MATERIALIZED SOURCE data_empty
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data2-${testdrive.seed}'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE data_empty
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data2-${testdrive.seed}')
+
+> CREATE TABLE data_empty_tbl FROM SOURCE data_empty (REFERENCE "testdrive-data2-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
 
-> CREATE MATERIALIZED SOURCE data_rt
-    FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-    WITH (topic_metadata_refresh_interval_ms=50)
-    FORMAT AVRO USING SCHEMA '${schema}'
+> CREATE SOURCE data_rt
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
 
-> CREATE MATERIALIZED VIEW view_rt AS SELECT b, sum(a) FROM data_rt GROUP BY b
+> CREATE TABLE data_rt_tbl FROM SOURCE data_rt (REFERENCE "testdrive-data-${testdrive.seed}")
+  FORMAT AVRO USING SCHEMA '${schema}'
 
-> CREATE MATERIALIZED VIEW view_empty AS SELECT b, sum(a) FROM data_empty GROUP BY b
+> CREATE MATERIALIZED VIEW view_rt AS SELECT b, sum(a) FROM data_rt_tbl GROUP BY b
+
+> CREATE MATERIALIZED VIEW view_empty AS SELECT b, sum(a) FROM data_empty_tbl GROUP BY b
 
 > SELECT * FROM view_empty;
 b sum

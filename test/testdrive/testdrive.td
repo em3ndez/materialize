@@ -1,4 +1,3 @@
-
 # Copyright Materialize, Inc. and contributors. All rights reserved.
 #
 # Use of this software is governed by the Business Source License
@@ -7,6 +6,8 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
+
+$ set-arg-default single-replica-cluster=quickstart
 
 # Tests for testdrive itself.
 
@@ -45,20 +46,20 @@ row 2
 $ set-regex match=u\d+ replacement=UID
 
 ? EXPLAIN SELECT * FROM t1 AS a1, t1 AS a2 WHERE a1.f1 IS NOT NULL;
-%0 =
-| Get materialize.public.t1 (UID)
-| Filter !(isnull(#0))
-| ArrangeBy ()
+Explained Query:
+  CrossJoin type=differential
+    ArrangeBy keys=[[]]
+      Filter (#0) IS NOT NULL
+        ReadStorage materialize.public.t1
+    ArrangeBy keys=[[]]
+      ReadStorage materialize.public.t1
 
-%1 =
-| Get materialize.public.t1 (UID)
+Source materialize.public.t1
 
-%2 =
-| Join %0 %1
-| | implementation = Differential %1 %0.()
+Target cluster: quickstart
 
 ! SELECT * FROM u1234;
-unknown catalog item 'UID'
+contains:unknown catalog item 'UID'
 
 # Exclude FETCH from the retry logic
 
@@ -66,7 +67,7 @@ unknown catalog item 'UID'
 
 > BEGIN
 
-> DECLARE c CURSOR FOR TAIL v1 AS OF 18446744073709551615;
+> DECLARE c CURSOR FOR SUBSCRIBE v1 AS OF 18446744073709551615;
 
 > FETCH 4 c WITH (timeout='10s');
 18446744073709551615 1 1
@@ -77,20 +78,32 @@ unknown catalog item 'UID'
 
 # kafka-verify sort-messages
 
-> CREATE VIEW sort_messages (a) AS VALUES (2),(1),(3);
 
-> CREATE SINK sort_messages_sink FROM sort_messages
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'sort-messages-sink'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
 
-$ kafka-verify format=avro sink=materialize.public.sort_messages_sink sort-messages=true
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
+> CREATE MATERIALIZED VIEW sort_messages (a) AS VALUES (2),(1),(3);
+
+> CREATE SINK sort_messages_sink
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM sort_messages
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'sort-messages-sink-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+
+$ kafka-verify-data format=avro sink=materialize.public.sort_messages_sink sort-messages=true
 {"before": null, "after": {"row": {"a": 1}}}
 {"before": null, "after": {"row": {"a": 2}}}
 {"before": null, "after": {"row": {"a": 3}}}
 
 # Use $ postgresql-execute and ${testdrive.materialize_addr}
 
-$ postgres-execute connection=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-execute connection=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 CREATE TABLE postgres_execute (f1 INTEGER);
 INSERT INTO postgres_execute VALUES (123);
 
@@ -113,25 +126,27 @@ $ set kafka-ingest-repeat={
 
 $ kafka-create-topic topic=kafka-ingest-repeat
 
-$ kafka-ingest format=avro topic=kafka-ingest-repeat schema=${kafka-ingest-repeat} publish=true repeat=2
+$ kafka-ingest format=avro topic=kafka-ingest-repeat schema=${kafka-ingest-repeat} repeat=2
 {"f1": "fish"}
 
-> CREATE MATERIALIZED SOURCE kafka_ingest_repeat_input
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC
-  'testdrive-kafka-ingest-repeat-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE SOURCE kafka_ingest_repeat_input
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-ingest-repeat-${testdrive.seed}')
+
+> CREATE TABLE kafka_ingest_repeat_input_tbl FROM SOURCE kafka_ingest_repeat_input (REFERENCE "testdrive-kafka-ingest-repeat-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE NONE
 
-> SELECT * FROM kafka_ingest_repeat_input;
+> SELECT * FROM kafka_ingest_repeat_input_tbl;
 fish
 fish
 
 # kafka-ingest repeat with ${kafka-ingest.iteration}
 
-$ kafka-ingest format=avro topic=kafka-ingest-repeat schema=${kafka-ingest-repeat} publish=true repeat=2
+$ kafka-ingest format=avro topic=kafka-ingest-repeat schema=${kafka-ingest-repeat} repeat=2
 {"f1": "${kafka-ingest.iteration}"}
 
-> SELECT * FROM kafka_ingest_repeat_input;
+> SELECT * FROM kafka_ingest_repeat_input_tbl;
 0
 1
 fish
@@ -144,7 +159,7 @@ $ set kafka-ingest-no-partition-value={"type": "record", "name": "r", "fields": 
 
 $ kafka-create-topic topic=kafka-ingest-no-partition partitions=2
 
-$ kafka-ingest format=avro topic=kafka-ingest-no-partition key-format=avro key-schema=${kafka-ingest-no-partition-key} schema=${kafka-ingest-no-partition-value} publish=true
+$ kafka-ingest format=avro topic=kafka-ingest-no-partition key-format=avro key-schema=${kafka-ingest-no-partition-key} schema=${kafka-ingest-no-partition-value}
 "a" {"a": "a"}
 "b" {"a": "b"}
 "c" {"a": "c"}
@@ -154,31 +169,29 @@ $ kafka-ingest format=avro topic=kafka-ingest-no-partition key-format=avro key-s
 "g" {"a": "g"}
 "h" {"a": "h"}
 
-> CREATE MATERIALIZED SOURCE kafka_ingest_no_partition
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-kafka-ingest-no-partition-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE SOURCE kafka_ingest_no_partition
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-ingest-no-partition-${testdrive.seed}')
+
+> CREATE TABLE kafka_ingest_no_partition_tbl FROM SOURCE kafka_ingest_no_partition (REFERENCE "testdrive-kafka-ingest-no-partition-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE NONE
 
-> SELECT COUNT(*) = 8 FROM kafka_ingest_no_partition;
-true
-
-> SELECT count(*)
-  FROM
-      mz_sources s JOIN mz_kafka_source_statistics stats ON s.id = split_part(stats.source_id, '/', 1),
-      jsonb_each(statistics->'topics') topics (topic, topic_statistics),
-      jsonb_each(topic_statistics->'partitions') partitions (partition, partition_statistics)
-  WHERE s.name = 'kafka_ingest_no_partition' AND (partition_statistics->'rxmsgs')::integer > 0
-2
+> SELECT COUNT(*) FROM kafka_ingest_no_partition_tbl;
+8
 
 # kafka-verify with regexp (the set-regexp from above is used)
 
-> CREATE VIEW kafka_verify_regexp (a) AS VALUES ('u123'), ('u234');
+> CREATE MATERIALIZED VIEW kafka_verify_regexp (a) AS VALUES ('u123'), ('u234');
 
-> CREATE SINK kafka_verify_regexp_sink FROM kafka_verify_regexp
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'kafka-verify-regexp-sink'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE SINK kafka_verify_regexp_sink
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM kafka_verify_regexp
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-verify-regexp-sink-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
 
-$ kafka-verify format=avro sink=materialize.public.kafka_verify_regexp_sink sort-messages=true
+$ kafka-verify-data format=avro sink=materialize.public.kafka_verify_regexp_sink sort-messages=true
 {"before": null, "after": {"row": {"a": "UID"}}}
 {"before": null, "after": {"row": {"a": "UID"}}}
 
@@ -186,19 +199,28 @@ $ kafka-verify format=avro sink=materialize.public.kafka_verify_regexp_sink sort
 
 > CREATE TABLE postgres_connect (f1 INTEGER);
 
-$ postgres-connect name=conn1 url=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-connect name=conn1 url=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 
 $ postgres-execute connection=conn1
 BEGIN;
 INSERT INTO postgres_connect VALUES (1);
 
 # Table is still empty, the transaction we just started is not committed yet
-> SELECT COUNT(*) = 0 FROM postgres_connect;
-true
+> SELECT COUNT(*) FROM postgres_connect;
+0
 
 $ postgres-execute connection=conn1
 INSERT INTO postgres_connect VALUES (2);
 COMMIT;
 
-> SELECT COUNT(*) = 2 FROM postgres_connect;
-true
+> SELECT COUNT(*) FROM postgres_connect;
+2
+
+# Comments don't affect following lines
+> CREATE TABLE t (x int)
+
+> INSERT INTO t VALUES (0)
+
+> SELECT *
+  FROM t -- this is a comment
+  WHERE x = 1

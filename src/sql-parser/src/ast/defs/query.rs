@@ -22,75 +22,16 @@ use std::fmt::{self, Debug};
 use std::hash::Hash;
 use std::mem;
 
-use crate::ast::display::{self, AstDisplay, AstFormatter};
-use crate::ast::{Expr, FunctionArgs, Ident, SqlOption, UnresolvedObjectName};
-
-// This represents the metadata that lives next to an AST, as we take it through
-// various stages in the planning process.
-//
-// Conceptually, when we first receive an AST from the parsing process, it only
-// represents the syntax that the user input, and has no semantic information
-// embedded in it. Later in this process, we want to be able to walk the tree
-// and add additional information to it piecemeal, perhaps without going down
-// the full planning pipeline. AstInfo represents various bits of information
-// that get stored in the tree: for instance, at first, table names are only
-// represented by the names the user input (in the `Raw` implementor of this
-// trait), but later on, we replace them with both the name along with the ID
-// that it gets resolved to.
-//
-// Currently this process brings an Ast<Raw> to Ast<Aug>, and lives in
-// sql/src/plan/query.rs:resolve_names.
-pub trait AstInfo: Clone {
-    // The type used for table references.
-    type ObjectName: AstDisplay + Clone + Hash + Debug + Eq;
-    // The type stored next to CTEs for their assigned ID.
-    type Id: Clone + Hash + Debug + Eq;
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, Default)]
-pub struct Raw;
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum RawName {
-    Name(UnresolvedObjectName),
-    Id(String, UnresolvedObjectName),
-}
-
-impl RawName {
-    pub fn name(&self) -> &UnresolvedObjectName {
-        match self {
-            RawName::Name(name) => name,
-            RawName::Id(_, name) => name,
-        }
-    }
-}
-
-impl AstDisplay for RawName {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            RawName::Name(o) => f.write_node(o),
-            RawName::Id(id, o) => {
-                f.write_str(format!("[{} AS ", id));
-                f.write_node(o);
-                f.write_str("]");
-            }
-        }
-    }
-}
-impl_display!(RawName);
-
-impl AstInfo for Raw {
-    type ObjectName = RawName;
-    type Id = ();
-}
+use crate::ast::display::{self, AstDisplay, AstFormatter, WithOptionName};
+use crate::ast::{AstInfo, Expr, Function, Ident, ShowStatement, WithOptionValue};
 
 /// The most complete variant of a `SELECT` query expression, optionally
 /// including `WITH`, `UNION` / other set operations, and `ORDER BY`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Query<T: AstInfo> {
     /// WITH (common table expressions, or CTEs)
-    pub ctes: Vec<Cte<T>>,
-    /// SELECT or UNION / EXCEPT / INTECEPT
+    pub ctes: CteBlock<T>,
+    /// SELECT or UNION / EXCEPT / INTERSECT
     pub body: SetExpr<T>,
     /// ORDER BY
     pub order_by: Vec<OrderByExpr<T>>,
@@ -103,11 +44,7 @@ pub struct Query<T: AstInfo> {
 
 impl<T: AstInfo> AstDisplay for Query<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        if !self.ctes.is_empty() {
-            f.write_str("WITH ");
-            f.write_node(&display::comma_separated(&self.ctes));
-            f.write_str(" ");
-        }
+        f.write_node(&self.ctes);
         f.write_node(&self.body);
         if !self.order_by.is_empty() {
             f.write_str(" ORDER BY ");
@@ -142,8 +79,18 @@ impl_display_t!(Query);
 impl<T: AstInfo> Query<T> {
     pub fn select(select: Select<T>) -> Query<T> {
         Query {
-            ctes: vec![],
+            ctes: CteBlock::empty(),
             body: SetExpr::Select(Box::new(select)),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        }
+    }
+
+    pub fn query(query: Query<T>) -> Query<T> {
+        Query {
+            ctes: CteBlock::empty(),
+            body: SetExpr::Query(Box::new(query)),
             order_by: vec![],
             limit: None,
             offset: None,
@@ -154,7 +101,7 @@ impl<T: AstInfo> Query<T> {
         mem::replace(
             self,
             Query::<T> {
-                ctes: vec![],
+                ctes: CteBlock::empty(),
                 order_by: vec![],
                 body: SetExpr::Values(Values(vec![])),
                 limit: None,
@@ -166,7 +113,7 @@ impl<T: AstInfo> Query<T> {
 
 /// A node in a tree, representing a "query body" expression, roughly:
 /// `SELECT ... [ {UNION|EXCEPT|INTERSECT} SELECT ...]`
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SetExpr<T: AstInfo> {
     /// Restricted SELECT .. FROM .. HAVING (no ORDER BY or set operations)
     Select(Box<Select<T>>),
@@ -181,7 +128,8 @@ pub enum SetExpr<T: AstInfo> {
         right: Box<SetExpr<T>>,
     },
     Values(Values<T>),
-    // TODO: ANSI SQL supports `TABLE` here.
+    Show(ShowStatement<T>),
+    Table(T::ItemName),
 }
 
 impl<T: AstInfo> AstDisplay for SetExpr<T> {
@@ -194,6 +142,11 @@ impl<T: AstInfo> AstDisplay for SetExpr<T> {
                 f.write_str(")")
             }
             SetExpr::Values(v) => f.write_node(v),
+            SetExpr::Show(v) => f.write_node(v),
+            SetExpr::Table(t) => {
+                f.write_str("TABLE ");
+                f.write_node(t)
+            }
             SetExpr::SetOperation {
                 left,
                 right,
@@ -214,7 +167,7 @@ impl<T: AstInfo> AstDisplay for SetExpr<T> {
 }
 impl_display_t!(SetExpr);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SetOperator {
     Union,
     Except,
@@ -232,10 +185,53 @@ impl AstDisplay for SetOperator {
 }
 impl_display!(SetOperator);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SelectOptionName {
+    ExpectedGroupSize,
+    AggregateInputGroupSize,
+    DistinctOnInputGroupSize,
+    LimitInputGroupSize,
+}
+
+impl AstDisplay for SelectOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            SelectOptionName::ExpectedGroupSize => "EXPECTED GROUP SIZE",
+            SelectOptionName::AggregateInputGroupSize => "AGGREGATE INPUT GROUP SIZE",
+            SelectOptionName::DistinctOnInputGroupSize => "DISTINCT ON INPUT GROUP SIZE",
+            SelectOptionName::LimitInputGroupSize => "LIMIT INPUT GROUP SIZE",
+        })
+    }
+}
+impl_display!(SelectOptionName);
+
+impl WithOptionName for SelectOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            SelectOptionName::ExpectedGroupSize
+            | SelectOptionName::AggregateInputGroupSize
+            | SelectOptionName::DistinctOnInputGroupSize
+            | SelectOptionName::LimitInputGroupSize => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SelectOption<T: AstInfo> {
+    pub name: SelectOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(SelectOption);
+
 /// A restricted variant of `SELECT` (without CTEs/`ORDER BY`), which may
 /// appear either as the only body item of an `SQLQuery`, or as an operand
 /// to a set operation like `UNION`.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Select<T: AstInfo> {
     pub distinct: Option<Distinct<T>>,
     /// projection expressions
@@ -248,8 +244,10 @@ pub struct Select<T: AstInfo> {
     pub group_by: Vec<Expr<T>>,
     /// HAVING
     pub having: Option<Expr<T>>,
+    /// QUALIFY
+    pub qualify: Option<Expr<T>>,
     /// OPTION
-    pub options: Vec<SqlOption<T>>,
+    pub options: Vec<SelectOption<T>>,
 }
 
 impl<T: AstInfo> AstDisplay for Select<T> {
@@ -279,8 +277,12 @@ impl<T: AstInfo> AstDisplay for Select<T> {
             f.write_str(" HAVING ");
             f.write_node(having);
         }
+        if let Some(ref qualify) = self.qualify {
+            f.write_str(" QUALIFY ");
+            f.write_node(qualify);
+        }
         if !self.options.is_empty() {
-            f.write_str(" OPTION (");
+            f.write_str(" OPTIONS (");
             f.write_node(&display::comma_separated(&self.options));
             f.write_str(")");
         }
@@ -305,7 +307,7 @@ impl<T: AstInfo> Select<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Distinct<T: AstInfo> {
     EntireRow,
     On(Vec<Expr<T>>),
@@ -325,14 +327,85 @@ impl<T: AstInfo> AstDisplay for Distinct<T> {
     }
 }
 
+/// A block of common table expressions (CTEs).
+///
+/// The block can either be entirely "simple" (traditional SQL `WITH` block),
+/// or "mutually recursive", which introduce their bindings before the block
+/// and may result in mutually recursive definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CteBlock<T: AstInfo> {
+    Simple(Vec<Cte<T>>),
+    MutuallyRecursive(MutRecBlock<T>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MutRecBlock<T: AstInfo> {
+    pub options: Vec<MutRecBlockOption<T>>,
+    pub ctes: Vec<CteMutRec<T>>,
+}
+
+impl<T: AstInfo> CteBlock<T> {
+    /// Returns an empty (simple) CTE block.
+    pub fn empty() -> Self {
+        CteBlock::Simple(Vec::new())
+    }
+    /// True if there are no bindings in the block.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            CteBlock::Simple(list) => list.is_empty(),
+            CteBlock::MutuallyRecursive(list) => list.ctes.is_empty(),
+        }
+    }
+    /// Iterates through the identifiers used in bindings.
+    pub fn bound_identifiers(&self) -> impl Iterator<Item = &Ident> {
+        let mut names = Vec::new();
+        match self {
+            CteBlock::Simple(list) => {
+                for cte in list.iter() {
+                    names.push(&cte.alias.name);
+                }
+            }
+            CteBlock::MutuallyRecursive(MutRecBlock { options: _, ctes }) => {
+                for cte in ctes.iter() {
+                    names.push(&cte.name);
+                }
+            }
+        }
+        names.into_iter()
+    }
+}
+
+impl<T: AstInfo> AstDisplay for CteBlock<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if !self.is_empty() {
+            match self {
+                CteBlock::Simple(list) => {
+                    f.write_str("WITH ");
+                    f.write_node(&display::comma_separated(list));
+                }
+                CteBlock::MutuallyRecursive(MutRecBlock { options, ctes }) => {
+                    f.write_str("WITH MUTUALLY RECURSIVE ");
+                    if !options.is_empty() {
+                        f.write_str("(");
+                        f.write_node(&display::comma_separated(options));
+                        f.write_str(") ");
+                    }
+                    f.write_node(&display::comma_separated(ctes));
+                }
+            }
+            f.write_str(" ");
+        }
+    }
+}
+
 /// A single CTE (used after `WITH`): `alias [(col1, col2, ...)] AS ( query )`
 /// The names in the column list before `AS`, when specified, replace the names
 /// of the columns returned by the query. The parser does not validate that the
 /// number of columns in the query matches the number of columns in the query.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Cte<T: AstInfo> {
     pub alias: TableAlias,
-    pub id: T::Id,
+    pub id: T::CteId,
     pub query: Query<T>,
 }
 
@@ -346,8 +419,87 @@ impl<T: AstInfo> AstDisplay for Cte<T> {
 }
 impl_display_t!(Cte);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CteMutRec<T: AstInfo> {
+    pub name: Ident,
+    pub columns: Vec<CteMutRecColumnDef<T>>,
+    pub id: T::CteId,
+    pub query: Query<T>,
+}
+
+impl<T: AstInfo> AstDisplay for CteMutRec<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
+        if !self.columns.is_empty() {
+            f.write_str(" (");
+            f.write_node(&display::comma_separated(&self.columns));
+            f.write_str(")");
+        }
+        f.write_str(" AS (");
+        f.write_node(&self.query);
+        f.write_str(")");
+    }
+}
+impl_display_t!(CteMutRec);
+
+/// A column definition in a [`CteMutRec`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CteMutRecColumnDef<T: AstInfo> {
+    pub name: Ident,
+    pub data_type: T::DataType,
+}
+
+impl<T: AstInfo> AstDisplay for CteMutRecColumnDef<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
+        f.write_str(" ");
+        f.write_node(&self.data_type);
+    }
+}
+impl_display_t!(CteMutRecColumnDef);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MutRecBlockOptionName {
+    RecursionLimit,
+    ErrorAtRecursionLimit,
+    ReturnAtRecursionLimit,
+}
+
+impl AstDisplay for MutRecBlockOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            MutRecBlockOptionName::RecursionLimit => "RECURSION LIMIT",
+            MutRecBlockOptionName::ErrorAtRecursionLimit => "ERROR AT RECURSION LIMIT",
+            MutRecBlockOptionName::ReturnAtRecursionLimit => "RETURN AT RECURSION LIMIT",
+        })
+    }
+}
+impl_display!(MutRecBlockOptionName);
+
+impl WithOptionName for MutRecBlockOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            MutRecBlockOptionName::RecursionLimit
+            | MutRecBlockOptionName::ErrorAtRecursionLimit
+            | MutRecBlockOptionName::ReturnAtRecursionLimit => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MutRecBlockOption<T: AstInfo> {
+    pub name: MutRecBlockOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(MutRecBlockOption);
+
 /// One item of the comma-separated list following `SELECT`
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SelectItem<T: AstInfo> {
     /// An expression, optionally followed by `[ AS ] alias`.
     Expr { expr: Expr<T>, alias: Option<Ident> },
@@ -371,7 +523,7 @@ impl<T: AstInfo> AstDisplay for SelectItem<T> {
 }
 impl_display_t!(SelectItem);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableWithJoins<T: AstInfo> {
     pub relation: TableFactor<T>,
     pub joins: Vec<Join<T>>,
@@ -401,19 +553,19 @@ impl<T: AstInfo> TableWithJoins<T> {
 }
 
 /// A table name or a parenthesized subquery with an optional alias
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TableFactor<T: AstInfo> {
     Table {
-        name: T::ObjectName,
+        name: T::ItemName,
         alias: Option<TableAlias>,
     },
     Function {
-        function: TableFunction<T>,
+        function: Function<T>,
         alias: Option<TableAlias>,
         with_ordinality: bool,
     },
     RowsFrom {
-        functions: Vec<TableFunction<T>>,
+        functions: Vec<Function<T>>,
         alias: Option<TableAlias>,
         with_ordinality: bool,
     },
@@ -461,13 +613,13 @@ impl<T: AstInfo> AstDisplay for TableFactor<T> {
                 alias,
                 with_ordinality,
             } => {
-                f.write_str("ROWS FROM(");
+                f.write_str("ROWS FROM (");
                 f.write_node(&display::comma_separated(functions));
+                f.write_str(")");
                 if let Some(alias) = alias {
                     f.write_str(" AS ");
                     f.write_node(alias);
                 }
-                f.write_str(")");
                 if *with_ordinality {
                     f.write_str(" WITH ORDINALITY");
                 }
@@ -502,22 +654,7 @@ impl<T: AstInfo> AstDisplay for TableFactor<T> {
 }
 impl_display_t!(TableFactor);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableFunction<T: AstInfo> {
-    pub name: UnresolvedObjectName,
-    pub args: FunctionArgs<T>,
-}
-impl<T: AstInfo> AstDisplay for TableFunction<T> {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_node(&self.name);
-        f.write_str("(");
-        f.write_node(&self.args);
-        f.write_str(")");
-    }
-}
-impl_display_t!(TableFunction);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableAlias {
     pub name: Ident,
     pub columns: Vec<Ident>,
@@ -541,7 +678,7 @@ impl AstDisplay for TableAlias {
 }
 impl_display!(TableAlias);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Join<T: AstInfo> {
     pub relation: TableFactor<T>,
     pub join_operator: JoinOperator<T>,
@@ -567,10 +704,15 @@ impl<T: AstInfo> AstDisplay for Join<T> {
                             f.write_str(" ON ");
                             f.write_node(expr);
                         }
-                        JoinConstraint::Using(attrs) => {
+                        JoinConstraint::Using { columns, alias } => {
                             f.write_str(" USING (");
-                            f.write_node(&display::comma_separated(attrs));
+                            f.write_node(&display::comma_separated(columns));
                             f.write_str(")");
+
+                            if let Some(join_using_alias) = alias {
+                                f.write_str(" AS ");
+                                f.write_node(join_using_alias);
+                            }
                         }
                         _ => {}
                     }
@@ -616,7 +758,7 @@ impl<T: AstInfo> AstDisplay for Join<T> {
 }
 impl_display_t!(Join);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum JoinOperator<T: AstInfo> {
     Inner(JoinConstraint<T>),
     LeftOuter(JoinConstraint<T>),
@@ -625,18 +767,22 @@ pub enum JoinOperator<T: AstInfo> {
     CrossJoin,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum JoinConstraint<T: AstInfo> {
     On(Expr<T>),
-    Using(Vec<Ident>),
+    Using {
+        columns: Vec<Ident>,
+        alias: Option<Ident>,
+    },
     Natural,
 }
 
 /// SQL ORDER BY expression
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OrderByExpr<T: AstInfo> {
     pub expr: Expr<T>,
     pub asc: Option<bool>,
+    pub nulls_last: Option<bool>,
 }
 
 impl<T: AstInfo> AstDisplay for OrderByExpr<T> {
@@ -647,24 +793,37 @@ impl<T: AstInfo> AstDisplay for OrderByExpr<T> {
             Some(false) => f.write_str(" DESC"),
             None => {}
         }
+        match self.nulls_last {
+            Some(true) => f.write_str(" NULLS LAST"),
+            Some(false) => f.write_str(" NULLS FIRST"),
+            None => {}
+        }
     }
 }
 impl_display_t!(OrderByExpr);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Limit<T: AstInfo> {
     pub with_ties: bool,
     pub quantity: Expr<T>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Values<T: AstInfo>(pub Vec<Vec<Expr<T>>>);
 
 impl<T: AstInfo> AstDisplay for Values<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("VALUES ");
         let mut delim = "";
-        for row in &self.0 {
+
+        for (i, row) in self.0.iter().enumerate() {
+            if f.redacted() && i == 20 {
+                f.write_str("/* ");
+                f.write_str(&(self.0.len().saturating_sub(20)).to_string());
+                f.write_str(" more rows */");
+                break;
+            }
+
             f.write_str(delim);
             delim = ", ";
             f.write_str("(");

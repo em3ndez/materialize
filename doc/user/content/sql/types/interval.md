@@ -1,5 +1,5 @@
 ---
-title: "interval Data Type"
+title: "interval type"
 description: "Expresses a duration of time"
 menu:
     main:
@@ -8,14 +8,19 @@ menu:
 
 `interval` data expresses a duration of time.
 
+`interval` data keeps months, days, and microseconds completely separate and will not try to convert between any of
+those fields when comparing `interval`s. This may lead to some unexpected behavior. For example `1 month` is considered
+greater than `100 days`. See ['justify_days'](../../functions/justify-days), ['justify_hours'](../../functions/justify-hours), and
+['justify_interval'](../../functions/justify-interval) to explicitly convert between these fields.
+
 Detail | Info
 -------|-----
 **Quick Syntax** | `INTERVAL '1' MINUTE` <br/> `INTERVAL '1-2 3 4:5:6.7'` <br/>`INTERVAL '1 year 2.3 days 4.5 seconds'`
 **Size** | 20 bytes
 **Catalog name** | `pg_catalog.interval`
 **OID** | 1186
-**Min value** | -178956970 years -7 months -2236962132 days -07:59:59.999999
-**Max value** | 178956970 years 7 months 2236962132 days 07:59:59.999999
+**Min value** | -178956970 years -8 months -2147483648 days -2562047788:00:54.775808
+**Max value** | 178956970 years 7 months 2147483647 days 2562047788:00:54.775807
 
 ## Syntax
 
@@ -47,8 +52,8 @@ offers support for two types of `time_expr` syntax:
 
 - SQL Standard, i.e. `'Y-M D H:M:S.NS'`
 - PostgreSQL, i.e. repeated `int.frac time_unit`, e.g.:
-    - `'1 year 2 months 3.4 days 5 hours 6 minutes 7.8 seconds'`
-    - `'1y 2mon 3.4d 5h 6m 7.8s'`
+    - `'1 year 2 months 3.4 days 5 hours 6 minutes 7 seconds 8 milliseconds'`
+    - `'1y 2mon 3.4d 5h 6m 7s 8ms'`
 
 Like PostgreSQL, Materialize's implementation includes the following
 stipulations:
@@ -69,7 +74,8 @@ stipulations:
     For example, the `time_expr` `'1:2'` (1 hour, 2 minutes) also writes a value
     of 0 seconds. You cannot then include another `time_expr` which writes to
     the seconds `time_unit`.
-
+- A two-field `time_expr` like `'1:2'` is by default interpreted as (hour, minute)
+  while `1:2 MINUTE TO SECOND` interprets as (minute, seconds).
 - Only PostgreSQL `time_expr`s support non-second fractional `time_units`, e.g.
     `1.2 days`. Materialize only supports 9 places of decimal precision.
 
@@ -87,7 +93,7 @@ You can [cast](../../functions/cast) `interval` to:
 You can [cast](../../functions/cast) from the following types to `interval`:
 
 - [`text`](../text) (explicitly)
-- [`time`](../time)  (explicity)
+- [`time`](../time)  (explicitly)
 
 ### Valid operations
 
@@ -104,12 +110,12 @@ Operation | Computes | Notes
 [`time`](../time) `+` [`interval`](../interval) | `time`
 [`time`](../time) `-` [`interval`](../interval) | `time`
 [`time`](../time) `-` [`time`](../time) | [`interval`](../interval)
-[`interval`](../interval) `*` [`double precision`](../float) | [`interval`](../interval) | {{< version-added v0.6.1 />}}
-[`interval`](../interval) `/` [`double precision`](../float) | [`interval`](../interval) | {{< version-added v0.6.1 />}}
+[`interval`](../interval) `*` [`double precision`](../float) | [`interval`](../interval) |
+[`interval`](../interval) `/` [`double precision`](../float) | [`interval`](../interval) |
 
 ## Examples
 
-```sql
+```mzsql
 SELECT INTERVAL '1' MINUTE AS interval_m;
 ```
 
@@ -121,7 +127,7 @@ SELECT INTERVAL '1' MINUTE AS interval_m;
 
 ### SQL Standard syntax
 
-```sql
+```mzsql
 SELECT INTERVAL '1-2 3 4:5:6.7' AS interval_p;
 ```
 
@@ -133,7 +139,7 @@ SELECT INTERVAL '1-2 3 4:5:6.7' AS interval_p;
 
 ### PostgreSQL syntax
 
-```sql
+```mzsql
 SELECT INTERVAL '1 year 2.3 days 4.5 seconds' AS interval_p;
 ```
 
@@ -147,14 +153,14 @@ SELECT INTERVAL '1 year 2.3 days 4.5 seconds' AS interval_p;
 
 `interval_n` demonstrates using negative and positive components in an interval.
 
-```sql
+```mzsql
 SELECT INTERVAL '-1 day 2:3:4.5' AS interval_n;
 ```
 
 ```nofmt
  interval_n
 -------------
- -21:56:55.5
+ -1 days +02:03:04.5
 ```
 
 ### Truncating interval
@@ -162,7 +168,7 @@ SELECT INTERVAL '-1 day 2:3:4.5' AS interval_n;
 `interval_r` demonstrates how `head_time_unit` and `tail_time_unit` truncate the
 interval.
 
-```sql
+```mzsql
 SELECT INTERVAL '1-2 3 4:5:6.7' DAY TO MINUTE AS interval_r;
 ```
 
@@ -178,7 +184,7 @@ SELECT INTERVAL '1-2 3 4:5:6.7' DAY TO MINUTE AS interval_r;
 as well as using `tail_time_unit` to control the `time_unit` of the last value
 of the `interval` string.
 
-```sql
+```mzsql
 SELECT INTERVAL '1 day 2-3 4' MINUTE AS interval_w;
 ```
 
@@ -190,7 +196,7 @@ SELECT INTERVAL '1 day 2-3 4' MINUTE AS interval_w;
 
 ### Interaction with timestamps
 
-```sql
+```mzsql
 SELECT TIMESTAMP '2020-01-01 8:00:00' + INTERVAL '1' DAY AS ts_interaction;
 ```
 

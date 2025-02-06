@@ -71,16 +71,16 @@ SELECT 1.5::float::bigint
 # TODO(sploiselle): fix return type to indicate custom type
 
 statement ok
-CREATE TYPE int4_list AS LIST (element_type=int4)
+CREATE TYPE int4_list AS LIST (ELEMENT TYPE = int4)
 
 statement ok
-CREATE TYPE int4_list_list AS LIST (element_type=int4_list)
+CREATE TYPE int4_list_list AS LIST (ELEMENT TYPE = int4_list)
 
 statement ok
-CREATE TYPE int4_list_too AS LIST (element_type=int4)
+CREATE TYPE int4_list_too AS LIST (ELEMENT TYPE = int4)
 
 statement ok
-CREATE TYPE int4_list_list_too AS LIST (element_type=int4_list_too)
+CREATE TYPE int4_list_list_too AS LIST (ELEMENT TYPE = int4_list_too)
 
 query T
 SELECT pg_typeof('{1}'::int4 list::int4_list)
@@ -101,3 +101,27 @@ query T
 SELECT pg_typeof('{1}'::int4_list_list_too::int4_list_list)
 ----
 int4_list_list
+
+query TTT
+SELECT CAST('2020-01-01' AS date), CAST('2020-01-01'::timestamp as date), CAST('2020-01-01'::timestamptz as date)
+----
+2020-01-01
+2020-01-01
+2020-01-01
+
+# Postgres also supports `typename ( expression )` cast expressions with some limitations.
+# https://www.postgresql.org/docs/13/sql-expressions.html#SQL-SYNTAX-TYPE-CASTS
+# TODO: Support these more generally instead of just `date`.
+
+query TTT
+SELECT date('2020-01-01'), date('2020-01-01'::timestamp), date('2020-01-01'::timestamptz)
+----
+2020-01-01
+2020-01-01
+2020-01-01
+
+query error invalid input syntax for type date
+SELECT date('2000')
+
+query error db error: ERROR: function date\(unknown, unknown\) does not exist
+SELECT date('2000', 'a')

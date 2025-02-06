@@ -7,52 +7,56 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use async_trait::async_trait;
+use anyhow::{anyhow, bail, Context};
+use mz_ore::task;
+use tokio_postgres::Client;
 
-use crate::action::{Action, State};
+use crate::action::{ControlFlow, State};
 use crate::parser::BuiltinCommand;
 use crate::util::postgres::postgres_client;
 
-pub struct ExecuteAction {
-    connection: String,
-    queries: Vec<String>,
+async fn execute_input(cmd: BuiltinCommand, client: &Client) -> Result<(), anyhow::Error> {
+    for query in cmd.input {
+        println!(">> {}", query);
+        client
+            .batch_execute(&query)
+            .await
+            .context("executing postgres query")?;
+    }
+    Ok(())
 }
 
-pub fn build_execute(mut cmd: BuiltinCommand) -> Result<ExecuteAction, String> {
+pub async fn run_execute(
+    mut cmd: BuiltinCommand,
+    state: &State,
+) -> Result<ControlFlow, anyhow::Error> {
     let connection = cmd.args.string("connection")?;
+    let background = cmd.args.opt_bool("background")?.unwrap_or(false);
     cmd.args.done()?;
-    Ok(ExecuteAction {
-        connection,
-        queries: cmd.input,
-    })
-}
 
-#[async_trait]
-impl Action for ExecuteAction {
-    async fn undo(&self, _: &mut State) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn redo(&self, state: &mut State) -> Result<(), String> {
-        let client;
-        let client = if self.connection.starts_with("postgres://") {
-            client = postgres_client(&self.connection).await?;
-            &client
-        } else {
-            state
-                .postgres_clients
-                .get(&self.connection)
-                .ok_or(format!("connection '{}' not found", &self.connection))?
-        };
-
-        for query in &self.queries {
-            println!(">> {}", query);
-            client
-                .batch_execute(query)
-                .await
-                .map_err(|e| format!("executing postgres query: {}", e))?;
+    match (connection.starts_with("postgres://"), background) {
+        (true, true) => {
+            let (client_inner, _) = postgres_client(&connection, state.default_timeout).await?;
+            task::spawn(|| "postgres-execute", async move {
+                match execute_input(cmd, &client_inner).await {
+                    Ok(_) => {}
+                    Err(e) => println!("Error in backgrounded postgres-execute query: {e}"),
+                }
+            });
         }
-
-        Ok(())
+        (false, true) => bail!("cannot use 'background' arg with referenced connection"),
+        (true, false) => {
+            let (client_inner, _) = postgres_client(&connection, state.default_timeout).await?;
+            execute_input(cmd, &client_inner).await?;
+        }
+        (false, false) => {
+            let client = state
+                .postgres_clients
+                .get(&connection)
+                .ok_or_else(|| anyhow!("connection '{}' not found", &connection))?;
+            execute_input(cmd, client).await?;
+        }
     }
+
+    Ok(ControlFlow::Continue)
 }

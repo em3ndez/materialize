@@ -21,10 +21,7 @@
 // The original source code is subject to the terms of the MIT license, a copy
 // of which can be found in the LICENSE file at the root of this repository.
 
-use std::mem::transmute;
-
 use crate::schema::{Schema, SchemaNode, SchemaPiece};
-use crate::types::AvroMap;
 use crate::types::{DecimalValue, Value};
 use crate::util::{zig_i32, zig_i64};
 
@@ -34,7 +31,7 @@ use crate::util::{zig_i32, zig_i64};
 /// be valid with regards to the schema. Schema are needed only to guide the
 /// encoding for complex type values.
 pub fn encode(value: &Value, schema: &Schema, buffer: &mut Vec<u8>) {
-    encode_ref(&value, schema.top_node(), buffer)
+    encode_ref(value, schema.top_node(), buffer)
 }
 
 fn encode_bytes<B: AsRef<[u8]> + ?Sized>(s: &B, buffer: &mut Vec<u8>) {
@@ -70,16 +67,8 @@ pub fn encode_ref(value: &Value, schema: SchemaNode, buffer: &mut Vec<u8>) {
         Value::Boolean(b) => buffer.push(if *b { 1u8 } else { 0u8 }),
         Value::Int(i) => encode_int(*i, buffer),
         Value::Long(i) => encode_long(*i, buffer),
-        Value::Float(x) => buffer.extend_from_slice(&unsafe { transmute::<f32, [u8; 4]>(*x) }),
-        Value::Date(d) => {
-            let span = (*d) - chrono::NaiveDate::from_ymd(1970, 1, 1);
-            encode_int(
-                span.num_days()
-                    .try_into()
-                    .expect("Num days is too large to encode as i32"),
-                buffer,
-            )
-        }
+        Value::Float(x) => buffer.extend_from_slice(&x.to_le_bytes()),
+        Value::Date(d) => encode_int(*d, buffer),
         Value::Timestamp(d) => {
             let mult = match schema.inner {
                 SchemaPiece::TimestampMilli => 1_000,
@@ -87,13 +76,14 @@ pub fn encode_ref(value: &Value, schema: SchemaNode, buffer: &mut Vec<u8>) {
                 other => panic!("Invalid schema for timestamp: {:?}", other),
             };
             let ts_seconds = d
+                .and_utc()
                 .timestamp()
                 .checked_mul(mult)
                 .expect("All chrono dates can be converted to timestamps");
             let sub_part: i64 = if mult == 1_000 {
-                d.timestamp_subsec_millis().into()
+                d.and_utc().timestamp_subsec_millis().into()
             } else {
-                d.timestamp_subsec_micros().into()
+                d.and_utc().timestamp_subsec_micros().into()
             };
             let ts = if ts_seconds >= 0 {
                 ts_seconds + sub_part
@@ -102,7 +92,7 @@ pub fn encode_ref(value: &Value, schema: SchemaNode, buffer: &mut Vec<u8>) {
             };
             encode_long(ts, buffer)
         }
-        Value::Double(x) => buffer.extend_from_slice(&unsafe { transmute::<f64, [u8; 8]>(*x) }),
+        Value::Double(x) => buffer.extend_from_slice(&x.to_le_bytes()),
         Value::Decimal(DecimalValue { unscaled, .. }) => match schema.name {
             None => encode_bytes(unscaled, buffer),
             Some(_) => buffer.extend(unscaled),
@@ -139,7 +129,7 @@ pub fn encode_ref(value: &Value, schema: SchemaNode, buffer: &mut Vec<u8>) {
                 buffer.push(0u8);
             }
         }
-        Value::Map(AvroMap(items)) => {
+        Value::Map(items) => {
             if let SchemaPiece::Map(inner) = schema.inner {
                 if !items.is_empty() {
                     encode_long(items.len() as i64, buffer);
@@ -166,23 +156,25 @@ pub fn encode_ref(value: &Value, schema: SchemaNode, buffer: &mut Vec<u8>) {
             encode_bytes(&j.to_string(), buffer);
         }
         Value::Uuid(u) => {
-            encode_bytes(&u.to_string(), buffer);
+            let u_str = u.to_string();
+            encode_bytes(&u_str, buffer);
         }
     }
 }
 
 pub fn encode_to_vec(value: &Value, schema: &Schema) -> Vec<u8> {
     let mut buffer = Vec::new();
-    encode(&value, schema, &mut buffer);
+    encode(value, schema, &mut buffer);
     buffer
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    #[test]
+    use super::*;
+
+    #[mz_ore::test]
     fn test_encode_empty_array() {
         let mut buf = Vec::new();
         let empty: Vec<Value> = Vec::new();
@@ -194,12 +186,12 @@ mod tests {
         assert_eq!(vec![0u8], buf);
     }
 
-    #[test]
+    #[mz_ore::test]
     fn test_encode_empty_map() {
         let mut buf = Vec::new();
-        let empty: HashMap<String, Value> = HashMap::new();
+        let empty: BTreeMap<String, Value> = BTreeMap::new();
         encode(
-            &Value::Map(AvroMap(empty)),
+            &Value::Map(empty),
             &r#"{"type": "map", "values": "int"}"#.parse().unwrap(),
             &mut buf,
         );

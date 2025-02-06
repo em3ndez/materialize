@@ -7,11 +7,10 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-import distutils.core
+import distutils.core  # pyright: ignore
 import os
 import sys
 from pathlib import Path
-from typing import Set
 
 import requests
 
@@ -35,7 +34,11 @@ def main() -> None:
             continue
         else:
             print(f"Releasing {name} {version}")
-            spawn.runv([sys.executable, "setup.py", "build", "sdist"], cwd=path)
+            spawn.runv(
+                [sys.executable, "setup.py", "build", "sdist"],
+                cwd=path,
+                env={**os.environ, "RELEASE_BUILD": "1"},
+            )
             dist_files = (path / "dist").iterdir()
             spawn.runv(
                 ["twine", "upload", *dist_files],
@@ -47,7 +50,7 @@ def main() -> None:
             )
 
 
-def get_released_versions(name: str) -> Set[str]:
+def get_released_versions(name: str) -> set[str]:
     res = requests.get(f"https://pypi.org/pypi/{name}/json")
     res.raise_for_status()
     return set(res.json()["releases"])

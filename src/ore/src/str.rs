@@ -30,7 +30,7 @@ pub trait StrExt {
     /// double quote characters:
     ///
     /// ```
-    /// use ore::str::StrExt;
+    /// use mz_ore::str::StrExt;
     ///
     /// let name = "bob";
     /// let message = format!("unknown user {}", name.quoted());
@@ -40,18 +40,33 @@ pub trait StrExt {
     /// In a pathological case:
     ///
     /// ```
-    /// use ore::str::StrExt;
+    /// use mz_ore::str::StrExt;
     ///
     /// let name = r#"b@d"inp!t""#;
     /// let message = format!("unknown user {}", name.quoted());
     /// assert_eq!(message, r#"unknown user "b@d\"inp!t\"""#);
     /// ```
     fn quoted(&self) -> QuotedStr;
+    /// Same as [`StrExt::quoted`], but also escapes new lines and tabs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mz_ore::str::StrExt;
+    ///
+    /// let name = "b@d\"\tinp!t\"\r\n";
+    /// let message = format!("unknown user {}", name.escaped());
+    /// assert_eq!(message, r#"unknown user "b@d\"\tinp!t\"\r\n""#);
+    /// ```
+    fn escaped(&self) -> EscapedStr;
 }
 
 impl StrExt for str {
     fn quoted(&self) -> QuotedStr {
         QuotedStr(self)
+    }
+    fn escaped(&self) -> EscapedStr {
+        EscapedStr(self)
     }
 }
 
@@ -79,7 +94,38 @@ impl<'a> Deref for QuotedStr<'a> {
     type Target = str;
 
     fn deref(&self) -> &str {
-        &self.0
+        self.0
+    }
+}
+
+/// Same as [`QuotedStr`], but also escapes new lines and tabs.
+///
+/// Constructed by [`StrExt::escaped`].
+#[derive(Debug)]
+pub struct EscapedStr<'a>(&'a str);
+
+impl<'a> fmt::Display for EscapedStr<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_char('"')?;
+        for c in self.chars() {
+            // We don't use `char::escape_default()` here to prevent escaping Unicode chars.
+            match c {
+                '"' => f.write_str("\\\"")?,
+                '\n' => f.write_str("\\n")?,
+                '\r' => f.write_str("\\r")?,
+                '\t' => f.write_str("\\t")?,
+                _ => f.write_char(c)?,
+            }
+        }
+        f.write_char('"')
+    }
+}
+
+impl<'a> Deref for EscapedStr<'a> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.0
     }
 }
 
@@ -109,6 +155,27 @@ where
         close,
         contents,
     }
+}
+
+/// Given a closure, it creates a Display that simply calls the given closure when fmt'd.
+pub fn closure_to_display<F>(fun: F) -> impl fmt::Display
+where
+    F: Fn(&mut fmt::Formatter) -> fmt::Result,
+{
+    struct Mapped<F> {
+        fun: F,
+    }
+
+    impl<F> fmt::Display for Mapped<F>
+    where
+        F: Fn(&mut fmt::Formatter) -> fmt::Result,
+    {
+        fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            (self.fun)(formatter)
+        }
+    }
+
+    Mapped { fun }
 }
 
 /// Creates a type whose [`fmt::Display`] implementation outputs each item in
@@ -143,5 +210,230 @@ where
     Separated {
         separator,
         iter: iter.into_iter(),
+    }
+}
+
+/// A helper struct to keep track of indentation levels.
+///
+/// This will be most often used as part of the rendering context
+/// type for various `Display$Format` implementation.
+#[derive(Debug, Clone)]
+pub struct Indent {
+    unit: String,
+    buff: String,
+    mark: Vec<usize>,
+}
+
+impl AsMut<Indent> for Indent {
+    fn as_mut(&mut self) -> &mut Indent {
+        self
+    }
+}
+
+impl Indent {
+    /// Construct a new `Indent` where one level is represented
+    /// by the given `unit` repeated `step` times.
+    pub fn new(unit: char, step: usize) -> Indent {
+        Indent {
+            unit: std::iter::repeat(unit).take(step).collect::<String>(),
+            buff: String::with_capacity(unit.len_utf8()),
+            mark: vec![],
+        }
+    }
+
+    fn inc(&mut self, rhs: usize) {
+        for _ in 0..rhs {
+            self.buff += &self.unit;
+        }
+    }
+
+    fn dec(&mut self, rhs: usize) {
+        let tail = rhs.saturating_mul(self.unit.len());
+        let head = self.buff.len().saturating_sub(tail);
+        self.buff.truncate(head);
+    }
+
+    /// Remember the current state.
+    pub fn set(&mut self) {
+        self.mark.push(self.buff.len());
+    }
+
+    /// Reset `buff` to the last marked state.
+    pub fn reset(&mut self) {
+        if let Some(len) = self.mark.pop() {
+            while self.buff.len() < len {
+                self.buff += &self.unit;
+            }
+            self.buff.truncate(len);
+        }
+    }
+}
+
+/// Convenience methods for pretty-printing based on indentation
+/// that are automatically available for context objects that can
+/// be mutably referenced as an [`Indent`] instance.
+pub trait IndentLike {
+    /// Print a block of code defined in `f` one step deeper
+    /// from the current [`Indent`].
+    fn indented<F>(&mut self, f: F) -> fmt::Result
+    where
+        F: FnMut(&mut Self) -> fmt::Result;
+
+    /// Same as [`IndentLike::indented`], but the `f` only going to be printed
+    /// in an indented context if `guard` is `true`.
+    fn indented_if<F>(&mut self, guard: bool, f: F) -> fmt::Result
+    where
+        F: FnMut(&mut Self) -> fmt::Result;
+}
+
+impl<T: AsMut<Indent>> IndentLike for T {
+    fn indented<F>(&mut self, mut f: F) -> fmt::Result
+    where
+        F: FnMut(&mut Self) -> fmt::Result,
+    {
+        *self.as_mut() += 1;
+        let result = f(self);
+        *self.as_mut() -= 1;
+        result
+    }
+
+    fn indented_if<F>(&mut self, guard: bool, mut f: F) -> fmt::Result
+    where
+        F: FnMut(&mut Self) -> fmt::Result,
+    {
+        if guard {
+            *self.as_mut() += 1;
+        }
+        let result = f(self);
+
+        if guard {
+            *self.as_mut() -= 1;
+        }
+        result
+    }
+}
+
+impl Default for Indent {
+    fn default() -> Self {
+        Indent::new(' ', 2)
+    }
+}
+
+impl std::ops::AddAssign<usize> for Indent {
+    fn add_assign(&mut self, rhs: usize) {
+        self.inc(rhs)
+    }
+}
+
+impl std::ops::SubAssign<usize> for Indent {
+    fn sub_assign(&mut self, rhs: usize) {
+        self.dec(rhs)
+    }
+}
+
+impl fmt::Display for Indent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.buff)
+    }
+}
+
+/// Newtype wrapper around [`String`] whose _byte_ length is guaranteed to be less than or equal to
+/// the provided `MAX`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaxLenString<const MAX: usize>(String);
+
+impl<const MAX: usize> MaxLenString<MAX> {
+    /// Creates a new [`MaxLenString`] returning an error if `s` is more than `MAX` bytes long.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mz_ore::str::MaxLenString;
+    ///
+    /// type ShortString = MaxLenString<30>;
+    ///
+    /// let good = ShortString::new("hello".to_string()).unwrap();
+    /// assert_eq!(good.as_str(), "hello");
+    ///
+    /// // Note: this is only 8 characters, but each character requires 4 bytes.
+    /// let too_long = "😊😊😊😊😊😊😊😊";
+    /// let smol = ShortString::new(too_long.to_string());
+    /// assert!(smol.is_err());
+    /// ```
+    ///
+    pub fn new(s: String) -> Result<Self, String> {
+        if s.len() > MAX {
+            return Err(s);
+        }
+
+        Ok(MaxLenString(s))
+    }
+
+    /// Consume self, returning the inner [`String`].
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Returns a reference to the underlying string.
+    pub fn as_str(&self) -> &str {
+        self
+    }
+}
+
+impl<const MAX: usize> Deref for MaxLenString<MAX> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const MAX: usize> fmt::Display for MaxLenString<MAX> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<const MAX: usize> TryFrom<String> for MaxLenString<MAX> {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(s)
+    }
+}
+
+impl<'a, const MAX: usize> TryFrom<&'a String> for MaxLenString<MAX> {
+    type Error = String;
+
+    fn try_from(s: &'a String) -> Result<Self, Self::Error> {
+        Self::try_from(s.clone())
+    }
+}
+
+impl<'a, const MAX: usize> TryFrom<&'a str> for MaxLenString<MAX> {
+    type Error = String;
+
+    fn try_from(s: &'a str) -> Result<Self, Self::Error> {
+        Self::try_from(String::from(s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[crate::test]
+    fn test_indent() {
+        let mut indent = Indent::new('~', 3);
+        indent += 1;
+        assert_eq!(indent.to_string(), "~~~".to_string());
+        indent += 3;
+        assert_eq!(indent.to_string(), "~~~~~~~~~~~~".to_string());
+        indent -= 2;
+        assert_eq!(indent.to_string(), "~~~~~~".to_string());
+        indent -= 4;
+        assert_eq!(indent.to_string(), "".to_string());
+        indent += 1;
+        assert_eq!(indent.to_string(), "~~~".to_string());
     }
 }

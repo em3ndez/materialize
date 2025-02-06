@@ -9,6 +9,14 @@
 
 mode cockroach
 
+# Run all tests on a multi-process cluster, because there were some serialization issues in the past that happened
+# only on multi-process clusters.
+statement ok
+CREATE CLUSTER multiprocess REPLICAS (a (SIZE '2-2'));
+
+statement ok
+SET cluster = 'multiprocess';
+
 statement ok
 CREATE TABLE data (input text)
 
@@ -22,7 +30,7 @@ asdf asdf NULL
 asdfjkl asdf NULL
 jkl NULL jkl
 
-# TODO - Test that the columns have the correct nullability, once they actually do (#1685)
+# TODO - Test that the columns have the correct nullability, once they actually do (database-issues#612)
 
 # Standard regex matching.
 query TTT
@@ -52,22 +60,701 @@ mode standard
 
 # Check that literal regexes are pre-compiled...
 query T multiline
-EXPLAIN PLAN FOR SELECT input ~ 'foo?' FROM data
+EXPLAIN WITH(arity, join implementations) SELECT input ~ 'foo?' FROM data
 ----
-%0 =
-| Get materialize.public.data (u1)
-| Map "foo?" ~(#0)
-| Project (#1)
+Explained Query:
+  Project (#1) // { arity: 1 }
+    Map (is_regexp_match["foo?", case_insensitive=false](#0)) // { arity: 2 }
+      ReadStorage materialize.public.data // { arity: 1 }
+
+Source materialize.public.data
+
+Target cluster: multiprocess
 
 EOF
 
 # ...but not variable regexes.
 query T multiline
-EXPLAIN PLAN FOR SELECT input ~ input FROM data
+EXPLAIN WITH(arity, join implementations) SELECT input ~ input FROM data
 ----
-%0 =
-| Get materialize.public.data (u1)
-| Map (#0 ~ #0)
-| Project (#1)
+Explained Query:
+  Project (#1) // { arity: 1 }
+    Map ((#0 ~ #0)) // { arity: 2 }
+      ReadStorage materialize.public.data // { arity: 1 }
+
+Source materialize.public.data
+
+Target cluster: multiprocess
 
 EOF
+
+query T multiline
+EXPLAIN
+SELECT regexp_match('ABC', 'a.*');
+----
+Explained Query (fast path):
+  Constant
+    - (null)
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT regexp_match('ABC', 'a.*');
+----
+NULL
+
+query T multiline
+EXPLAIN
+SELECT regexp_match('ABC', 'a.*', 'i');
+----
+Explained Query (fast path):
+  Constant
+    - ({"ABC"})
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT regexp_match('ABC', 'a.*', 'i');
+----
+{ABC}
+
+# We have to accept it when both flags are present (taking the last one), because Postgres also does the same.
+query T
+SELECT regexp_match('ABC', 'a.*', 'ic');
+----
+NULL
+
+query T
+SELECT regexp_match('ABC', 'a.*', 'ci');
+----
+{ABC}
+
+query error invalid regular expression: regex parse error:
+SELECT 'abs' ~ '\';
+
+# Case-insensitive vs. case-sensitive regexes when there is no full const folding, but MirScalarExpr::reduce changes
+# from the binary to unary versions.
+
+statement ok
+CREATE TABLE t(s string, like_pat string, regex_pat string);
+
+statement ok
+INSERT INTO t VALUES ('abc', 'a%', 'a.*'), ('ABC', 'a%', 'a.*'), ('ccc', 'a%', 'a.*');
+
+# In Postgres' regexes, `.` matches newlines by default, so let's test this as well.
+# See https://www.postgresql.org/docs/current/functions-matching.html#POSIX-MATCHING-RULES
+# "newline-sensitive matching"
+statement ok
+INSERT INTO t VALUES (
+  E'test line 1\ntest line 2',
+  '%1%2%',
+  '1.*2'
+);
+
+# Note that sqllogictest can't handle newlines in string output, so replace those when displaying `s`
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s~'a.*';
+----
+Explained Query:
+  Project (#3)
+    Filter is_regexp_match["a.*", case_insensitive=false](#0)
+      Map (replace(#0, "\n", "<newline>"))
+        ReadStorage materialize.public.t
+
+Source materialize.public.t
+  filter=(is_regexp_match["a.*", case_insensitive=false](#0))
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s~'a.*';
+----
+abc
+
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s~*'a.*';
+----
+Explained Query:
+  Project (#3)
+    Filter is_regexp_match["a.*", case_insensitive=true](#0)
+      Map (replace(#0, "\n", "<newline>"))
+        ReadStorage materialize.public.t
+
+Source materialize.public.t
+  filter=(is_regexp_match["a.*", case_insensitive=true](#0))
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s~*'a.*';
+----
+ABC
+abc
+
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>'), regexp_match(s, 'a.*') FROM t;
+----
+Explained Query:
+  Project (#3, #4)
+    Map (replace(#0, "\n", "<newline>"), regexp_match["a.*", case_insensitive=false](#0))
+      ReadStorage materialize.public.t
+
+Source materialize.public.t
+
+Target cluster: multiprocess
+
+EOF
+
+query TT
+SELECT replace(s, E'\n', '<newline>'), regexp_match(s, 'a.*') FROM t;
+----
+ABC
+NULL
+ccc
+NULL
+test line 1<newline>test line 2
+NULL
+abc
+{abc}
+
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>'), regexp_match(s, 'a.*', 'i') FROM t;
+----
+Explained Query:
+  Project (#3, #4)
+    Map (replace(#0, "\n", "<newline>"), regexp_match["a.*", case_insensitive=true](#0))
+      ReadStorage materialize.public.t
+
+Source materialize.public.t
+
+Target cluster: multiprocess
+
+EOF
+
+query TT
+SELECT replace(s, E'\n', '<newline>'), regexp_match(s, 'a.*', 'i') FROM t;
+----
+ccc
+NULL
+test line 1<newline>test line 2
+NULL
+ABC
+{ABC}
+abc
+{abc}
+
+query TT
+SELECT replace(s, E'\n', '<newline>'), regexp_match(s, 'a.*', 'ic') FROM t;
+----
+ABC
+NULL
+ccc
+NULL
+test line 1<newline>test line 2
+NULL
+abc
+{abc}
+
+query TT
+SELECT replace(s, E'\n', '<newline>'), regexp_match(s, 'a.*', 'ci') FROM t;
+----
+ccc
+NULL
+test line 1<newline>test line 2
+NULL
+ABC
+{ABC}
+abc
+{abc}
+
+query error db error: ERROR: Evaluation error: invalid regular expression: regex parse error:
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s ~ '\';
+
+# Dynamic regexes (binary (or variadic) versions)
+
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s ~ regex_pat;
+----
+Explained Query:
+  Project (#3)
+    Filter (#0 ~ #2)
+      Map (replace(#0, "\n", "<newline>"))
+        ReadStorage materialize.public.t
+
+Source materialize.public.t
+  filter=((#0 ~ #2))
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s ~ regex_pat;
+----
+abc
+test line 1<newline>test line 2
+
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s ~* regex_pat;
+----
+Explained Query:
+  Project (#3)
+    Filter (#0 ~* #2)
+      Map (replace(#0, "\n", "<newline>"))
+        ReadStorage materialize.public.t
+
+Source materialize.public.t
+  filter=((#0 ~* #2))
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s ~* regex_pat;
+----
+ABC
+abc
+test line 1<newline>test line 2
+
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>'), regex_pat, regexp_match(s, regex_pat) FROM t;
+----
+Explained Query:
+  Project (#3, #2, #4)
+    Map (replace(#0, "\n", "<newline>"), regexp_match(#0, #2))
+      ReadStorage materialize.public.t
+
+Source materialize.public.t
+
+Target cluster: multiprocess
+
+EOF
+
+# We need to also replace newlines in the output here to not confuse sqllogictest.
+query TTT
+SELECT replace(s, E'\n', '<newline>'), regex_pat, replace(regexp_match(s, regex_pat)::text, E'\n', '<newline>') FROM t;
+----
+ABC
+a.*
+NULL
+ccc
+a.*
+NULL
+abc
+a.*
+{abc}
+test line 1<newline>test line 2
+1.*2
+{"1<newline>test line 2"}
+
+query T multiline
+EXPLAIN
+SELECT replace(s, E'\n', '<newline>'), regex_pat, regexp_match(s, regex_pat, 'i') FROM t;
+----
+Explained Query:
+  Project (#3, #2, #4)
+    Map (replace(#0, "\n", "<newline>"), regexp_match(#0, #2, "i"))
+      ReadStorage materialize.public.t
+
+Source materialize.public.t
+
+Target cluster: multiprocess
+
+EOF
+
+query TTT
+SELECT replace(s, E'\n', '<newline>'), regex_pat, replace(regexp_match(s, regex_pat, 'i')::text, E'\n', '<newline>') FROM t;
+----
+ccc
+a.*
+NULL
+ABC
+a.*
+{ABC}
+abc
+a.*
+{abc}
+test line 1<newline>test line 2
+1.*2
+{"1<newline>test line 2"}
+
+query TTT
+SELECT replace(s, E'\n', '<newline>'), regex_pat, replace(regexp_match(s, regex_pat, 'ic')::text, E'\n', '<newline>') FROM t;
+----
+ABC
+a.*
+NULL
+ccc
+a.*
+NULL
+abc
+a.*
+{abc}
+test line 1<newline>test line 2
+1.*2
+{"1<newline>test line 2"}
+
+query TTT
+SELECT replace(s, E'\n', '<newline>'), regex_pat, replace(regexp_match(s, regex_pat, 'ci')::text, E'\n', '<newline>') FROM t;
+----
+ccc
+a.*
+NULL
+ABC
+a.*
+{ABC}
+abc
+a.*
+{abc}
+test line 1<newline>test line 2
+1.*2
+{"1<newline>test line 2"}
+
+statement ok
+INSERT INTO T VALUES ('this is gonna be an invalid regex', '', '\');
+
+# Note: The actual error msg shows the regex itself (as it should), but it seems sqllogictest can't handle multiline
+# error msgs.
+query error db error: ERROR: Evaluation error: invalid regular expression: regex parse error:
+SELECT replace(s, E'\n', '<newline>') FROM t WHERE s ~* regex_pat;
+
+# TODO: multiline literal errors should be printed somehow differently in EXPLAIN
+query T multiline
+EXPLAIN
+SELECT *, s~'\' FROM t;
+----
+Explained Query:
+  Map (error("invalid regular expression: regex parse error:\n    \\n    ^\nerror: incomplete escape sequence, reached end of pattern prematurely"))
+    ReadStorage materialize.public.t
+
+Source materialize.public.t
+
+Target cluster: multiprocess
+
+EOF
+
+mode cockroach
+
+query T
+SELECT regexp_split_to_array(txt, re) FROM (VALUES
+  ('hello world'),
+  ('12  34'),
+  (' 12  34 '),
+  (''),
+  (' ')
+) TXT(txt),
+(VALUES
+  (''),
+  (' '),
+  ('\s+'),
+  ('\s*'),
+  ('\s')
+) RE(re)
+ORDER BY 1
+----
+{""}
+{""}
+{""}
+{""}
+{""}
+{"",""}
+{"",""}
+{"",""}
+{"",""}
+{"",1,2,3,4,""}
+{"",12,"",34,""}
+{"",12,"",34,""}
+{"",12,34,""}
+{" "}
+{" ",1,2," "," ",3,4," "}
+{1,2," "," ",3,4}
+{1,2,3,4}
+{12,"",34}
+{12,"",34}
+{12,34}
+{h,e,l,l,o," ",w,o,r,l,d}
+{h,e,l,l,o,w,o,r,l,d}
+{hello,world}
+{hello,world}
+{hello,world}
+
+# TODO: Correct ordering when database-issues#4764 is fixed.
+query T
+SELECT foo FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', '\s+') AS foo ORDER BY 1
+----
+brown
+dog
+fox
+jumps
+lazy
+over
+quick
+the
+the
+
+# TODO: Correct ordering when database-issues#4764 is fixed.
+query T
+SELECT foo FROM regexp_split_to_table('the quick brown fox', '\s*') AS foo ORDER BY 1
+----
+b
+c
+e
+f
+h
+i
+k
+n
+o
+o
+q
+r
+t
+u
+w
+x
+
+query T
+SELECT regexp_split_to_array('no match', 'nope')
+----
+{"no match"}
+
+query T
+SELECT regexp_split_to_table('no match', 'nope')
+----
+no match
+
+# Test regexp_replace success paths
+
+query T multiline
+EXPLAIN
+SELECT regexp_replace('FOOBARBAZ', 'b..', 'X');
+----
+Explained Query (fast path):
+  Constant
+    - ("FOOBARBAZ")
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT regexp_replace('FOOBARBAZ', 'b..', 'X');
+----
+FOOBARBAZ
+
+query T multiline
+EXPLAIN
+SELECT regexp_replace('FOOBARBAZ', 'b..', 'X', 'i');
+----
+Explained Query (fast path):
+  Constant
+    - ("FOOXBAZ")
+
+Target cluster: multiprocess
+
+EOF
+
+query T
+SELECT regexp_replace('FOOBARBAZ', 'b..', 'X', 'i');
+----
+FOOXBAZ
+
+query T
+SELECT regexp_replace('FOOBARBAZ', 'b..', 'X', 'ig');
+----
+FOOXX
+
+query T
+SELECT regexp_replace('foobarbaz', 'b(..)', 'X${1}Y', 'g')
+----
+fooXarYXazY
+
+query T
+SELECT regexp_replace('foobarbaz', 'no match', 'X')
+----
+foobarbaz
+
+statement ok
+CREATE TABLE r(s string, regex string, replacement string);
+
+statement ok
+INSERT INTO r VALUES ('foobarbaz', 'b..', 'X'), ('foobarbaz', 'b(..)', '>${1}<'), ('FOOBARBAZ', 'b..', 'X'), ('FOOZARZAZ', 'b..', 'X');
+
+query T multiline
+EXPLAIN
+SELECT regexp_replace(s, 'b..', 'X') FROM r;
+----
+Explained Query:
+  Project (#3)
+    Map (regexp_replace["b..", case_insensitive=false, limit=1](#0, "X"))
+      ReadStorage materialize.public.r
+
+Source materialize.public.r
+
+Target cluster: multiprocess
+
+EOF
+
+query TT
+SELECT s, regexp_replace(s, 'b..', 'X') FROM r;
+----
+foobarbaz
+fooXbaz
+foobarbaz
+fooXbaz
+FOOBARBAZ
+FOOBARBAZ
+FOOZARZAZ
+FOOZARZAZ
+
+query T multiline
+EXPLAIN
+SELECT regexp_replace(s, 'b..', 'X', 'i') FROM r;
+----
+Explained Query:
+  Project (#3)
+    Map (regexp_replace["b..", case_insensitive=true, limit=1](#0, "X"))
+      ReadStorage materialize.public.r
+
+Source materialize.public.r
+
+Target cluster: multiprocess
+
+EOF
+
+query TT
+SELECT s, regexp_replace(s, 'b..', 'X', 'i') FROM r;
+----
+FOOBARBAZ
+FOOXBAZ
+foobarbaz
+fooXbaz
+foobarbaz
+fooXbaz
+FOOZARZAZ
+FOOZARZAZ
+
+query T multiline
+EXPLAIN
+SELECT regexp_replace(s, 'b..', 'X', 'ig') FROM r;
+----
+Explained Query:
+  Project (#3)
+    Map (regexp_replace["b..", case_insensitive=true, limit=0](#0, "X"))
+      ReadStorage materialize.public.r
+
+Source materialize.public.r
+
+Target cluster: multiprocess
+
+EOF
+
+query TT
+SELECT s, regexp_replace(s, 'b..', 'X', 'ig') FROM r;
+----
+FOOBARBAZ
+FOOXX
+foobarbaz
+fooXX
+foobarbaz
+fooXX
+FOOZARZAZ
+FOOZARZAZ
+
+query T multiline
+EXPLAIN
+SELECT regexp_replace(s, regex, replacement, 'ig') FROM r;
+----
+Explained Query:
+  Project (#3)
+    Map (regexp_replace(#0, #1, #2, "ig"))
+      ReadStorage materialize.public.r
+
+Source materialize.public.r
+
+Target cluster: multiprocess
+
+EOF
+
+query TT
+SELECT s, regexp_replace(s, regex, replacement, 'ig') FROM r;
+----
+FOOBARBAZ
+FOOXX
+foobarbaz
+fooXX
+FOOZARZAZ
+FOOZARZAZ
+foobarbaz
+foo>ar<>az<
+
+# Test regexp_replace error paths
+
+query T multiline
+EXPLAIN
+SELECT regexp_replace('foobarbaz', 'b(..', 'X', 'ig');
+----
+Explained Query (fast path):
+  Error "invalid regular expression: regex parse error:\n    b(..\n     ^\nerror: unclosed group"
+
+Target cluster: multiprocess
+
+EOF
+
+query error invalid regular expression: regex parse error:
+SELECT regexp_replace('foobarbaz', 'b(..', 'X', 'ig');
+
+query error invalid regular expression flag: x
+SELECT regexp_replace('foobarbaz', 'b(..', 'X', 'igx');
+
+statement ok
+CREATE TABLE e(s string, regex string, replacement string);
+
+statement ok
+INSERT INTO e VALUES ('foobarbaz', 'b(..', 'X');
+
+query T multiline
+EXPLAIN
+SELECT s, regexp_replace(s, 'b(..', replacement, 'ig') FROM e;
+----
+Explained Query:
+  Project (#0, #3)
+    Map (regexp_replace[EvalError]: invalid regular expression: regex parse error:
+    b(..
+     ^
+error: unclosed group(#0, #2))
+      ReadStorage materialize.public.e
+
+Source materialize.public.e
+
+Target cluster: multiprocess
+
+EOF
+
+query error invalid regular expression: regex parse error:
+SELECT s, regexp_replace(s, 'b(..', replacement, 'ig') FROM e;
+
+query error invalid regular expression: regex parse error:
+SELECT s, regexp_replace(s, regex, replacement, 'ig') FROM e;
+
+query error invalid regular expression flag: x
+SELECT regexp_replace(s, regex, replacement, 'igx') FROM e;
+
+statement ok
+DROP CLUSTER multiprocess;

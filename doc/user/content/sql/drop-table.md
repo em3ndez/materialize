@@ -1,17 +1,17 @@
 ---
 title: "DROP TABLE"
-description: "`DROP TABLE` removes a table from your Materialize instance."
+description: "`DROP TABLE` removes a table from Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`DROP TABLE` removes a table from your Materialize instance.
+`DROP TABLE` removes a table from Materialize.
 
 ## Conceptual framework
 
 [Tables](../create-table) store non-streaming data that is inserted via [INSERT](../insert)
-statements. `DROP TABLE` removes tables from your Materialize instance.
+statements. `DROP TABLE` removes a table from Materialize.
 
 ## Syntax
 
@@ -29,7 +29,7 @@ _table_name_ | The name of the table to remove.
 ### Remove a table with no dependent objects
 Create a table *t* and verify that it was created:
 
-```sql
+```mzsql
 CREATE TABLE t (a int, b text NOT NULL);
 SHOW TABLES;
 ```
@@ -41,14 +41,14 @@ t
 
 Remove the table:
 
-```sql
+```mzsql
 DROP TABLE t;
 ```
 ### Remove a table with dependent objects
 
 Create a table *t*:
 
-```sql
+```mzsql
 CREATE TABLE t (a int, b text NOT NULL);
 INSERT INTO t VALUES (1, 'yes'), (2, 'no'), (3, 'maybe');
 SELECT * FROM t;
@@ -64,20 +64,20 @@ a |   b
 
 Create a materialized view from *t*:
 
-```sql
+```mzsql
 CREATE MATERIALIZED VIEW t_view AS SELECT sum(a) AS sum FROM t;
 SHOW MATERIALIZED VIEWS;
 ```
 ```
-  name
---------
- t_view
+name    | cluster
+--------+---------
+t_view  | default
 (1 row)
 ```
 
 Remove table *t*:
 
-```sql
+```mzsql
 DROP TABLE t CASCADE;
 ```
 
@@ -85,20 +85,28 @@ DROP TABLE t CASCADE;
 
 You can use either of the following commands:
 
-- ```sql
+- ```mzsql
   DROP TABLE t;
   ```
-- ```sql
+- ```mzsql
   DROP TABLE t RESTRICT;
   ```
 
 ### Do not issue an error if attempting to remove a nonexistent table
 
-```sql
+```mzsql
 DROP TABLE IF EXISTS t;
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of the dropped table.
+- `USAGE` privileges on the containing schema.
 
 ## Related pages
 
 - [`CREATE TABLE`](../create-table)
 - [`INSERT`](../insert)
+- [DROP OWNED](../drop-owned)

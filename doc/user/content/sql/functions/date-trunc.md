@@ -1,5 +1,5 @@
 ---
-title: "date_trunc Function"
+title: "date_trunc function"
 description: "Truncates a timestamp at the specified time component"
 menu:
   main:
@@ -17,15 +17,15 @@ To align values along arbitrary values, see [`date_bin`].
 
 Parameter | Type | Description
 ----------|------|------------
-_ts_val_ | [`timestamp`], [`timestamp with time zone`] | The value you want to truncate.
+_val_ | [`timestamp`], [`timestamp with time zone`], [`interval`] | The value you want to truncate.
 
 ### Return value
 
-`date_trunc` returns the same type as _ts_val_.
+`date_trunc` returns the same type as _val_.
 
 ## Examples
 
-```sql
+```mzsql
 SELECT date_trunc('hour', TIMESTAMP '2019-11-26 15:56:46.241150') AS hour_trunc;
 ```
 ```nofmt
@@ -33,9 +33,8 @@ SELECT date_trunc('hour', TIMESTAMP '2019-11-26 15:56:46.241150') AS hour_trunc;
 -------------------------------
  2019-11-26 15:00:00.000000000
 ```
-<hr/>
 
-```sql
+```mzsql
 SELECT date_trunc('year', TIMESTAMP '2019-11-26 15:56:46.241150') AS year_trunc;
 ```
 ```nofmt
@@ -44,6 +43,16 @@ SELECT date_trunc('year', TIMESTAMP '2019-11-26 15:56:46.241150') AS year_trunc;
  2019-01-01 00:00:00.000000000
 ```
 
+```mzsql
+SELECT date_trunc('millennium', INTERVAL '1234 years 11 months 23 days 23:59:12.123456789') AS millennium_trunc;
+```
+```nofmt
+          millennium_trunc
+-------------------------------
+ 1000 years
+```
+
 [`date_bin`]: ../date-bin
+[`interval`]: ../../types/interval/
 [`timestamp`]: ../../types/timestamp
 [`timestamp with time zone`]: ../../types/timestamptz

@@ -7,6 +7,11 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_table_keys = true
+----
+COMPLETE 0
+
 mode cockroach
 
 statement ok
@@ -28,10 +33,14 @@ statement ok
 INSERT INTO t3 VALUES (4, 5), (5, 5), (5, 5), (null, null)
 
 query T multiline
-EXPLAIN SELECT * FROM t1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1
 ----
-%0 =
-| Get materialize.public.t1 (u1)
+Explained Query:
+  ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+
+Target cluster: quickstart
 
 EOF
 
@@ -43,10 +52,14 @@ SELECT * FROM t1
 4 5
 
 query T multiline
-EXPLAIN SELECT a1.* FROM t1 AS a1 LEFT JOIN t1 AS a2 ON (a1.key = a2.key)
+EXPLAIN WITH(arity, join implementations) SELECT a1.* FROM t1 AS a1 LEFT JOIN t1 AS a2 ON (a1.key = a2.key)
 ----
-%0 =
-| Get materialize.public.t1 (u1)
+Explained Query:
+  ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+
+Target cluster: quickstart
 
 EOF
 
@@ -58,12 +71,17 @@ SELECT a1.* FROM t1 AS a1 LEFT JOIN t1 AS a2 ON (a1.key = a2.key)
 4 5
 
 query T multiline
-EXPLAIN SELECT * FROM t1 AS a1 LEFT JOIN t1 AS a2 ON (a1.key = a2.key) WHERE a1.nokey = 1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 AS a1 LEFT JOIN t1 AS a2 ON (a1.key = a2.key) WHERE a1.nokey = 1
 ----
-%0 =
-| Get materialize.public.t1 (u1)
-| Filter (#1 = 1)
-| Project (#0, #1, #0, #1)
+Explained Query:
+  Project (#0, #1, #0, #1) // { arity: 4 }
+    Filter (#1 = 1) // { arity: 2 }
+      ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+  filter=((#1 = 1))
+
+Target cluster: quickstart
 
 EOF
 
@@ -73,10 +91,12 @@ SELECT * FROM t1 AS a1 LEFT JOIN t1 AS a2 ON (a1.key = a2.key) WHERE a1.nokey = 
 1  1  1  1
 
 query T multiline
-EXPLAIN SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
 ----
-%0 =
-| Constant
+Explained Query (fast path):
+  Constant <empty>
+
+Target cluster: quickstart
 
 EOF
 
@@ -86,11 +106,14 @@ SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
 
 
 query T multiline
-EXPLAIN SELECT * FROM t1 UNION ALL SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 UNION ALL SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
 ----
-%0 =
-| Get materialize.public.t1 (u1)
-| Threshold
+Explained Query:
+  ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+
+Target cluster: quickstart
 
 EOF
 
@@ -102,10 +125,14 @@ SELECT * FROM t1 UNION ALL SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
 4  5
 
 query T multiline
-EXPLAIN SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1 UNION ALL SELECT * FROM t1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1 UNION ALL SELECT * FROM t1
 ----
-%0 =
-| Get materialize.public.t1 (u1)
+Explained Query:
+  ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+
+Target cluster: quickstart
 
 EOF
 
@@ -117,11 +144,14 @@ SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1 UNION ALL SELECT * FROM t1
 4  5
 
 query T multiline
-EXPLAIN SELECT * FROM t1 UNION ALL SELECT * FROM t2 EXCEPT ALL SELECT * FROM t1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 UNION ALL SELECT * FROM t2 EXCEPT ALL SELECT * FROM t1
 ----
-%0 =
-| Get materialize.public.t2 (u3)
-| Threshold
+Explained Query:
+  ReadStorage materialize.public.t2 // { arity: 2 }
+
+Source materialize.public.t2
+
+Target cluster: quickstart
 
 EOF
 
@@ -132,11 +162,14 @@ SELECT * FROM t1 UNION ALL SELECT * FROM t2 EXCEPT ALL SELECT * FROM t1
 5 5
 
 query T multiline
-EXPLAIN SELECT * FROM t2 UNION ALL SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t2 UNION ALL SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
 ----
-%0 =
-| Get materialize.public.t2 (u3)
-| Threshold
+Explained Query:
+  ReadStorage materialize.public.t2 // { arity: 2 }
+
+Source materialize.public.t2
+
+Target cluster: quickstart
 
 EOF
 
@@ -147,24 +180,21 @@ SELECT * FROM t2 UNION ALL SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1
 5 5
 
 query T multiline
-EXPLAIN SELECT * FROM t2 EXCEPT ALL SELECT * FROM t1 UNION ALL SELECT * FROM t1
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t2 EXCEPT ALL SELECT * FROM t1 UNION ALL SELECT * FROM t1
 ----
-%0 =
-| Get materialize.public.t2 (u3)
+Explained Query:
+  Union // { arity: 2 }
+    Threshold // { arity: 2 }
+      Union // { arity: 2 }
+        ReadStorage materialize.public.t2 // { arity: 2 }
+        Negate // { arity: 2 }
+          ReadStorage materialize.public.t1 // { arity: 2 }
+    ReadStorage materialize.public.t1 // { arity: 2 }
 
-%1 =
-| Get materialize.public.t1 (u1)
-| Negate
+Source materialize.public.t1
+Source materialize.public.t2
 
-%2 =
-| Union %0 %1
-| Threshold
-
-%3 =
-| Get materialize.public.t1 (u1)
-
-%4 =
-| Union %2 %3
+Target cluster: quickstart
 
 EOF
 
@@ -177,14 +207,17 @@ SELECT * FROM t2 EXCEPT ALL SELECT * FROM t1 UNION ALL SELECT * FROM t1
 5  5
 
 query T multiline
-EXPLAIN
+EXPLAIN WITH(arity, join implementations)
 WITH t3_with_key AS (select f1 as key, sum(f2) as nokey from t3 group by f1)
 SELECT a1.* FROM t3_with_key AS a1 LEFT JOIN t3_with_key AS a2 ON (a1.key = a2.key)
 ----
-%0 =
-| Get materialize.public.t3 (u5)
-| Reduce group=(#0)
-| | agg sum(#1)
+Explained Query:
+  Reduce group_by=[#0] aggregates=[sum(#1)] // { arity: 2 }
+    ReadStorage materialize.public.t3 // { arity: 2 }
+
+Source materialize.public.t3
+
+Target cluster: quickstart
 
 EOF
 
@@ -197,34 +230,16 @@ NULL NULL
 5  10
 
 query T multiline
-EXPLAIN
+EXPLAIN WITH(arity, join implementations)
 WITH t3_with_key AS (select f1 as key, sum(f2) as nokey from t3 group by f1)
 SELECT a1.* FROM t3 AS a1 LEFT JOIN t3_with_key AS a2 ON (a1.f1 = a2.key);
 ----
-%0 = Let l0 =
-| Get materialize.public.t3 (u5)
-| Filter !(isnull(#0))
+Explained Query:
+  ReadStorage materialize.public.t3 // { arity: 2 }
 
-%1 =
-| Get materialize.public.t3 (u5)
+Source materialize.public.t3
 
-%2 =
-| Get %0 (l0)
-| Project (#0)
-| Distinct group=(#0)
-| ArrangeBy (#0)
-
-%3 =
-| Join %1 %2 (= #0 #2)
-| | implementation = Differential %1 %2.(#0)
-| Project (#0, #1)
-| Negate
-
-%4 =
-| Get materialize.public.t3 (u5)
-
-%5 =
-| Union %3 %4 %0
+Target cluster: quickstart
 
 EOF
 
@@ -238,12 +253,16 @@ NULL NULL
 5 5
 
 query T multiline
-EXPLAIN
+EXPLAIN WITH(arity, join implementations)
 WITH t3_with_key AS (select f1 as key, sum(f2) as nokey from t3 group by f1)
 SELECT a1.* FROM t3 AS a1 LEFT JOIN t3_with_key AS a2 ON (a1.f1 = a2.key or (a1.f1 is null and a2.key is null));
 ----
-%0 =
-| Get materialize.public.t3 (u5)
+Explained Query:
+  ReadStorage materialize.public.t3 // { arity: 2 }
+
+Source materialize.public.t3
+
+Target cluster: quickstart
 
 EOF
 
@@ -255,3 +274,54 @@ NULL NULL
 4 5
 5 5
 5 5
+
+statement ok
+CREATE TABLE init(n int, m int, s string);
+
+# Union branch cancellation should happen inside WMR.
+query T multiline
+EXPLAIN
+WITH MUTUALLY RECURSIVE
+  c0(n int) AS (
+    (SELECT n FROM init)
+    UNION ALL
+    (SELECT * FROM c2)
+  ),
+  c1(n int) AS (
+    (SELECT n+n FROM c0)
+    UNION ALL
+    ((SELECT n+3 FROM c0) EXCEPT ALL (SELECT n+3 FROM c0))
+  ),
+  c2(n int) AS (
+    (SELECT * FROM c0)
+    UNION ALL
+    (SELECT * FROM c1)
+    UNION ALL
+    (SELECT * FROM c1)
+  )
+SELECT * FROM c2;
+----
+Explained Query:
+  With Mutually Recursive
+    cte l0 =
+      Union
+        Project (#0)
+          ReadStorage materialize.public.init
+        Get l2
+    cte l1 =
+      Project (#1)
+        Map ((#0 + #0))
+          Get l0
+    cte l2 =
+      Union
+        Get l0
+        Get l1
+        Get l1
+  Return
+    Get l2
+
+Source materialize.public.init
+
+Target cluster: quickstart
+
+EOF

@@ -1,21 +1,22 @@
 ---
 title: "SHOW SCHEMAS"
-description: "`SHOW SCHEMAS` returns a list of all schemas available to your Materialize instances."
+description: "`SHOW SCHEMAS` returns a list of all schemas available in Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`SHOW SCHEMAS` returns a list of all schemas available to your Materialize
-instances.
+`SHOW SCHEMAS` returns a list of all schemas available in Materialize.
 
 ## Syntax
 
-{{< diagram "show-schemas.svg" >}}
+```mzsql
+SHOW SCHEMAS [ FROM <database_name> ]
+```
 
-Field | Use
-------|-----
-_database&lowbar;name_ | The database to show schemas from. Defaults to the current database. For available databases, see [`SHOW DATABASES`](../show-databases).
+Option                        | Description
+------------------------------|------------
+**FROM** <database_name>      | If specified, only show schemas from the specified database. Defaults to the current database. For available databases, see [`SHOW DATABASES`](../show-databases).
 
 ## Details
 
@@ -23,13 +24,9 @@ _database&lowbar;name_ | The database to show schemas from. Defaults to the curr
 
 `SHOW SCHEMAS`'s output is a table with one column, `name`.
 
-{{< version-changed v0.5.0 >}}
-The output column is renamed from `SCHEMAS` to `name`.
-{{< /version-changed >}}
-
 ## Examples
 
-```sql
+```mzsql
 SHOW DATABASES;
 ```
 ```nofmt
@@ -38,13 +35,13 @@ SHOW DATABASES;
 materialize
 my_db
 ```
-```sql
+```mzsql
 SHOW SCHEMAS FROM my_db
 ```
 ```nofmt
- name
-------
-public
+  name
+--------
+ public
 ```
 
 ## Related pages

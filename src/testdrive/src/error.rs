@@ -9,177 +9,102 @@
 
 //! Error handling.
 //!
-//! Testdrive takes pains to provide better error messages than are typical of a
-//! Rust program. The main error type, [`Error`], is not intentionally not
-//! constructible from from underlying errors without providing additional
-//! context. The [`ResultExt`] trait can be used to ergonomically add this
-//! context to the error within the result. For example, here is an idiomatic
-//! example of handling a filesystem error:
-//!
-//! ```ignore
-//! use std::fs::File;
-//! use std::io::Read;
-//! use testdrive::error::{Error, ResultExt};
-//!
-//! fn check_file(path: &str) -> Result<bool, Error> {
-//!     let mut file = File::open(&path).err_ctx(format!("opening {}", path))?;
-//!
-//!     let mut contents = String::new();
-//!     file.read_to_string(&mut contents).err_ctx(format!("reading {}", path))?;
-//!     Ok(contents.contains("AOK"))
-//! }
-//! ```
+//! Errors inside of the testdrive library are represented as an
+//! `anyhow::Error`. As the error bubbles up the stack, it may be upgraded to a
+//! `PosError`, which attaches source code position information. The position
+//! information tracked by a `PosError` uses a parser-specific representation
+//! that is not human-readable, so `PosError`s are upgraded to `Error`s before
+//! they are returned externally.
 
-use std::error::Error as StdError;
-use std::fmt::{self, Write as FmtWrite};
-use std::io::{self, Write};
-use std::iter::IntoIterator;
+use std::fmt::{self, Write as _};
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
-use atty::Stream;
+use mz_ore::error::ErrorExt;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
-pub type DynError = Box<dyn StdError + Send + Sync>;
-
-/// A testdrive error.
+/// An error produced when parsing or executing a testdrive script.
 ///
-#[derive(Debug)]
-pub enum Error {
-    /// An error in parsing a testdrive script.
-    Input {
-        /// The underlying error.
-        err: InputError,
-        /// Additional details.
-        details: Option<InputDetails>,
-    },
-    /// Other errors.
-    General {
-        /// The component in which the error occurred.
-        ctx: String,
-        /// The underlying causes of the error.
-        causes: Vec<DynError>,
-        /// Hints about how to resolve the error.
-        hints: Vec<String>,
-    },
+/// Errors are optionally associated with a location in a testdrive script. When
+/// printed with the [`Error::print_error`] method, the location of the error
+/// along with a snippet of the source code at that location will be printed
+/// alongside the error message.
+pub struct Error {
+    source: anyhow::Error,
+    location: Option<ErrorLocation>,
 }
 
 impl Error {
-    /// Create a new error with just the specified message
-    pub(crate) fn message(m: impl Into<String>) -> Error {
-        Error::General {
-            ctx: m.into(),
-            causes: Vec::new(),
-            hints: Vec::new(),
-        }
+    pub(crate) fn new(source: anyhow::Error, location: Option<ErrorLocation>) -> Self {
+        Error { source, location }
     }
 
-    /// Create a new error with the specified message and cause
-    pub fn with_cause(m: impl Into<String>, cause: impl Into<DynError>) -> Error {
-        Error::General {
-            ctx: m.into(),
-            causes: vec![cause.into()],
-            hints: Vec::new(),
-        }
-    }
-
-    /// Prints the error to `stderr`, with coloring if the terminal supports it.
-    pub fn print_stderr(&self) -> io::Result<()> {
-        let color_choice = if atty::is(Stream::Stderr) {
+    /// Prints the error to `stdout`, with coloring if the terminal supports it.
+    pub fn print_error(&self) -> io::Result<()> {
+        let color_choice = if std::io::stdout().is_terminal() {
             ColorChoice::Auto
         } else {
             ColorChoice::Never
         };
-        let mut stderr = StandardStream::stderr(color_choice);
-        println!("^^^ +++");
-        match self {
-            Error::Input {
-                err,
-                details: Some(details),
-            } => {
+        let mut stdout = StandardStream::stdout(color_choice);
+        eprintln!("^^^ +++");
+        match &self.location {
+            Some(location) => {
                 let mut color_spec = ColorSpec::new();
                 color_spec.set_bold(true);
-                stderr.set_color(&color_spec)?;
-                write!(
-                    &mut stderr,
-                    "{}:{}:{}: ",
-                    details.filename, details.line, details.col
-                )?;
-                write_error_heading(&mut stderr, &color_spec)?;
-                writeln!(&mut stderr, "{}", err.msg)?;
+                stdout.set_color(&color_spec)?;
+                if let Some(filename) = &location.filename {
+                    write!(
+                        &mut stdout,
+                        "{}:{}:{}: ",
+                        filename.display(),
+                        location.line,
+                        location.col
+                    )?;
+                } else {
+                    write!(&mut stdout, "{}:{}: ", location.line, location.col)?;
+                }
+                write_error_heading(&mut stdout, &color_spec)?;
+                writeln!(&mut stdout, "{}", self.source.display_with_causes())?;
                 color_spec.set_bold(false);
-                stderr.set_color(&color_spec)?;
-                write!(&mut stderr, "{}", details.snippet)?;
-                writeln!(&mut stderr, "{}^", " ".repeat(details.col - 1))
+                stdout.set_color(&color_spec)?;
+                write!(&mut stdout, "{}", location.snippet)?;
+                writeln!(&mut stdout, "{}^", " ".repeat(location.col - 1))?;
             }
-            Error::Input { details: None, .. } => {
-                panic!("programming error: print_stderr called on InputError with no details")
-            }
-            Error::General { ctx, causes, hints } => {
+            None => {
                 let color_spec = ColorSpec::new();
-                write_error_heading(&mut stderr, &color_spec)?;
-                write!(&mut stderr, "{}", ctx)?;
-                for (i, cause) in causes.iter().enumerate() {
-                    if i == 0 {
-                        write!(&mut stderr, ": {}", cause)?;
-                    } else {
-                        write!(&mut stderr, ", {}", cause)?;
-                    }
-                }
-                writeln!(&mut stderr)?;
-
-                for hint in hints {
-                    stderr.set_color(&color_spec.clone().set_bold(true))?;
-                    write!(&mut stderr, " hint: ")?;
-                    stderr.set_color(&color_spec)?;
-                    writeln!(&mut stderr, "{}", hint)?;
-                }
-                Ok(())
+                write_error_heading(&mut stdout, &color_spec)?;
+                writeln!(&mut stdout, "{}", self.source.display_with_causes())?;
             }
         }
-    }
-
-    pub(crate) fn with_input_details(
-        self,
-        filename: &str,
-        contents: &str,
-        positioner: &dyn Positioner,
-    ) -> Self {
-        match self {
-            Error::Input { err, .. } => {
-                let (line, col) = positioner.line_col(err.pos);
-                let details = InputDetails {
-                    filename: filename.to_owned(),
-                    snippet: make_snippet(contents, line),
-                    line,
-                    col,
-                };
-                Error::Input {
-                    err,
-                    details: Some(details),
-                }
-            }
-            _ => self,
-        }
+        std::io::stdout().flush()
     }
 }
 
-impl From<InputError> for Error {
-    fn from(err: InputError) -> Error {
-        Error::Input { err, details: None }
-    }
-}
-
-fn make_snippet(contents: &str, line_num: usize) -> String {
-    let mut buf = String::new();
-    writeln!(&mut buf, "     |").unwrap();
-    for (i, line) in contents.lines().enumerate() {
-        if i >= line_num {
-            break;
-        } else if i + 2 >= line_num {
-            writeln!(&mut buf, "{:4} | {}", i + 1, line).unwrap();
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.location {
+            Some(location) => {
+                if let Some(filename) = &location.filename {
+                    write!(
+                        f,
+                        "{}:{}:{}: ",
+                        filename.display(),
+                        location.line,
+                        location.col
+                    )?;
+                } else {
+                    write!(f, "{}:{}: ", location.line, location.col)?;
+                }
+                writeln!(f, "{}", self.source.display_with_causes())?;
+                write!(f, "{}", location.snippet)?;
+                writeln!(f, "{}^", " ".repeat(location.col - 1))
+            }
+            None => {
+                write!(f, "{}", self.source.display_with_causes())
+            }
         }
     }
-    write!(&mut buf, "     | ").unwrap();
-    buf
 }
 
 fn write_error_heading(stream: &mut StandardStream, color_spec: &ColorSpec) -> io::Result<()> {
@@ -188,114 +113,75 @@ fn write_error_heading(stream: &mut StandardStream, color_spec: &ColorSpec) -> i
     stream.set_color(color_spec)
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Input { err, .. } => write!(f, "{}", err.msg),
-            Error::General { ctx, causes, .. } => {
-                write!(f, "{}", ctx)?;
-                write!(f, "{}", ctx)?;
-                for (i, cause) in causes.iter().enumerate() {
-                    if i == 0 {
-                        write!(f, ": {}", cause)?;
-                    } else {
-                        write!(f, ", {}", cause)?;
-                    }
-                    writeln!(f)?;
-                }
-                Ok(())
-            }
+impl From<anyhow::Error> for Error {
+    fn from(source: anyhow::Error) -> Error {
+        Error {
+            source,
+            location: None,
         }
     }
 }
 
-impl std::error::Error for Error {}
-
-#[derive(Debug)]
-pub struct InputError {
-    pub msg: String,
-    pub pos: usize,
-}
-
-#[derive(Debug)]
-pub struct InputDetails {
-    filename: String,
+pub(crate) struct ErrorLocation {
+    filename: Option<PathBuf>,
     snippet: String,
     line: usize,
     col: usize,
 }
 
-impl InputDetails {
-    pub fn filename(&self) -> String {
-        return self.filename.clone();
+impl ErrorLocation {
+    pub(crate) fn new(
+        filename: Option<&Path>,
+        contents: &str,
+        line: usize,
+        col: usize,
+    ) -> ErrorLocation {
+        let mut snippet = String::new();
+        writeln!(&mut snippet, "     |").unwrap();
+        for (i, l) in contents.lines().enumerate() {
+            let l_lc = l.to_lowercase();
+            if i >= line {
+                break;
+            } else if l_lc.contains("postgres-") || l_lc.contains("secret") || l_lc.contains("url")
+            {
+                writeln!(
+                    &mut snippet,
+                    "{:4} | {} ... [rest of line truncated for security]",
+                    i + 1,
+                    l.get(0..20).unwrap_or(l)
+                )
+                .unwrap();
+            } else if i + 2 >= line {
+                writeln!(&mut snippet, "{:4} | {}", i + 1, l).unwrap();
+            }
+        }
+        write!(&mut snippet, "     | ").unwrap();
+
+        ErrorLocation {
+            filename: filename.map(|f| f.to_path_buf()),
+            snippet,
+            line,
+            col,
+        }
     }
 }
 
-pub trait Positioner {
-    fn line_col(&self, pos: usize) -> (usize, usize);
+pub(crate) struct PosError {
+    pub(crate) source: anyhow::Error,
+    pub(crate) pos: Option<usize>,
 }
 
-/// Extra methods that integrate std Results with [`Error`]
-pub trait ResultExt<T, E> {
-    /// Wrap any error in an [`Error`] with the given context message
-    fn err_ctx(self, ctx: impl Into<String>) -> Result<T, Error>
-    where
-        Self: Sized;
-
-    /// Wrap any error in an [`Error`] with the given context message, which is lazily evaluated
-    fn with_err_ctx(self, ctx: impl FnOnce() -> String) -> Result<T, Error>
-    where
-        Self: Sized;
-
-    /// Wrap any error in an [`Error`] with the given context message and additional hints
-    fn err_hint(
-        self,
-        ctx: impl Into<String>,
-        hint: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<T, Error>
-    where
-        Self: Sized;
+impl PosError {
+    pub(crate) fn new(source: anyhow::Error, pos: usize) -> PosError {
+        PosError {
+            source,
+            pos: Some(pos),
+        }
+    }
 }
 
-impl<T, E> ResultExt<T, E> for Result<T, E>
-where
-    E: 'static + Send + Sync,
-    E: Into<DynError>,
-{
-    fn err_ctx(self, ctx: impl Into<String>) -> Result<T, Error>
-    where
-        Self: Sized,
-    {
-        self.map_err(|err| Error::General {
-            ctx: ctx.into(),
-            causes: vec![err.into()],
-            hints: Vec::new(),
-        })
-    }
-
-    fn with_err_ctx(self, ctx: impl FnOnce() -> String) -> Result<T, Error>
-    where
-        Self: Sized,
-    {
-        self.map_err(|err| Error::General {
-            ctx: ctx(),
-            causes: vec![err.into()],
-            hints: Vec::new(),
-        })
-    }
-
-    fn err_hint(
-        self,
-        ctx: impl Into<String>,
-        hints: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<T, Error>
-    where
-        Self: Sized,
-    {
-        self.map_err(|err| Error::General {
-            ctx: ctx.into(),
-            causes: vec![err.into()],
-            hints: hints.into_iter().map(Into::into).collect(),
-        })
+impl From<anyhow::Error> for PosError {
+    fn from(source: anyhow::Error) -> PosError {
+        PosError { source, pos: None }
     }
 }

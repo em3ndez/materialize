@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default default-storage-size=1
+
 # 'date' is days since the start of the UNiX epoch
 
 $ set date={"type": "record", "name": "date_field", "fields": [ { "name": "f1", "type": { "logicalType": "date", "type": "int" } } ] }
@@ -19,12 +21,19 @@ $ kafka-ingest format=avro topic=avro-decode-date schema=${date} timestamp=1
 {"f1": 1}
 {"f1": 12345678}
 
-> CREATE MATERIALIZED SOURCE avro_decode_date
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-decode-date-${testdrive.seed}'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE CLUSTER avro_decode_date_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE avro_decode_date
+  IN CLUSTER avro_decode_date_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-decode-date-${testdrive.seed}')
+
+> CREATE TABLE avro_decode_date_tbl FROM SOURCE avro_decode_date (REFERENCE "testdrive-avro-decode-date-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${date}'
   ENVELOPE NONE
 
-> SELECT * FROM avro_decode_date
+> SELECT * FROM avro_decode_date_tbl
 1969-12-31
 1970-01-01
 1970-01-02
@@ -42,12 +51,16 @@ $ kafka-ingest format=avro topic=avro-decode-time-millis schema=${time-millis} t
 {"f1": 1}
 {"f1": 12345678}
 
-> CREATE MATERIALIZED SOURCE avro_decode_time_millis
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-decode-date-${testdrive.seed}'
+> CREATE CLUSTER avro_decode_time_millis_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE avro_decode_time_millis
+  IN CLUSTER avro_decode_time_millis_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-decode-date-${testdrive.seed}')
+
+> CREATE TABLE avro_decode_time_millis_tbl FROM SOURCE avro_decode_time_millis (REFERENCE "testdrive-avro-decode-date-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${time-millis}'
   ENVELOPE NONE
 
-> SELECT * FROM avro_decode_time_millis
+> SELECT * FROM avro_decode_time_millis_tbl
 -1
 0
 1
@@ -71,12 +84,16 @@ $ kafka-ingest format=avro topic=avro-decode-timestamp-millis schema=${timestamp
 {"f1": 61000}
 {"f1": 1234567890}
 
-> CREATE MATERIALIZED SOURCE avro_decode_timestamp_millis
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-decode-timestamp-millis-${testdrive.seed}'
+> CREATE CLUSTER avro_decode_timestamp_millis_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE avro_decode_timestamp_millis
+  IN CLUSTER avro_decode_timestamp_millis_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-decode-timestamp-millis-${testdrive.seed}')
+
+> CREATE TABLE avro_decode_timestamp_millis_tbl FROM SOURCE avro_decode_timestamp_millis (REFERENCE "testdrive-avro-decode-timestamp-millis-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${timestamp-millis}'
   ENVELOPE NONE
 
-> SELECT * FROM avro_decode_timestamp_millis
+> SELECT * FROM avro_decode_timestamp_millis_tbl
 "1970-01-01 00:00:00"
 "1970-01-01 00:00:00.001"
 "1970-01-01 00:00:00.010"
@@ -104,12 +121,16 @@ $ kafka-ingest format=avro topic=avro-decode-timestamp-micros schema=${timestamp
 {"f1": 61000000}
 {"f1": 1234567890}
 
-> CREATE MATERIALIZED SOURCE avro_decode_timestamp_micros
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-decode-timestamp-micros-${testdrive.seed}'
+> CREATE CLUSTER avro_decode_timestamp_micros_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE avro_decode_timestamp_micros
+  IN CLUSTER avro_decode_timestamp_micros_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-decode-timestamp-micros-${testdrive.seed}')
+
+> CREATE TABLE avro_decode_timestamp_micros_tbl FROM SOURCE avro_decode_timestamp_micros (REFERENCE "testdrive-avro-decode-timestamp-micros-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${timestamp-micros}'
   ENVELOPE NONE
 
-> SELECT * FROM avro_decode_timestamp_micros
+> SELECT * FROM avro_decode_timestamp_micros_tbl
 "1970-01-01 00:00:00"
 "1970-01-01 00:00:00.000001"
 "1970-01-01 00:00:00.000010"
@@ -136,12 +157,16 @@ $ kafka-ingest format=avro topic=avro-decode-local-timestamp-millis schema=${loc
 {"f1": 10000}
 {"f1": 1234567890}
 
-> CREATE MATERIALIZED SOURCE avro_decode_local_timestamp_millis
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-decode-local-timestamp-millis-${testdrive.seed}'
+> CREATE CLUSTER avro_decode_local_timestamp_millis_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE avro_decode_local_timestamp_millis
+  IN CLUSTER avro_decode_local_timestamp_millis_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-decode-local-timestamp-millis-${testdrive.seed}')
+
+> CREATE TABLE avro_decode_local_timestamp_millis_tbl FROM SOURCE avro_decode_local_timestamp_millis (REFERENCE "testdrive-avro-decode-local-timestamp-millis-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${local-timestamp-millis}'
   ENVELOPE NONE
 
-> SELECT * FROM avro_decode_local_timestamp_millis
+> SELECT * FROM avro_decode_local_timestamp_millis_tbl
 0
 1
 10

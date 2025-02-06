@@ -77,11 +77,191 @@ where
     }
 }
 
+#[cfg(feature = "compact_bytes")]
+impl Vector<u8> for compact_bytes::CompactBytes {
+    fn push(&mut self, value: u8) {
+        self.push(value)
+    }
+
+    fn extend_from_slice(&mut self, other: &[u8]) {
+        self.extend_from_slice(other)
+    }
+}
+
+/// Extension methods for `std::vec::Vec`
+pub trait VecExt<T> {
+    /// Creates an iterator which uses a closure to determine if an element should be removed.
+    ///
+    /// If the closure returns true, then the element is removed and yielded.
+    /// If the closure returns false, the element will remain in the vector and will not be yielded
+    /// by the iterator.
+    ///
+    /// Using this method and consuming the iterator is equivalent to the following code:
+    ///
+    /// ```
+    /// # let some_predicate = |x: &mut i32| { *x == 2 || *x == 3 || *x == 6 };
+    /// # let mut vec = vec![1, 2, 3, 4, 5, 6];
+    /// let mut i = 0;
+    /// while i < vec.len() {
+    ///     if some_predicate(&mut vec[i]) {
+    ///         let val = vec.swap_remove(i);
+    ///         // your code here
+    ///     } else {
+    ///         i += 1;
+    ///     }
+    /// }
+    ///
+    /// # assert_eq!(vec, vec![1, 5, 4]);
+    /// ```
+    ///
+    /// But `drain_filter_swapping` is easier to use.
+    ///
+    /// Note that `drain_filter_swapping` also lets you mutate every element in the filter closure,
+    /// regardless of whether you choose to keep or remove it.
+    ///
+    /// # Note
+    ///
+    /// Because the elements are removed using [`Vec::swap_remove`] the order of elements yielded
+    /// by the iterator and the order of the remaining elements in the original vector is **not**
+    /// maintained.
+    ///
+    /// # Examples
+    ///
+    /// Splitting an array into evens and odds, reusing the original allocation. Notice how the
+    /// order is not preserved in either results:
+    ///
+    /// ```
+    /// use mz_ore::vec::VecExt;
+    ///
+    /// let mut numbers = vec![1, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15];
+    ///
+    /// let evens = numbers.drain_filter_swapping(|x| *x % 2 == 0).collect::<Vec<_>>();
+    /// let odds = numbers;
+    ///
+    /// assert_eq!(evens, vec![2, 4, 14, 6, 8]);
+    /// assert_eq!(odds, vec![1, 15, 3, 13, 5, 11, 9]);
+    /// ```
+    #[must_use = "The vector is modified only if the iterator is consumed"]
+    fn drain_filter_swapping<F>(&mut self, filter: F) -> DrainFilterSwapping<'_, T, F>
+    where
+        F: FnMut(&mut T) -> bool;
+
+    /// Returns whether the vector is sorted using the given comparator function.
+    fn is_sorted_by<F>(&self, compare: F) -> bool
+    where
+        F: FnMut(&T, &T) -> bool;
+}
+
+/// Extension methods for `Vec<T>` where `T: PartialOrd`
+pub trait PartialOrdVecExt<T> {
+    /// Returns whether the vector is sorted.
+    // Remove once https://github.com/rust-lang/rust/issues/53485 is stabilized
+    fn is_sorted(&self) -> bool;
+    /// Returns whether the vector is sorted with strict inequality.
+    fn is_strictly_sorted(&self) -> bool;
+}
+
+impl<T> VecExt<T> for Vec<T> {
+    fn drain_filter_swapping<F>(&mut self, filter: F) -> DrainFilterSwapping<'_, T, F>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        DrainFilterSwapping {
+            vec: self,
+            idx: 0,
+            pred: filter,
+        }
+    }
+
+    // implementation is from Vec::is_sorted_by, but with `windows` instead of
+    // the unstable `array_windows`
+    fn is_sorted_by<F>(&self, mut compare: F) -> bool
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        self.windows(2).all(|win| compare(&win[0], &win[1]))
+    }
+}
+
+impl<T> PartialOrdVecExt<T> for Vec<T>
+where
+    T: PartialOrd,
+{
+    fn is_sorted(&self) -> bool {
+        self.is_sorted_by(|a, b| a <= b)
+    }
+
+    fn is_strictly_sorted(&self) -> bool {
+        self.is_sorted_by(|a, b| a < b)
+    }
+}
+
+/// An iterator which uses a closure to determine if an element should be removed.
+///
+/// This struct is created by [`VecExt::drain_filter_swapping`].
+/// See its documentation for more.
+///
+/// Warning: The vector is modified only if the iterator is consumed!
+///
+/// # Example
+///
+/// ```
+/// use mz_ore::vec::VecExt;
+///
+/// let mut v = vec![0, 1, 2];
+/// let iter: mz_ore::vec::DrainFilterSwapping<_, _> = v.drain_filter_swapping(|x| *x % 2 == 0);
+/// ```
+#[derive(Debug)]
+pub struct DrainFilterSwapping<'a, T, F> {
+    vec: &'a mut Vec<T>,
+    /// The index of the item that will be inspected by the next call to `next`.
+    idx: usize,
+    /// The filter test predicate.
+    pred: F,
+}
+
+impl<'a, T, F> Iterator for DrainFilterSwapping<'a, T, F>
+where
+    F: FnMut(&mut T) -> bool,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = self.vec.get_mut(self.idx)?;
+            if (self.pred)(item) {
+                return Some(self.vec.swap_remove(self.idx));
+            } else {
+                self.idx += 1;
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.vec.len() - self.idx))
+    }
+}
+
+/// Remove the elements from `v` at the positions indicated by `indexes`, and return the removed
+/// elements in a new vector.
+///
+/// `indexes` shouldn't have duplicates. (Might panic or behave incorrectly in case of
+/// duplicates.)
+pub fn swap_remove_multiple<T>(v: &mut Vec<T>, mut indexes: Vec<usize>) -> Vec<T> {
+    indexes.sort();
+    indexes.reverse();
+    let mut result = Vec::new();
+    for r in indexes {
+        result.push(v.swap_remove(r));
+    }
+    result
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
-    #[test]
+    #[crate::test]
     fn miri_test_repurpose() {
         let v: Vec<usize> = vec![0, 1, 2];
 
@@ -123,14 +303,14 @@ mod test {
         assert_eq!(other[0].s, "hmm2");
     }
 
-    #[test]
+    #[crate::test]
     #[should_panic(expected = "same size")]
     fn miri_test_wrong_size() {
         let v: Vec<usize> = vec![0, 1, 2];
         let _: Vec<()> = repurpose_allocation(v);
     }
 
-    #[test]
+    #[crate::test]
     #[should_panic(expected = "same alignment")]
     fn miri_test_wrong_align() {
         #[repr(align(8))]
@@ -152,5 +332,36 @@ mod test {
         // the alignment check
         let v: Vec<Gus1> = vec![Default::default()];
         let _: Vec<Gus2> = repurpose_allocation(v);
+    }
+
+    #[crate::test]
+    fn test_is_sorted_by() {
+        assert!(vec![0, 1, 2].is_sorted_by(|a, b| a < b));
+        assert!(vec![0, 1, 2].is_sorted_by(|a, b| a <= b));
+        assert!(!vec![0, 1, 2].is_sorted_by(|a, b| a > b));
+        assert!(!vec![0, 1, 2].is_sorted_by(|a, b| a >= b));
+        assert!(vec![0, 1, 2].is_sorted_by(|_a, _b| true));
+        assert!(!vec![0, 1, 2].is_sorted_by(|_a, _b| false));
+
+        assert!(!vec![0, 1, 1, 2].is_sorted_by(|a, b| a < b));
+        assert!(vec![0, 1, 1, 2].is_sorted_by(|a, b| a <= b));
+        assert!(!vec![0, 1, 1, 2].is_sorted_by(|a, b| a > b));
+        assert!(!vec![0, 1, 1, 2].is_sorted_by(|a, b| a >= b));
+        assert!(vec![0, 1, 1, 2].is_sorted_by(|_a, _b| true));
+        assert!(!vec![0, 1, 1, 2].is_sorted_by(|_a, _b| false));
+
+        assert!(!vec![2, 1, 0].is_sorted_by(|a, b| a < b));
+        assert!(!vec![2, 1, 0].is_sorted_by(|a, b| a <= b));
+        assert!(vec![2, 1, 0].is_sorted_by(|a, b| a > b));
+        assert!(vec![2, 1, 0].is_sorted_by(|a, b| a >= b));
+        assert!(vec![2, 1, 0].is_sorted_by(|_a, _b| true));
+        assert!(!vec![2, 1, 0].is_sorted_by(|_a, _b| false));
+
+        assert!(!vec![5, 1, 9, 42].is_sorted_by(|a, b| a < b));
+        assert!(!vec![5, 1, 9, 42].is_sorted_by(|a, b| a <= b));
+        assert!(!vec![5, 1, 9, 42].is_sorted_by(|a, b| a > b));
+        assert!(!vec![5, 1, 9, 42].is_sorted_by(|a, b| a >= b));
+        assert!(vec![5, 1, 9, 42].is_sorted_by(|_a, _b| true));
+        assert!(!vec![5, 1, 9, 42].is_sorted_by(|_a, _b| false));
     }
 }

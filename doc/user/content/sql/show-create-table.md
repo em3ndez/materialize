@@ -3,35 +3,39 @@ title: "SHOW CREATE TABLE"
 description: "`SHOW CREATE TABLE` returns the SQL used to create the table."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
 `SHOW CREATE TABLE` returns the SQL used to create the table.
 
-{{< experimental v0.4.1 />}}
-
 ## Syntax
 
-{{< diagram "show-create-table.svg" >}}
+```sql
+SHOW CREATE TABLE <table_name>
+```
 
-Field | Use
-------|-----
-_table&lowbar;name_ | The table you want use. You can find available table names through [`SHOW TABLES`](../show-tables).
+For available table names, see [`SHOW TABLES`](/sql/show-tables).
 
 ## Examples
 
-```sql
+```mzsql
 CREATE TABLE t (a int, b text NOT NULL);
 ```
 
-```sql
+```mzsql
 SHOW CREATE TABLE t;
 ```
 ```nofmt
-        Table         |                             Create Table
-----------------------+----------------------------------------------------------------------
- materialize.public.t | CREATE TABLE "materialize"."public"."t" ("a" int, "b" text NOT NULL)
+         name         |                                             create_sql
+----------------------+-----------------------------------------------------------------------------------------------------
+ materialize.public.t | CREATE TABLE "materialize"."public"."t" ("a" "pg_catalog"."int4", "b" "pg_catalog"."text" NOT NULL)
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `USAGE` privileges on the schema containing the table.
 
 ## Related pages
 

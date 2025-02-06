@@ -9,43 +9,52 @@
 
 #[cfg(test)]
 mod tests {
-    use lowertest::*;
-
-    use std::collections::HashMap;
-
-    use lazy_static::lazy_static;
-    use ore::result::ResultExt;
+    use mz_lowertest::*;
+    use mz_ore::cast::CastFrom;
+    use mz_ore::collections::HashMap;
+    use mz_ore::result::ResultExt;
     use proc_macro2::TokenTree;
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize, MzStructReflect)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
     struct ZeroArg;
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize, MzStructReflect)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
     struct SingleUnnamedArg(Box<f64>);
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize, MzStructReflect)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
     struct OptionalArg(bool, #[serde(default)] (f64, u32));
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize, MzStructReflect)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
     struct MultiUnnamedArg(Vec<(usize, Vec<(String, usize)>, usize)>, String);
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize, MzStructReflect)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
     struct MultiNamedArg {
-        fizz: Vec<Option<bool>>,
+        fizz: Vec<Option<MultiUnnamedArg>>,
         #[serde(default)]
         bizz: Vec<Vec<(SingleUnnamedArg, bool)>>,
     }
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize, MzStructReflect)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
     struct FirstArgEnum {
-        test_enum: Box<TestEnum>,
+        #[allow(clippy::redundant_allocation)]
+        test_enum: Box<Box<TestEnum>>,
         #[serde(default)]
         second_arg: String,
     }
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize, MzEnumReflect)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
+    struct SingleNamedOptionArg {
+        named_field: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
+    struct SecondLayerOfOption {
+        named_field: Option<SingleNamedOptionArg>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Serialize, MzReflect)]
     enum TestEnum {
         SingleNamedField {
             foo: Vec<usize>,
@@ -60,28 +69,12 @@ mod tests {
         SingleUnnamedField2(Vec<i64>),
         SingleUnnamedField3(MultiNamedArg),
         SingleUnnamedZeroArgField(ZeroArg),
-        MultiUnnamedFields(MultiUnnamedArg, MultiNamedArg, Box<TestEnum>),
+        MultiUnnamedFields(MultiUnnamedArg, Option<Box<TestEnum>>, Box<TestEnum>),
         MultiUnnamedFields2(OptionalArg, FirstArgEnum, #[serde(default)] String),
         MultiUnnamedZeroArgFields(ZeroArg, ZeroArg),
-        MultiUnnamedFieldsFirstZeroArg(ZeroArg, OptionalArg),
+        MultiUnnamedFieldsFirstZeroArg(ZeroArg, OptionalArg, Option<SingleNamedOptionArg>),
         Unit,
-    }
-
-    gen_reflect_info_func!(
-        produce_rti,
-        [TestEnum],
-        [
-            ZeroArg,
-            SingleUnnamedArg,
-            OptionalArg,
-            MultiUnnamedArg,
-            MultiNamedArg,
-            FirstArgEnum
-        ]
-    );
-
-    lazy_static! {
-        static ref RTI: ReflectedTypeInfo = produce_rti();
+        OptionStructNesting(SecondLayerOfOption),
     }
 
     #[derive(Default)]
@@ -102,7 +95,6 @@ mod tests {
             first_arg: TokenTree,
             rest_of_stream: &mut I,
             type_name: &str,
-            rti: &ReflectedTypeInfo,
         ) -> Result<Option<String>, String>
         where
             I: Iterator<Item = TokenTree>,
@@ -142,12 +134,19 @@ mod tests {
             } else if type_name == "f64" {
                 if let TokenTree::Punct(punct) = first_arg.clone() {
                     if punct.as_char() == '+' {
-                        return to_json(rest_of_stream, type_name, rti, self);
+                        if let Some(token) = rest_of_stream.next() {
+                            return Ok(Some(token.to_string()));
+                        } else {
+                            return Err("+ is not an f64".to_string());
+                        }
                     }
                 }
             } else if type_name == "usize" {
                 if let TokenTree::Literal(literal) = first_arg {
-                    let litval = literal.to_string().parse::<usize>().map_err_to_string()?;
+                    let litval = literal
+                        .to_string()
+                        .parse::<usize>()
+                        .map_err_to_string_with_causes()?;
                     return Ok(Some(format!("{}", litval + 1)));
                 }
             }
@@ -155,14 +154,9 @@ mod tests {
         }
 
         /// This decrements all numbers of type "usize" by one.
-        fn reverse_syntax_override(
-            &mut self,
-            json: &Value,
-            type_name: &str,
-            _rti: &ReflectedTypeInfo,
-        ) -> Option<String> {
+        fn reverse_syntax_override(&mut self, json: &Value, type_name: &str) -> Option<String> {
             if type_name == "usize" {
-                let result: usize = json.as_u64().unwrap() as usize;
+                let result = usize::cast_from(json.as_u64().unwrap());
                 if result == 0 {
                     return Some(0.to_string());
                 } else {
@@ -182,16 +176,10 @@ mod tests {
             deserialize_optional(
                 &mut stream.into_iter(),
                 "TestEnum",
-                &RTI,
                 &mut TestOverrideDeserializeContext::default(),
             )
         } else {
-            deserialize_optional(
-                &mut stream.into_iter(),
-                "TestEnum",
-                &RTI,
-                &mut GenericTestDeserializeContext::default(),
-            )
+            deserialize_optional_generic(&mut stream.into_iter(), "TestEnum")
         }
     }
 
@@ -200,21 +188,15 @@ mod tests {
         let result: Option<TestEnum> = create_test_enum(s, args)?;
         // 2) Go from TestEnum back to a new spec.
         let (json, new_s) = if let Some(result) = &result {
-            let json = serde_json::to_value(result).map_err_to_string()?;
+            let json = serde_json::to_value(result).map_err_to_string_with_causes()?;
             let new_s = if args.get("override").is_some() {
-                from_json(
+                serialize::<TestEnum, _>(
                     &json,
                     "TestEnum",
-                    &RTI,
                     &mut TestOverrideDeserializeContext::default(),
                 )
             } else {
-                from_json(
-                    &json,
-                    "TestEnum",
-                    &RTI,
-                    &mut GenericTestDeserializeContext::default(),
-                )
+                serialize_generic::<TestEnum>(&json, "TestEnum")
             };
             (json, new_s)
         } else {
@@ -224,7 +206,7 @@ mod tests {
         //    is successful because of the syntax supports multiple ways of
         //    specifying the same thing. So convert the new spec back into a
         //    TestEnum and compare the TestEnums.
-        let new_result = create_test_enum(&new_s, &args)?;
+        let new_result = create_test_enum(&new_s, args)?;
         if !new_result.eq(&result) {
             return Err(format!(
                 "Round trip failed. New spec:\n{}
@@ -237,13 +219,14 @@ mod tests {
         Ok(format!("{:?}", result))
     }
 
-    #[test]
+    #[mz_ore::test]
     fn run() {
         datadriven::walk("tests/testdata", |f| {
             f.run(move |s| -> String {
+                let args = s.args.clone().into();
                 match s.directive.as_str() {
-                    "build" => match build(&s.input, &s.args) {
-                        Ok(msg) => format!("{}\n", msg.trim_end().to_string()),
+                    "build" => match build(&s.input, &args) {
+                        Ok(msg) => format!("{}\n", msg.trim_end()),
                         Err(err) => format!("error: {}\n", err),
                     },
                     _ => panic!("unknown directive: {}", s.directive),

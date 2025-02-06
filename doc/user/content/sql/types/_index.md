@@ -1,12 +1,12 @@
 ---
-title: "SQL Data Types"
-description: "Learn more about the SQL data types you love...."
+title: "SQL data types"
+description: "Learn more about the SQL data types supported in Materialize"
 menu:
   main:
     identifier: sql-types
-    name: Data Types
-    parent: sql
-    weight: 10
+    name: SQL data types
+    parent: reference
+    weight: 110
 disable_list: true
 ---
 
@@ -18,7 +18,7 @@ Materialize's type system consists of two classes of types:
 ## Built-in types
 
 Type | Aliases | Use | Size (bytes) | Catalog name | Syntax
------|---------|-----|--------------|----------------|-----
+-----|-------|-----|--------------|----------------|-----
 [`bigint`](integer) | `int8` | Large signed integer | 8 | Named | `123`
 [`boolean`](boolean) | `bool` | State of `TRUE` or `FALSE` | 1 | Named | `TRUE`, `FALSE`
 [`bytea`](bytea) | `bytea` | Unicode string | Variable | Named | `'\xDEADBEEF'` or `'\\000'`
@@ -33,11 +33,16 @@ Type | Aliases | Use | Size (bytes) | Catalog name | Syntax
 [`oid`](oid) | | PostgreSQL object identifier | 4 | Named | `123`
 [`real`](float) | `float4` | Single precision floating-point number | 4 | Named | `1.23`
 [`record`](record) | | Tuple with arbitrary contents | Variable | Unnameable | `ROW($expr, ...)`
+[`smallint`](integer) | `int2` | Small signed integer | 2 | Named | `123`
 [`text`](text) | `string` | Unicode string | Variable | Named | `'foo'`
 [`time`](time) | | Time without date | 4 | Named | `TIME '01:23:45'`
+[`uint2`](uint) | | Small unsigned integer | 2 | Named | `123`
+[`uint4`](uint) | | Unsigned integer | 4 | Named | `123`
+[`uint8`](uint) | | Large unsigned integer | 8 | Named | `123`
 [`timestamp`](timestamp) | | Date and time | 8 | Named | `TIMESTAMP '2007-02-01 15:04:05'`
 [`timestamp with time zone`](timestamp) | `timestamp with time zone` | Date and time with timezone | 8 | Named | `TIMESTAMPTZ '2007-02-01 15:04:05+06'`
 [Arrays](array) (`[]`) | | Multidimensional array | Variable | Named | `ARRAY[...]`
+[`uuid`](uuid) | | UUID | 16 | Named | `UUID 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'`
 
 #### Catalog name
 
@@ -50,7 +55,7 @@ Value | Description
 ## Custom types
 
 Custom types, in general, provide a mechanism to create names for specific
-instances of  anonymous types to suite users' needs.
+instances of anonymous types to suit users' needs.
 
 However, types are considered custom if the type:
 - Was created through [`CREATE TYPE`][create-type].
@@ -61,10 +66,7 @@ To create custom types, see [`CREATE TYPE`][create-type].
 ### Use
 
 Currently, custom types only provides a shorthand for referring to
-otherwise-annoying-to-type names, but in the future will provide [binary
-encoding and decoding][binary] for these types, as well.
-
-[binary]:https://github.com/MaterializeInc/materialize/issues/4628
+otherwise-annoying-to-type names.
 
 ### Casts
 
@@ -88,7 +90,7 @@ Values in custom types are _never_ considered equal to:
 ### Polymorphism
 
 When using custom types as values for [polymorphic
-functions](list/#polymorphism), the following additional constraints appply:
+functions](list/#polymorphism), the following additional constraints apply:
 
 - If any value passed to a polymorphic parameter is a custom type, the resultant
   type must use the custom type in the appropriate location.
@@ -108,9 +110,9 @@ functions](list/#polymorphism), the following additional constraints appply:
 #### Examples
 
 This is a little easier to understand if we make it concrete, so we'll focus on
-concatenting two lists and appending an element to list.
+concatenating two lists and appending an element to list.
 
-For these operations, Materialize uses the following polymorphc parameters:
+For these operations, Materialize uses the following polymorphic parameters:
 
 - `listany`, which accepts any `list`, and constrains all lists to being of the
   same structurally equivalent type.
@@ -125,8 +127,8 @@ If we concatenate a custom `list` (in this example, `custom_list`) and a
 structurally equivalent built-in `list` (`int4 list`), the result is of the same
 type as the custom `list` (`custom_list`).
 
-```sql
-CREATE TYPE custom_list AS LIST (element_type=int4);
+```mzsql
+CREATE TYPE custom_list AS LIST (ELEMENT TYPE int4);
 
 SELECT pg_typeof(
   list_cat('{1}'::custom_list, '{2}'::int4 list)
@@ -142,11 +144,11 @@ SELECT pg_typeof(
 When appending an element to a list, we'll use `list_append` whose signature is
 `list_append(l: listany, e: listelementany)`.
 
-If we append a structurally appropriate elment (`int4`) to a custom `list`
+If we append a structurally appropriate element (`int4`) to a custom `list`
 (`custom_list`), the result is of the same type as the custom `list`
 (`custom_list`).
 
-```sql
+```mzsql
 SELECT pg_typeof(
   list_append('{1}'::custom_list, 2)
 ) AS custom_list_built_in_element_cat;
@@ -161,7 +163,7 @@ SELECT pg_typeof(
 If we append a structurally appropriate custom element (`custom_list`) to a
 built-in `list` (`int4 list list`), the result is a `list` of custom elements.
 
-```sql
+```mzsql
 SELECT pg_typeof(
   list_append('{{1}}'::int4 list list, '{2}'::custom_list)
 ) AS built_in_list_custom_element_append;
@@ -174,7 +176,7 @@ SELECT pg_typeof(
 ```
 
 This is the "least custom type" we could support for these values––i.e.
-Materialize will not create or disocver a custom type whose elements are
+Materialize will not create or discover a custom type whose elements are
 `custom_list`, nor will it coerce `custom_list` into an anonymous built-in
 list.
 
@@ -185,7 +187,7 @@ types' polymorphic constraints.
 For example, values of type `custom_list list` and `custom_nested_list` cannot
 both be used as `listany` values for the same function:
 
-```sql
+```mzsql
 CREATE TYPE custom_nested_list AS LIST (element_type=custom_list);
 
 SELECT list_cat(
@@ -203,7 +205,7 @@ As another example, when using `custom_list list` values for `listany`
 parameters, you can only use `custom_list` or `int4 list` values for
 `listelementany` parameters––using any other custom type will fail:
 
-```sql
+```mzsql
 CREATE TYPE second_custom_list AS LIST (element_type=int4);
 
 SELECT list_append(
@@ -222,7 +224,7 @@ To make custom types interoperable, you must cast them to the same type. For
 example, casting `custom_nested_list` to `custom_list list` (or vice versa)
 makes the values passed to `listany` parameters of the same custom type:
 
-```sql
+```mzsql
 SELECT pg_typeof(
   list_cat(
     -- result is "custom_list list"

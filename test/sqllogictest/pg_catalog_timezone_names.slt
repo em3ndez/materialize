@@ -1,0 +1,38 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+mode cockroach
+
+query T
+select count(distinct utc_offset) >= 24 as ok from pg_timezone_abbrevs
+----
+true
+
+query TT
+SELECT timezone_offset('America/Denver', '2000-06-01 00:00:00 UTC'), timezone_offset('America/Denver', '2000-12-01 00:00:00 UTC')
+----
+(MDT,-07:00:00,01:00:00)  (MST,-07:00:00,00:00:00)
+
+statement ok
+SET unsafe_new_transaction_wall_time = '2000-06-01 00:00:00 UTC';
+
+query TTTT
+SELECT * FROM pg_catalog.pg_timezone_names where name = 'America/Denver'
+----
+America/Denver  MDT  -06:00:00  true
+
+statement ok
+SET unsafe_new_transaction_wall_time = '2000-12-01 00:00:00 UTC';
+
+query TTTT
+SELECT * FROM pg_catalog.pg_timezone_names where name = 'America/Denver'
+----
+America/Denver  MST  -07:00:00  false
+
+# time zone definitions are validated in misc/python/materialize/postgres_consistency/custom/predefined_pg_queries.py

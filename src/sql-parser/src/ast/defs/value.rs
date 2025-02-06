@@ -21,8 +21,10 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::ast::defs::AstInfo;
+use serde::{Deserialize, Serialize};
+
 use crate::ast::display::{self, AstDisplay, AstFormatter};
+use crate::ast::Ident;
 
 #[derive(Debug)]
 pub struct ValueError(pub(crate) String);
@@ -36,7 +38,7 @@ impl fmt::Display for ValueError {
 }
 
 /// Primitive SQL values.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Value {
     /// Numeric value.
     Number(String),
@@ -54,14 +56,29 @@ pub enum Value {
     /// ```
     /// e.g. `INTERVAL '123:45.678' MINUTE TO SECOND(2)`.
     Interval(IntervalValue),
-    /// Array of Values.
-    Array(Vec<Value>),
     /// `NULL` value.
     Null,
 }
 
 impl AstDisplay for Value {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if f.redacted() {
+            // When adding branches to this match statement, think about whether it is OK for us to collect
+            // the value as part of our telemetry. Check the data management policy to be sure!
+            match self {
+                Value::Number(_) | Value::String(_) | Value::HexString(_) => {
+                    f.write_str("'<REDACTED>'");
+                    return;
+                }
+                Value::Interval(_) => {
+                    f.write_str("INTERVAL '<REDACTED>'");
+                    return;
+                }
+                Value::Boolean(_) | Value::Null => {
+                    // These are fine to log, so just fall through.
+                }
+            }
+        }
         match self {
             Value::Number(v) => f.write_str(v),
             Value::String(v) => {
@@ -75,59 +92,9 @@ impl AstDisplay for Value {
                 f.write_str("'");
             }
             Value::Boolean(v) => f.write_str(v),
-            Value::Interval(IntervalValue {
-                value,
-                precision_high: _,
-                precision_low: _,
-                fsec_max_precision: Some(fsec_max_precision),
-            }) => {
+            Value::Interval(interval_value) => {
                 f.write_str("INTERVAL '");
-                f.write_node(&display::escape_single_quote_string(value));
-                f.write_str("' SECOND (");
-                f.write_str(fsec_max_precision);
-                f.write_str(")");
-            }
-            Value::Interval(IntervalValue {
-                value,
-                precision_high,
-                precision_low,
-                fsec_max_precision,
-            }) => {
-                f.write_str("INTERVAL '");
-                f.write_node(&display::escape_single_quote_string(value));
-                f.write_str("'");
-                match (precision_high, precision_low, fsec_max_precision) {
-                    (DateTimeField::Year, DateTimeField::Second, None) => {}
-                    (DateTimeField::Year, DateTimeField::Second, Some(ns)) => {
-                        f.write_str(" SECOND(");
-                        f.write_str(ns);
-                        f.write_str(")");
-                    }
-                    (DateTimeField::Year, low, None) => {
-                        f.write_str(" ");
-                        f.write_str(low);
-                    }
-                    (high, low, None) => {
-                        f.write_str(" ");
-                        f.write_str(high);
-                        f.write_str(" TO ");
-                        f.write_str(low);
-                    }
-                    (high, low, Some(ns)) => {
-                        f.write_str(" ");
-                        f.write_str(high);
-                        f.write_str(" TO ");
-                        f.write_str(low);
-                        f.write_str("(");
-                        f.write_str(ns);
-                        f.write_str(")");
-                    }
-                }
-            }
-            Value::Array(values) => {
-                f.write_str("[");
-                f.write_node(&display::comma_separated(values));
-                f.write_str("]");
+                f.write_node(interval_value);
             }
             Value::Null => f.write_str("NULL"),
         }
@@ -135,25 +102,85 @@ impl AstDisplay for Value {
 }
 impl_display!(Value);
 
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
+impl AstDisplay for IntervalValue {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if f.redacted() {
+            f.write_str("<REDACTED>'");
+        } else {
+            let IntervalValue {
+                value,
+                precision_high,
+                precision_low,
+                fsec_max_precision,
+            } = self;
+            f.write_node(&display::escape_single_quote_string(value));
+            f.write_str("'");
+            match (precision_high, precision_low, fsec_max_precision) {
+                (DateTimeField::Year, DateTimeField::Second, None) => {}
+                (DateTimeField::Year, DateTimeField::Second, Some(ns)) => {
+                    f.write_str(" SECOND(");
+                    f.write_str(ns);
+                    f.write_str(")");
+                }
+                (DateTimeField::Year, low, None) => {
+                    f.write_str(" ");
+                    f.write_str(low);
+                }
+                (high, low, None) => {
+                    f.write_str(" ");
+                    f.write_str(high);
+                    f.write_str(" TO ");
+                    f.write_str(low);
+                }
+                (high, low, Some(ns)) => {
+                    f.write_str(" ");
+                    f.write_str(high);
+                    f.write_str(" TO ");
+                    f.write_str(low);
+                    f.write_str("(");
+                    f.write_str(ns);
+                    f.write_str(")");
+                }
+            }
+        }
+    }
+}
+
+impl From<Ident> for Value {
+    fn from(ident: Ident) -> Self {
+        Self::String(ident.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DateTimeField {
+    Millennium,
+    Century,
+    Decade,
     Year,
     Month,
     Day,
     Hour,
     Minute,
     Second,
+    Milliseconds,
+    Microseconds,
 }
 
 impl fmt::Display for DateTimeField {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
+            DateTimeField::Millennium => "MILLENNIUM",
+            DateTimeField::Century => "CENTURY",
+            DateTimeField::Decade => "DECADE",
             DateTimeField::Year => "YEAR",
             DateTimeField::Month => "MONTH",
             DateTimeField::Day => "DAY",
             DateTimeField::Hour => "HOUR",
             DateTimeField::Minute => "MINUTE",
             DateTimeField::Second => "SECOND",
+            DateTimeField::Milliseconds => "MILLISECONDS",
+            DateTimeField::Microseconds => "MICROSECONDS",
         })
     }
 }
@@ -163,12 +190,19 @@ impl FromStr for DateTimeField {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_uppercase().as_ref() {
-            "YEAR" | "YEARS" | "Y" => Ok(Self::Year),
+            "MILLENNIUM" | "MILLENNIA" | "MIL" | "MILS" => Ok(Self::Millennium),
+            "CENTURY" | "CENTURIES" | "CENT" | "C" => Ok(Self::Century),
+            "DECADE" | "DECADES" | "DEC" | "DECS" => Ok(Self::Decade),
+            "YEAR" | "YEARS" | "YR" | "YRS" | "Y" => Ok(Self::Year),
             "MONTH" | "MONTHS" | "MON" | "MONS" => Ok(Self::Month),
             "DAY" | "DAYS" | "D" => Ok(Self::Day),
-            "HOUR" | "HOURS" | "H" => Ok(Self::Hour),
-            "MINUTE" | "MINUTES" | "M" => Ok(Self::Minute),
-            "SECOND" | "SECONDS" | "S" => Ok(Self::Second),
+            "HOUR" | "HOURS" | "HR" | "HRS" | "H" => Ok(Self::Hour),
+            "MINUTE" | "MINUTES" | "MIN" | "MINS" | "M" => Ok(Self::Minute),
+            "SECOND" | "SECONDS" | "SEC" | "SECS" | "S" => Ok(Self::Second),
+            "MILLISECOND" | "MILLISECONDS" | "MILLISECON" | "MILLISECONS" | "MSECOND"
+            | "MSECONDS" | "MSEC" | "MSECS" | "MS" => Ok(Self::Milliseconds),
+            "MICROSECOND" | "MICROSECONDS" | "MICROSECON" | "MICROSECONS" | "USECOND"
+            | "USECONDS" | "USEC" | "USECS" | "US" => Ok(Self::Microseconds),
             _ => Err(format!("invalid DateTimeField: {}", s)),
         }
     }
@@ -176,7 +210,7 @@ impl FromStr for DateTimeField {
 
 /// An intermediate value for Intervals, which tracks all data from
 /// the user, as well as the computed ParsedDateTime.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct IntervalValue {
     /// The raw `[value]` that was present in `INTERVAL '[value]'`
     pub value: String,
@@ -205,56 +239,25 @@ impl Default for IntervalValue {
     }
 }
 
-/// SQL data types
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DataType<T: AstInfo> {
-    /// Array
-    Array(Box<DataType<T>>),
-    /// List
-    List(Box<DataType<T>>),
-    /// Map
-    Map {
-        key_type: Box<DataType<T>>,
-        value_type: Box<DataType<T>>,
-    },
-    /// Types who don't embed other types, e.g. INT
-    Other {
-        name: T::ObjectName,
-        /// Typ modifiers appended to the type name, e.g. `numeric(38,0)`.
-        typ_mod: Vec<u64>,
-    },
-}
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Version(pub(crate) u64);
 
-impl<T: AstInfo> AstDisplay for DataType<T> {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            DataType::Array(ty) => {
-                f.write_node(&ty);
-                f.write_str("[]");
-            }
-            DataType::List(ty) => {
-                f.write_node(&ty);
-                f.write_str(" list");
-            }
-            DataType::Map {
-                key_type,
-                value_type,
-            } => {
-                f.write_str("map[");
-                f.write_node(&key_type);
-                f.write_str("=>");
-                f.write_node(&value_type);
-                f.write_str("]");
-            }
-            DataType::Other { name, typ_mod } => {
-                f.write_node(name);
-                if typ_mod.len() > 0 {
-                    f.write_str("(");
-                    f.write_node(&display::comma_separated(typ_mod));
-                    f.write_str(")");
-                }
-            }
-        }
+impl Version {
+    pub fn new(val: u64) -> Self {
+        Version(val)
+    }
+
+    pub fn into_inner(self) -> u64 {
+        self.0
     }
 }
-impl_display_t!(DataType);
+
+impl AstDisplay for Version {
+    fn fmt<W>(&self, f: &mut AstFormatter<W>)
+    where
+        W: fmt::Write,
+    {
+        f.write_node(&self.0);
+    }
+}
+impl_display!(Version);

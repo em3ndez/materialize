@@ -8,20 +8,32 @@
 // by the Apache License, Version 2.0.
 
 //! Fuses reduce operators with parent operators if possible.
-use crate::TransformArgs;
-use expr::{MirRelationExpr, MirScalarExpr};
+use mz_expr::{MirRelationExpr, MirScalarExpr};
+
+use crate::{TransformCtx, TransformError};
 
 /// Fuses reduce operators with parent operators if possible.
 #[derive(Debug)]
 pub struct Reduce;
 
 impl crate::Transform for Reduce {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "ReduceFusion"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "reduce_fusion")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
-    ) -> Result<(), crate::TransformError> {
-        relation.try_visit_mut_pre(&mut |e| Ok(self.action(e)))
+        _: &mut TransformCtx,
+    ) -> Result<(), TransformError> {
+        let result = relation.visit_pre_mut(|e| self.action(e));
+        mz_repr::explain::trace_plan(&*relation);
+        Ok(result)
     }
 }
 
@@ -47,7 +59,7 @@ impl Reduce {
                 // Collect all columns referenced by outer
                 let mut outer_cols = vec![];
                 for expr in group_key.iter() {
-                    expr.visit_post(&mut |e| {
+                    expr.visit_pre(|e| {
                         if let MirScalarExpr::Column(i) = e {
                             outer_cols.push(*i);
                         }

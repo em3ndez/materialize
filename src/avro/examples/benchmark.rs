@@ -21,13 +21,15 @@
 // The original source code is subject to the terms of the MIT license, a copy
 // of which can be found in the LICENSE file at the root of this repository.
 
+// TODO(benesch): remove this once this module no longer makes use of
+// potentially dangerous `as` conversions.
+#![allow(clippy::as_conversions)]
+
 use std::time::{Duration, Instant};
 
-use mz_avro::{
-    schema::Schema,
-    types::{Record, ToAvro, Value},
-    Reader, Writer,
-};
+use mz_avro::schema::Schema;
+use mz_avro::types::{Record, ToAvro, Value};
+use mz_avro::{Reader, Writer};
 
 fn nanos(duration: Duration) -> u64 {
     duration.as_secs() * 1_000_000_000 + duration.subsec_nanos() as u64

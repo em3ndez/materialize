@@ -1,0 +1,124 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+mode cockroach
+
+# Start from a pristine server
+reset-server
+
+# ---- NewClusterForm.tsx
+
+statement ok
+CREATE CLUSTER foo REPLICAS ( r1 (SIZE = '1') );
+
+query T
+SELECT id FROM mz_clusters WHERE name = 'foo';
+----
+u2
+
+statement ok
+DROP CLUSTER foo CASCADE;
+
+# ---- useDataflowStructure.ts
+
+statement ok
+CREATE TEMPORARY VIEW export_to_dataflow AS
+SELECT export_id, id FROM mz_introspection.mz_compute_exports AS mce JOIN mz_introspection.mz_dataflows AS md ON
+mce.dataflow_id = md.id;
+
+statement ok
+CREATE TEMPORARY VIEW all_ops AS
+SELECT e2d.export_id, mdod.id, mda.address, mdod.name, mdop.parent_id, coalesce(mas.records, 0) AS arrangement_records, coalesce(mse.elapsed_ns, 0) AS elapsed_ns
+FROM export_to_dataflow AS e2d
+JOIN mz_introspection.mz_dataflow_operator_dataflows AS mdod ON e2d.id = mdod.dataflow_id
+LEFT JOIN mz_introspection.mz_scheduling_elapsed AS mse ON mdod.id = mse.id
+LEFT JOIN mz_introspection.mz_arrangement_sizes AS mas ON mdod.id = mas.operator_id
+LEFT JOIN mz_introspection.mz_dataflow_operator_parents AS mdop ON mdod.id = mdop.id
+LEFT JOIN mz_introspection.mz_dataflow_addresses AS mda ON mdod.id = mda.id;
+
+# Note(parkmycar): This suceeds on web, but fails because of pg_repr using binary encoding.
+statement error binary encoding of list types is not implemented
+SELECT mdco.id, from_operator_id, from_operator_address, from_port, to_operator_id, to_operator_address, to_port, COALESCE(sum(sent), 0) AS sent
+FROM mz_introspection.mz_dataflow_channel_operators AS mdco
+JOIN mz_introspection.mz_dataflow_channels AS mdc ON mdc.id = mdco.id
+LEFT JOIN mz_introspection.mz_message_counts AS mmc ON mdco.id = mmc.channel_id
+JOIN mz_introspection.mz_compute_exports mce ON mce.dataflow_id = from_operator_address[1]
+WHERE mce.export_id = 'does_not_exist'
+GROUP BY mdco.id, from_operator_id, from_operator_address, to_operator_id, to_operator_address, from_port, to_port;
+
+# Note(parkmycar): This suceeds on web, but fails because of pg_repr using binary encoding.
+statement error binary encoding of list types is not implemented
+SELECT id, address, name, parent_id, arrangement_records, elapsed_ns FROM all_ops WHERE export_id = 'does_not_exist';
+
+# Ensure indexes are used where expected.
+query T multiline
+EXPLAIN SELECT * FROM mz_catalog.mz_kafka_sources
+----
+Explained Query (fast path):
+  ReadIndex on=mz_catalog.mz_kafka_sources mz_kafka_sources_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_catalog.mz_kafka_sources_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT * FROM mz_internal.mz_webhook_sources
+----
+Explained Query (fast path):
+  ReadIndex on=mz_internal.mz_webhook_sources mz_webhook_sources_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_webhook_sources_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+# ---- mz_object_history
+
+# Reset server to clear mz_object_history
+reset-server
+
+# Mock audit log timestamps to make test deterministic
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_mock_audit_event_timestamp = 666
+----
+COMPLETE 0
+
+statement ok
+CREATE MATERIALIZED VIEW temp_view AS SELECT 1;
+
+
+statement ok
+DROP MATERIALIZED VIEW temp_view;
+
+query TTTTT
+SELECT id, cluster_id, object_type, created_at, dropped_at FROM mz_internal.mz_object_history WHERE id LIKE 'u%';
+----
+u1  u1  materialized-view  1970-01-01␠00:00:00.666+00  1970-01-01␠00:00:00.666+00
+
+# ---- mz_cluster_replica_name_history
+
+statement ok
+CREATE CLUSTER foo REPLICAS ( weewoo1 (SIZE = '1') );
+
+statement ok
+ALTER CLUSTER REPLICA foo.weewoo1 RENAME TO weewoo2;
+
+query TTT
+SELECT id, previous_name, new_name FROM mz_internal.mz_cluster_replica_name_history WHERE new_name = 'weewoo1' OR new_name = 'weewoo2';
+----
+u2  NULL  weewoo1
+u2  weewoo1  weewoo2
+
+statement ok
+DROP CLUSTER foo;

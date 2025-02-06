@@ -12,6 +12,14 @@
 # successfully disambiguated and replicated
 #
 
+> CREATE SECRET pgpass AS 'postgres'
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass
+  )
+
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 ALTER USER postgres WITH replication;
 DROP PUBLICATION IF EXISTS mz_source;
@@ -32,50 +40,33 @@ INSERT INTO schema2.t1 VALUES (2);
 
 CREATE PUBLICATION mz_source FOR ALL TABLES;
 
-> CREATE MATERIALIZED SOURCE mz_source
-  FROM POSTGRES CONNECTION 'host=postgres port=5432 user=postgres password=postgres sslmode=require dbname=postgres'
-  PUBLICATION 'mz_source';
-
-> SELECT COUNT(*) > 0 FROM mz_source;
-true
-
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 INSERT INTO schema1.t1 SELECT * FROM schema1.t1;
 INSERT INTO schema2.t1 SELECT * FROM schema2.t1;
 
-! CREATE VIEWS FROM SOURCE mz_source;
-unknown schema 'schema1'
+> CREATE SOURCE mz_source
+  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
 
-! CREATE VIEWS FROM SOURCE mz_source (t1);
-table t1 is ambiguous, consider specifying the schema
+> CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE schema1.t1);
+! CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE schema2.t1);
+contains:catalog item 't1' already exists
 
-> DROP SCHEMA IF EXISTS schema1;
+> DROP TABLE t1;
 
-> CREATE SCHEMA schema1;
+! CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE t1);
+contains:reference t1 is ambiguous, consider specifying an additional layer of qualification
 
-> CREATE VIEWS FROM SOURCE mz_source (schema1.t1);
+> CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE schema1.t1);
 
-> SELECT * FROM schema1.t1;
+> SELECT * FROM t1;
 1
 1
 
-> DROP VIEW schema1.t1;
+> DROP SOURCE mz_source CASCADE;
 
-> DROP SCHEMA IF EXISTS schema2;
-
-> CREATE SCHEMA schema2;
-
-> CREATE VIEWS FROM SOURCE mz_source;
-
-> SELECT * FROM schema1.t1;
-1
-1
-
-> SELECT * FROM schema2.t1;
-2
-2
-
-> CREATE VIEWS FROM SOURCE mz_source (schema1.t1 AS t1_1, schema2.t1 AS t1_2);
+> CREATE SOURCE mz_source FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
+> CREATE TABLE t1_1 FROM SOURCE mz_source (REFERENCE schema1.t1);
+> CREATE TABLE t1_2 FROM SOURCE mz_source (REFERENCE schema2.t1);
 
 > SELECT * FROM t1_1;
 1
@@ -89,6 +80,4 @@ $ postgres-execute connection=postgres://postgres:postgres@postgres
 DROP SCHEMA schema1 CASCADE;
 DROP SCHEMA schema2 CASCADE;
 
-> DROP SCHEMA schema1 CASCADE;
-
-> DROP SCHEMA schema2 CASCADE;
+> DROP SOURCE mz_source CASCADE;

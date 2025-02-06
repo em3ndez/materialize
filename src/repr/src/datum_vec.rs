@@ -16,10 +16,10 @@
 //! It uses `ore::vec::repurpose_allocation` to accomplish this, which contains
 //! unsafe code.
 
-use crate::{Datum, Row};
+use crate::{Datum, RowRef};
 
 /// A re-useable vector of `Datum` with no particular lifetime.
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 pub struct DatumVec {
     outer: Vec<Datum<'static>>,
 }
@@ -39,23 +39,11 @@ impl DatumVec {
             inner,
         }
     }
+
     /// Borrow an instance with a specific lifetime, and pre-populate with a `Row`.
-    pub fn borrow_with<'a>(&'a mut self, row: &'a Row) -> DatumVecBorrow<'a> {
+    pub fn borrow_with<'a>(&'a mut self, row: &'a RowRef) -> DatumVecBorrow<'a> {
         let mut borrow = self.borrow();
         borrow.extend(row.iter());
-        borrow
-    }
-
-    /// Borrow an instance with a specific lifetime, and pre-populate with `Row`s, for example
-    /// first adding a key followed by its values.
-    pub fn borrow_with_many<'a, 'b, D: ::std::borrow::Borrow<Row> + 'a>(
-        &'a mut self,
-        rows: &'b [&'a D],
-    ) -> DatumVecBorrow<'a> {
-        let mut borrow = self.borrow();
-        for row in rows {
-            borrow.extend(row.borrow().iter());
-        }
         borrow
     }
 }
@@ -72,7 +60,7 @@ pub struct DatumVecBorrow<'outer> {
 
 impl<'outer> Drop for DatumVecBorrow<'outer> {
     fn drop(&mut self) {
-        *self.outer = ore::vec::repurpose_allocation(std::mem::take(&mut self.inner));
+        *self.outer = mz_ore::vec::repurpose_allocation(std::mem::take(&mut self.inner));
     }
 }
 
@@ -92,16 +80,15 @@ impl<'outer> std::ops::DerefMut for DatumVecBorrow<'outer> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::Row;
 
-    #[test]
+    #[mz_ore::test]
     fn miri_test_datum_vec() {
         let mut d = DatumVec::new();
 
         assert_eq!(d.borrow().len(), 0);
 
-        let mut r = Row::with_capacity(10);
-        r.push(Datum::String("first"));
-        r.push(Datum::Dummy);
+        let r = Row::pack_slice(&[Datum::String("first"), Datum::Dummy]);
 
         {
             let borrow = d.borrow_with(&r);
@@ -111,9 +98,10 @@ mod test {
 
         {
             // different lifetime, so that rust is happy with the reference lifetimes
-            let mut r2 = Row::with_capacity(1);
-            r2.push(Datum::String("second"));
-            let borrow = d.borrow_with_many(&[&r, &r2]);
+            let r2 = Row::pack_slice(&[Datum::String("second")]);
+            let mut borrow = d.borrow();
+            borrow.extend(&r);
+            borrow.extend(&r2);
             assert_eq!(borrow.len(), 3);
             assert_eq!(borrow[2], Datum::String("second"));
         }

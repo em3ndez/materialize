@@ -7,47 +7,28 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Persistence for Materialize dataflows.
+//! Persistence for differential dataflow collections
 
 #![warn(missing_docs, missing_debug_implementations)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::clone_on_ref_ptr
 )]
 
-use std::fmt;
-
+pub mod azure;
+pub mod cfg;
 pub mod error;
 pub mod file;
 pub mod gen;
 pub mod indexed;
+pub mod intercept;
+pub mod location;
 pub mod mem;
-pub mod operators;
-pub mod pfuture;
+pub mod metrics;
+pub mod postgres;
+pub mod retry;
 pub mod s3;
-pub mod storage;
 pub mod unreliable;
 pub mod workload;
-
-#[cfg(test)]
-pub mod golden_test;
-#[cfg(test)]
-pub mod nemesis;
-
-// TODO
-// - Backward compatibility of persisted data, particularly the encoded keys and
-//   values.
-// - Tighten up the jargon and usage of that jargon: write, update, persist,
-//   drain, entry, update, data, log, blob, indexed, unsealed, trace.
-// - Think through all the <, <=, !<= usages and document them more correctly
-//   (aka replace before/after an antichain with in advance of/not in advance
-//   of).
-
-// Testing edge cases:
-// - Failure while draining from log into unsealed.
-// - Equality edge cases around all the various timestamp/frontier checks.
-
-/// A type usable as a persisted key or value.
-pub trait Data: Clone + persist_types::Codec + fmt::Debug + Ord {}
-impl<T: Clone + persist_types::Codec + fmt::Debug + Ord> Data for T {}

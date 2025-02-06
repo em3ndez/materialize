@@ -15,25 +15,31 @@ operations provided by the standard [`subprocess`][subprocess] module.
 [subprocess]: https://docs.python.org/3/library/subprocess.html
 """
 
+import math
 import subprocess
 import sys
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import IO, Dict, Literal, Optional, Sequence, TextIO, Union, overload
+from typing import IO, TypeVar
 
 from materialize import ui
 
 CalledProcessError = subprocess.CalledProcessError
 
 
+# NOTE(benesch): Please think twice before adding additional parameters to this
+# method! It is meant to serve 95% of callers with a small ands understandable
+# set of parameters. If your needs are niche, consider calling `subprocess.run`
+# directly rather than adding a one-off parameter here.
 def runv(
-    args: Sequence[Union[Path, str]],
-    cwd: Optional[Path] = None,
-    stdin: Union[None, int, IO[bytes], bytes] = None,
-    stdout: Union[None, int, IO[bytes], TextIO] = None,
-    capture_output: bool = False,
-    env: Optional[Dict[str, str]] = None,
-    stderr: Union[None, int, IO[bytes], TextIO] = None,
-    print_to: TextIO = sys.stdout,
+    args: Sequence[Path | str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    stdin: None | int | IO[bytes] | bytes = None,
+    stdout: None | int | IO[bytes] = None,
+    stderr: None | int | IO[bytes] = None,
 ) -> subprocess.CompletedProcess:
     """Verbosely run a subprocess.
 
@@ -44,91 +50,66 @@ def runv(
         args: A list of strings or paths describing the program to run and
             the arguments to pass to it.
         cwd: An optional directory to change into before executing the process.
+        env: A replacement environment with which to launch the process. If
+            unspecified, the current process's environment is used. Replacement
+            occurs wholesale, so use a construction like
+            `env=dict(os.environ, KEY=VAL, ...)` to instead amend the existing
+            environment.
         stdin: An optional IO handle or byte string to use as the process's
             stdin stream.
         stdout: An optional IO handle to use as the process's stdout stream.
-        capture_output: Whether to prevent the process from streaming output
-            the parent process's stdin/stdout handles. If true, the output
-            will be captured and made available as the `stdout` and `stderr`
-            fields on the returned `subprocess.CompletedProcess`. Note that
-            setting this parameter to true will override the behavior of the
-            `stdout` parameter.
-        env: If present, overwrite the environment with this dict
+        stderr: An optional IO handle to use as the process's stderr stream.
 
     Raises:
         OSError: The process cannot be executed, e.g. because the specified
             program does not exist.
         CalledProcessError: The process exited with a non-zero exit status.
     """
-    print("$", ui.shell_quote(args), file=print_to)
+    print("$", ui.shell_quote(args), file=sys.stderr)
 
-    if capture_output:
-        stdout = subprocess.PIPE
-        stderr = subprocess.PIPE
-
-    # Work around https://bugs.python.org/issue34886.
-    stdin_args = {"stdin": stdin}
+    input = None
     if isinstance(stdin, bytes):
-        stdin_args = {"input": stdin}
+        input = stdin
+        stdin = None
 
-    return subprocess.run(  # type: ignore
+    return subprocess.run(
         args,
         cwd=cwd,
+        env=env,
+        input=input,
+        stdin=stdin,
         stdout=stdout,
         stderr=stderr,
         check=True,
-        env=env,
-        **stdin_args,
     )
 
 
-@overload
 def capture(
-    args: Sequence[Union[Path, str]],
-    cwd: Optional[Path] = ...,
-    stdin: Union[None, int, IO[bytes]] = None,
-    unicode: Literal[False] = ...,
-    stderr_too: bool = False,
-    env: Optional[Dict[str, str]] = None,
-) -> bytes:
-    ...
-
-
-@overload
-def capture(
-    args: Sequence[Union[Path, str]],
-    cwd: Optional[Path] = ...,
-    stdin: Union[None, int, IO[bytes]] = None,
+    args: Sequence[Path | str],
     *,
-    unicode: Literal[True],
-    stderr_too: bool = False,
-    env: Optional[Dict[str, str]] = None,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    stdin: None | int | IO[bytes] | str = None,
+    stderr: None | int | IO[bytes] = None,
 ) -> str:
-    ...
-
-
-def capture(
-    args: Sequence[Union[Path, str]],
-    cwd: Optional[Path] = None,
-    stdin: Union[None, int, IO[bytes]] = None,
-    unicode: bool = False,
-    stderr_too: bool = False,
-    env: Optional[Dict[str, str]] = None,
-) -> Union[str, bytes]:
     """Capture the output of a subprocess.
 
     Args:
         args: A list of strings or paths describing the program to run and
             the arguments to pass to it.
         cwd: An optional directory to change into before executing the process.
-        stdin: Optional input stream for the process.
-        unicode: Whether to return output as a unicode string or as bytes.
-        stderr_too: Whether to capture stderr in the returned value
+        env: A replacement environment with which to launch the process. If
+            unspecified, the current process's environment is used. Replacement
+            occurs wholesale, so use a construction like
+            `env=dict(os.environ, KEY=VAL, ...)` to instead amend the existing
+            environment.
+        stdin: An optional IO handle, byte string or string to use as the process's
+            stdin stream.
+        stderr: An optional IO handle to use as the process's stderr stream.
 
     Returns:
-        output: The verbatim output of the process as a string or bytes object,
-            depending on the value of the `unicode` argument. Note that trailing
-            whitespace is preserved.
+        output: The verbatim output of the process as a string. Note that
+            trailing whitespace is preserved.
 
     Raises:
         OSError: The process cannot be executed, e.g. because the specified
@@ -139,7 +120,41 @@ def capture(
         You may want to call `strip()` on the output to remove any trailing
         whitespace.
     """
-    stderr = subprocess.STDOUT if stderr_too else None
-    return subprocess.check_output(  # type: ignore
-        args, cwd=cwd, stdin=stdin, universal_newlines=unicode, stderr=stderr, env=env
+    input = None
+    if isinstance(stdin, str):
+        input = stdin
+        stdin = None
+
+    return subprocess.check_output(
+        args, cwd=cwd, env=env, input=input, stdin=stdin, stderr=stderr, text=True
     )
+
+
+def run_and_get_return_code(
+    args: Sequence[Path | str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
+    """Run a subprocess and return the return code."""
+    try:
+        capture(args, cwd=cwd, env=env, stderr=subprocess.DEVNULL)
+        return 0
+    except CalledProcessError as e:
+        return e.returncode
+
+
+T = TypeVar("T")  # Generic type variable
+
+
+def run_with_retries(fn: Callable[[], T], max_duration: int = 60) -> T:
+    """Retry a function until it doesn't raise a `CalledProcessError`, uses
+    exponential backoff until `max_duration` is reached."""
+    for retry in range(math.ceil(math.log2(max_duration))):
+        try:
+            return fn()
+        except subprocess.CalledProcessError as e:
+            sleep_time = 2**retry
+            print(f"Failed: {e}, retrying in {sleep_time}s")
+            time.sleep(sleep_time)
+    return fn()

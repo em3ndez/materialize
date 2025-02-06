@@ -8,75 +8,61 @@
 // by the Apache License, Version 2.0.
 
 //! Fuses multiple `Union` operators into one.
-//!
-//! Nested negated unions are merged into the parent one by pushing
-//! the Negate to all their branches.
 
-use std::iter;
-
-use crate::TransformArgs;
-use expr::MirRelationExpr;
-use repr::RelationType;
+use mz_expr::visit::Visit;
+use mz_expr::MirRelationExpr;
 
 /// Fuses multiple `Union` operators into one.
 #[derive(Debug)]
 pub struct Union;
 
 impl crate::Transform for Union {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "UnionFusion"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "union")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut crate::TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        relation.try_visit_mut_post(&mut |e| Ok(self.action(e)))
+        relation.visit_mut_post(&mut Self::action)?;
+        mz_repr::explain::trace_plan(&*relation);
+        Ok(())
     }
 }
 
 impl Union {
     /// Fuses multiple `Union` operators into one.
-    /// Nested negated unions are merged into the parent one by pushing
-    /// the Negate to all their branches.
-    pub fn action(&self, relation: &mut MirRelationExpr) {
-        if let MirRelationExpr::Union { base, inputs } = relation {
-            let can_fuse = iter::once(&**base).chain(&*inputs).any(|input| -> bool {
-                match input {
-                    MirRelationExpr::Union { .. } => true,
-                    MirRelationExpr::Negate { input: inner_input } => {
-                        if let MirRelationExpr::Union { .. } = **inner_input {
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                }
-            });
-            if can_fuse {
-                let mut new_inputs: Vec<MirRelationExpr> = vec![];
-                for input in iter::once(&mut **base).chain(inputs) {
-                    let outer_input = input.take_dangerous();
-                    match outer_input {
-                        MirRelationExpr::Union { base, inputs } => {
-                            new_inputs.push(*base);
-                            new_inputs.extend(inputs);
-                        }
-                        MirRelationExpr::Negate {
-                            input: ref inner_input,
-                        } => {
-                            if let MirRelationExpr::Union { base, inputs } = &**inner_input {
-                                new_inputs.push(base.to_owned().negate());
-                                new_inputs.extend(inputs.into_iter().map(|x| x.clone().negate()));
-                            } else {
-                                new_inputs.push(outer_input);
-                            }
-                        }
-                        _ => new_inputs.push(outer_input),
-                    }
-                }
-                // A valid relation type is only needed for empty unions, but an existing union
-                // is guaranteed to be non-empty given that it always has at least a base branch.
-                assert!(!new_inputs.is_empty());
-                *relation = MirRelationExpr::union_many(new_inputs, RelationType::empty());
+    ///
+    /// The order among children is maintained, and the action should be idempotent.
+    /// This action works best if other operators such as `Negate` and other linear
+    /// operators are pushed down through other `Union` operators.
+    pub fn action(relation: &mut MirRelationExpr) {
+        if let MirRelationExpr::Union { inputs, .. } = relation {
+            let mut list: Vec<MirRelationExpr> = Vec::with_capacity(1 + inputs.len());
+            Self::unfold_unions_into(relation.take_dangerous(), &mut list);
+            *relation = MirRelationExpr::Union {
+                base: Box::new(list.remove(0)),
+                inputs: list,
+            }
+        }
+    }
+
+    /// Unfolds `self` and children into a list of expressions that can be unioned.
+    fn unfold_unions_into(expr: MirRelationExpr, list: &mut Vec<MirRelationExpr>) {
+        let mut stack = vec![expr];
+        while let Some(expr) = stack.pop() {
+            if let MirRelationExpr::Union { base, inputs } = expr {
+                stack.extend(inputs.into_iter().rev());
+                stack.push(*base);
+            } else {
+                list.push(expr);
             }
         }
     }

@@ -25,13 +25,21 @@ $ set schema={
 
 $ kafka-create-topic topic=topic-compression compression=gzip
 
-$ kafka-ingest format=avro topic=topic-compression key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=1000
+$ kafka-ingest format=avro topic=topic-compression key-format=avro key-schema=${keyschema} schema=${schema} repeat=1000
 {"f1": ${kafka-ingest.iteration}} {"f2": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"}
 
-> CREATE MATERIALIZED SOURCE topic_compression
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-topic-compression-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
+> CREATE CONNECTION IF NOT EXISTS kafka_conn TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE topic_compression
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-topic-compression-${testdrive.seed}');
+
+> CREATE TABLE topic_compression_tbl FROM SOURCE topic_compression (REFERENCE "testdrive-topic-compression-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE UPSERT;
 
-> SELECT COUNT(*) = 1000 FROM topic_compression;
-true
+> SELECT COUNT(*) FROM topic_compression_tbl;
+1000

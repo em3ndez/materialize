@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # Test that filter and demand information are properly progatated from a view
 # down to an unmaterialized source.
 
@@ -29,185 +31,187 @@ $ kafka-ingest format=avro topic=data schema=${schema}
 {"a": {"long": 3}, "b": {"long": 1}, "c": {"long": 3}, "d": {"long": 5}}
 {"a": {"long": 1}, "b": {"long": 2}, "c": {"long": 2}, "d": {"long": 3}}
 
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
 > CREATE SOURCE data
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+
+> CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
 
 $ set-regex match=u\d+ replacement=UID
 
 # basic test: pushing filters down to sources
 
-> CREATE MATERIALIZED VIEW mv as SELECT * from data where a = 1 and d = 3;
+> CREATE VIEW v as SELECT * from data_tbl where a = 1 and d = 3;
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Filter (#0 = 1), (#3 = 3)
-| Project (#0..#3)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Filter (#0 = 1) AND (#3 = 3)
+    ReadStorage materialize.public.data_tbl
 
-Query:
-%0 =
-| Get materialize.public.data (UID)
-| Filter (#0 = 1), (#3 = 3)
+Source materialize.public.data_tbl
+  filter=((#0 = 1) AND (#3 = 3))
 
-> SELECT * FROM mv
+Target cluster: quickstart
+
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 1 2 2 3
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
 # basic test: pushing demand down to sources
 
-> CREATE MATERIALIZED VIEW mv as SELECT b from data where b = 1;
+> CREATE VIEW v as SELECT b from data_tbl where b = 1;
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Filter (#1 = 1)
-| Project (#1)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Project (#1)
+    Filter (#1 = 1)
+      ReadStorage materialize.public.data_tbl
 
-Query:
-%0 =
-| Get materialize.public.data (UID)
-| Filter (#1 = 1)
-| Project (#1)
+Source materialize.public.data_tbl
+  filter=((#1 = 1))
 
-> SELECT * FROM mv
+Target cluster: quickstart
+
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 1
 1
 1
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
-> CREATE VIEW inner_view as SELECT a, b, d from data where d = 4;
+> CREATE VIEW inner_view as SELECT a, b, d from data_tbl where d = 4;
 
 # Filter gets pushed through intervening view.
 
-> CREATE MATERIALIZED VIEW mv as SELECT b from inner_view where a = 1
+> CREATE VIEW v as SELECT b from inner_view where a = 1
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Filter (#0 = 1), (#3 = 4)
-| Project (#0, #1, #3)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Project (#1)
+    Filter (#0 = 1) AND (#3 = 4)
+      ReadStorage materialize.public.data_tbl
 
-Query:
-%0 =
-| Get materialize.public.data (UID)
-| Filter (#0 = 1), (#3 = 4)
-| Project (#1)
+Source materialize.public.data_tbl
+  filter=((#0 = 1) AND (#3 = 4))
 
-> SELECT * FROM mv
+Target cluster: quickstart
+
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 1
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
 # Demand gets pushed through intervening view.
 
-> CREATE MATERIALIZED VIEW mv as SELECT d from inner_view where a = 1
+> CREATE VIEW v as SELECT d from inner_view where a = 1;
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Filter (#0 = 1), (#3 = 4)
-| Project (#0, #3)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Project (#3)
+    Filter (#0 = 1) AND (#3 = 4)
+      ReadStorage materialize.public.data_tbl
 
-Query:
-%0 =
-| Get materialize.public.data (UID)
-| Filter (#0 = 1), (#3 = 4)
-| Project (#3)
+Source materialize.public.data_tbl
+  filter=((#0 = 1) AND (#3 = 4))
 
-> SELECT * FROM mv
+Target cluster: quickstart
+
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 4
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
-> CREATE MATERIALIZED VIEW mv as SELECT s1.a from data s1, data s2 where s1.a = s2.b and s2.d = 4
+> CREATE VIEW v as SELECT s1.a from data_tbl s1, data_tbl s2 where s1.a = s2.b and s2.d = 4;
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Project (#0, #1, #3)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Project (#0)
+    Join on=(#0 = #1) type=differential
+      ArrangeBy keys=[[#0]]
+        Project (#0)
+          Filter (#0) IS NOT NULL
+            ReadStorage materialize.public.data_tbl
+      ArrangeBy keys=[[#0]]
+        Project (#1)
+          Filter (#3 = 4) AND (#1) IS NOT NULL
+            ReadStorage materialize.public.data_tbl
 
-Query:
-%0 =
-| Get materialize.public.data (UID)
-| Filter !(isnull(#0))
-| Project (#0)
-| ArrangeBy (#0)
+Source materialize.public.data_tbl
 
-%1 =
-| Get materialize.public.data (UID)
-| Filter (#3 = 4), !(isnull(#1))
-| Project (#1)
+Target cluster: quickstart
 
-%2 =
-| Join %0 %1 (= #0 #1)
-| | implementation = Differential %1 %0.(#0)
-| Project (#0)
-
-> SELECT * FROM mv
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 1
 1
 1
 1
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
 # filters and demand can be inferred in more complicated queries
 
-> CREATE MATERIALIZED VIEW mv as SELECT s2.a from data s1, data s2 where s1.a = s2.b and s2.d = 4 and s1.d = 4
+> CREATE VIEW v as SELECT s2.a from data_tbl s1, data_tbl s2 where s1.a = s2.b and s2.d = 4 and s1.d = 4;
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Filter (#3 = 4)
-| Project (#0, #1, #3)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Project (#1)
+    Join on=(#0 = #2) type=differential
+      ArrangeBy keys=[[#0]]
+        Project (#0)
+          Filter (#3 = 4) AND (#0) IS NOT NULL
+            ReadStorage materialize.public.data_tbl
+      ArrangeBy keys=[[#1]]
+        Project (#0, #1)
+          Filter (#3 = 4) AND (#1) IS NOT NULL
+            ReadStorage materialize.public.data_tbl
 
-Query:
-%0 =
-| Get materialize.public.data (UID)
-| Filter (#3 = 4), !(isnull(#0))
-| Project (#0)
-| ArrangeBy (#0)
+Source materialize.public.data_tbl
+  filter=((#3 = 4))
 
-%1 =
-| Get materialize.public.data (UID)
-| Filter (#3 = 4), !(isnull(#1))
-| Project (#0, #1)
+Target cluster: quickstart
 
-%2 =
-| Join %0 %1 (= #0 #2)
-| | implementation = Differential %1 %0.(#0)
-| Project (#1)
-
-> SELECT * FROM mv
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 1
 2
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
-> CREATE MATERIALIZED VIEW mv as SELECT s2.c from data s1, data s2 where s1.a = s2.a
+> CREATE VIEW v as SELECT s2.c from data_tbl s1, data_tbl s2 where s1.a = s2.a
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Filter !(isnull(#0))
-| Project (#0, #2)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  With
+    cte l0 =
+      Filter (#0) IS NOT NULL
+        ReadStorage materialize.public.data_tbl
+  Return
+    Project (#2)
+      Join on=(#0 = #1) type=differential
+        ArrangeBy keys=[[#0]]
+          Project (#0)
+            Get l0
+        ArrangeBy keys=[[#0]]
+          Project (#0, #2)
+            Get l0
 
-Query:
-%0 = Let l0 =
-| Get materialize.public.data (UID)
-| Filter !(isnull(#0))
+Source materialize.public.data_tbl
+  filter=((#0) IS NOT NULL)
 
-%1 =
-| Get %0 (l0)
-| Project (#0)
-| ArrangeBy (#0)
+Target cluster: quickstart
 
-%2 =
-| Get %0 (l0)
-| Project (#0, #2)
-
-%3 =
-| Join %1 %2 (= #0 #1)
-| | implementation = Differential %2 %1.(#0)
-| Project (#2)
-
-> SELECT * FROM mv
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 3
 5
 3
@@ -215,42 +219,36 @@ Query:
 3
 2
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
-> CREATE MATERIALIZED VIEW mv as SELECT * FROM (SELECT a, sum(b) FROM data GROUP BY a UNION ALL SELECT a, (a + c)::numeric FROM data) WHERE a = 1
+> CREATE VIEW v as SELECT * FROM (SELECT a, sum(b) FROM data_tbl GROUP BY a UNION ALL SELECT a, (a + c)::numeric FROM data_tbl) WHERE a = 1;
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Filter (#0 = 1)
-| Project (#0..#2)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Union
+    Project (#1, #0)
+      Map (1)
+        Reduce aggregates=[sum(#0)]
+          Project (#1)
+            Filter (#0 = 1)
+              ReadStorage materialize.public.data_tbl
+    Project (#0, #4)
+      Filter (#0 = 1)
+        Map (bigint_to_numeric((1 + #2)))
+          ReadStorage materialize.public.data_tbl
 
-Query:
-%0 = Let l0 =
-| Get materialize.public.data (UID)
-| Filter (#0 = 1)
+Source materialize.public.data_tbl
+  filter=((#0 = 1))
 
-%1 =
-| Get %0 (l0)
-| Project (#1)
-| Reduce group=()
-| | agg sum(#0)
-| Map 1
-| Project (#1, #0)
+Target cluster: quickstart
 
-%2 =
-| Get %0 (l0)
-| Map i64tonumeric((1 + #2))
-| Project (#0, #4)
-
-%3 =
-| Union %1 %2
-
-> SELECT * FROM mv
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 1 3
 1 3
 1 4
 
-> DROP VIEW mv;
+> DROP VIEW v;
 
 # multiple source test
 
@@ -261,37 +259,35 @@ $ kafka-ingest format=avro topic=data2 schema=${schema}
 {"a": {"long": 2}, "b": {"long": 1}, "c": {"long": 5}, "d": null}
 
 > CREATE SOURCE data2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data2-${testdrive.seed}'
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data2-${testdrive.seed}')
+
+> CREATE TABLE data2_tbl FROM SOURCE data2 (REFERENCE "testdrive-data2-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
 
-> CREATE MATERIALIZED VIEW mv as SELECT a, c FROM data EXCEPT ALL SELECT a, c FROM data2 where d is null
+> CREATE VIEW v as SELECT a, c FROM data_tbl EXCEPT ALL SELECT a, c FROM data2_tbl where d is null
 
-? EXPLAIN PLAN FOR VIEW mv;
-Source materialize.public.data (UID):
-| Project (#0, #2)
+? EXPLAIN SELECT * FROM v;
+Explained Query:
+  Threshold
+    Union
+      Project (#0, #2)
+        ReadStorage materialize.public.data_tbl
+      Negate
+        Project (#0, #2)
+          Filter (#3) IS NULL
+            ReadStorage materialize.public.data2_tbl
 
-Source materialize.public.data2 (UID):
-| Filter isnull(#3)
-| Project (#0, #2, #3)
+Source materialize.public.data_tbl
+Source materialize.public.data2_tbl
+  filter=((#3) IS NULL)
 
-Query:
-%0 =
-| Get materialize.public.data (UID)
-| Project (#0, #2)
+Target cluster: quickstart
 
-%1 =
-| Get materialize.public.data2 (UID)
-| Filter isnull(#3)
-| Project (#0, #2)
-| Negate
-
-%2 =
-| Union %0 %1
-| Threshold
-
-> SELECT * FROM mv
+> CREATE DEFAULT INDEX ON v;
+> SELECT * FROM v
 1 2
 1 3
 3 3
 
-> DROP VIEW mv;
+> DROP VIEW v;

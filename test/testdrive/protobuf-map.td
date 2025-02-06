@@ -7,7 +7,11 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # Test that Protobuf map fields are unsupported.
+
+$ kafka-create-topic topic=maps partitions=1
 
 $ file-append path=maps.proto
 syntax = "proto3";
@@ -19,9 +23,15 @@ message Maps {
   map<string, google.protobuf.Int64Value> message_map = 2;
 }
 
-$ protobuf-compile-descriptors inputs=maps.proto output=maps.pb
+$ protobuf-compile-descriptors inputs=maps.proto output=maps.pb set-var=maps-schema
 
-! CREATE SOURCE maps FROM
-  KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-maps-${testdrive.seed}'
-  FORMAT PROTOBUF MESSAGE '.Maps' USING SCHEMA FILE '${testdrive.temp-dir}/maps.pb'
-Protobuf map fields are not supported
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE maps
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-maps-${testdrive.seed}')
+
+! CREATE TABLE maps_tbl FROM SOURCE maps (REFERENCE "testdrive-maps-${testdrive.seed}")
+  FORMAT PROTOBUF MESSAGE '.Maps' USING SCHEMA '${maps-schema}'
+contains:Protobuf map fields are not supported

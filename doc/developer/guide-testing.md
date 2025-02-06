@@ -12,13 +12,13 @@ There are broadly three test suites:
      in the `tests/` directory within a crate.
 
   2. The data-driven **system test suite** in the top-level [test/](/test)
-     directory. These consist of text files in various DSLs (sqllogictest and
-     testdrive, at the moment) that essentially specify SQL commands to run and
+     directory. These consist of text files in various DSLs (sqllogictest,
+     testdrive, pgtest) that essentially specify SQL commands to run and
      their expected output.
 
   3. The long-running **performance and stability test suite**. This test suite
      has yet to be automated. At the moment it consists of engineers manually
-     running the demo in [demo/chbench/](/demo/chbench).
+     running the demo in [test/chbench/](/test/chbench).
 
 The unit/integration and system test suites are run on every PR and can easily
 be run locally. The goal is for these test suites to be quite fast, ideally
@@ -28,6 +28,9 @@ The long-running tests will simulate actual production runs of Materialize on
 gigabytes to terabytes of data over several hours to days, and will therefore
 report their results asynchronously (perhaps nightly or weekly).
 
+For how to run tests on your PR with a code coverage report see
+[Code Coverage for Pull Requests](https://github.com/MaterializeInc/materialize/blob/main/doc/developer/code-coverage.md).
+
 Details about each of the test suites follow.
 
 ## Unit/integration tests
@@ -36,7 +39,7 @@ The unit/integration test suite uses the standard test framework that ships with
 Cargo. You can run the full test suite like so:
 
 ```shell
-$ cargo test
+$ bin/cargo-test
 ```
 
 Some of the packages have tests that depend on ZooKeeper, Kafka, and the
@@ -69,15 +72,18 @@ pervasively throughout Cargo, and eventually you get used to it. (It's also the
 POSIX-blessed syntax for indicating that you want option parsing to stop, so you
 might be familiar with it from other command-line tools.)
 
-Without `--nocapture`, `println!()` and `dbg!()` output from tests can go
+Without `--nocapture`, `println!()` and `dbg!()`, output from tests can go
 missing, making debugging a very frustrating experience.
+
+Most tests execute with the tracing log filter `info`.
+This can be changed by setting the environment variable `MZ_TEST_LOG_FILTER`.
 
 The second argument worth special mention is the filter argument, which only
 runs the tests that match the specified pattern. For example, to only run tests
 with `avro` in their name:
 
 ```shell
-$ cargo test -- avro
+$ bin/cargo-test -- avro
 ```
 
 As mentioned above, the Rust unit/integration tests follow the standard
@@ -92,7 +98,7 @@ Rust, with rewrite support. datadriven tests plug into `cargo test` as unit
 or integration tests, but store test data in separate files from the Rust code.
 
 Datadriven is particularly useful when the output to be tested is too large to
-be mantained by hand efficiently. The expected output of tests written with
+be maintained by hand efficiently. The expected output of tests written with
 datadriven can be updated by running them with the `REWRITE` environment
 variable set:
 
@@ -147,36 +153,10 @@ file that has coverage of that feature! (Grep is your friend.)
 We pass every SQLite test, with only a few modifications to the upstream test
 data.
 
-To run a sqllogictest against Materialize, you'll need to have PostgreSQL
-running on the default port, 5432, and have created a database named after
-your user. On macOS:
+You can run a sqllogictest file like so:
 
 ```shell
-$ brew install postgresql
-$ brew services start postgresql
-$ createdb $(whoami)  # Yes, this is a shell command, not a SQL command.
-```
-
-On Debian, the current user might not exist or have sufficient permissions to
-create a database. If the `createdb` command fails, try to create a local
-postgres user matching the current user, with the `createdb` permission:
-
-```shell
-$ sudo -u postgres createuser "$(whoami)" --createdb
-```
-
-You might reasonably wonder why PostgreSQL is necessary for running
-sqllogictests against Materialize. The answer is that we offload the hard work
-of mutating queries, like `INSERT INTO ...` and `UPDATE`, to PostgreSQL. We
-slurp up the changelog, much like we would if we were running against a
-Kafka–PostgreSQL [CDC] solution in production, and then run the `SELECT` queries
-against Materialize and verify they match the results specified by the
-sqllogictest file.
-
-Once PostgreSQL is running, you can run a sqllogictest file like so:
-
-```shell
-$ cargo run --bin sqllogictest --release -- test/sqllogictest/TESTFILE.slt
+$ bin/sqllogictest [--release] -- test/sqllogictest/TESTFILE.slt
 ```
 
 For larger test files, it is imperative that you compile in release mode, i.e.,
@@ -186,7 +166,7 @@ made up for by a much faster execution.
 To add logging for tests, append `-vv`, e.g.:
 
 ```shell
-$ cargo run --bin sqllogictest --release -- test/TESTFILE.slt -vv
+$ bin/sqllogictest [--release] -- test/sqllogictest/TESTFILE.slt -vv
 ```
 
 There are currently three classes of sqllogictest files:
@@ -236,10 +216,20 @@ provide most of the coverage, but it's worth adding some (*very*) basic
 testdrive tests (e.g., `> SELECT DATE '1999-01-01'`) to ensure that our pgwire
 implementation is properly serializing dates.
 
+### pgtest
+
+Pgtest is a DSL to specify raw pgwire messages to send and their expected
+responses. It can be used to test message sequences that are difficult
+or impossible to test with PostgreSQL drivers. Its output is generated
+against PostgreSQL and then tested against Materialize. Usage is
+documented at the [pgtest crate][pgtest-docs].
+
+[pgtest-docs]: https://dev.materialize.com/api/rust/mz_pgtest/index.html
+
 ## Long-running tests
 
 These are still a work in progress. The beginning of the orchestration has
-begun, though; see the Docker Compose demo in [demo/chbench](/demo/chbench) if
+begun, though; see the Docker Compose demo in [test/chbench](/test/chbench) if
 you're curious.
 
 ## What kind of tests should I write?
@@ -253,7 +243,7 @@ is stable, so the behaviour of the function should never change, modulo bugs.
 
 But unit/integration tests can be detrimental when testing stateful functions,
 especially those in the middle of the stack. Trying to unit test some of the
-functions in the [dataflow](/src/dataflow) package would be an exercise in
+functions in the [compute](/src/compute) package would be an exercise in
 frustration. You'd need to mock out a dozen different objects and introduce
 several traits, and the logic under test is changing frequently, so the test
 will hamper development as often as it catches regressions.
@@ -268,7 +258,7 @@ tests.
 
 As a module stabilizes and its abstraction boundaries harden, unit
 testing becomes more attractive. But be wary of introducing abstraction just
-to make unit tests easier to right.
+to make unit tests easier to get right.
 
 And, as a general rule of thumb, you don't want to add a new long-running test.
 Experience suggests that these are quite finicky (e.g., because a VM fails to

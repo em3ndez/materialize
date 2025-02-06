@@ -7,34 +7,32 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::iter;
-use std::ops::Add;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::bail;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::DateTime;
 use crossbeam::thread;
-use rand::distributions::{
-    uniform::SampleUniform, Alphanumeric, Bernoulli, Uniform, WeightedIndex,
-};
-use rand::prelude::{Distribution, ThreadRng};
-use rand::thread_rng;
-use rdkafka::error::KafkaError;
-use rdkafka::producer::{BaseRecord, DefaultProducerContext, Producer, ThreadedProducer};
-use rdkafka::types::RDKafkaErrorCode;
-use rdkafka::util::Timeout;
-use rdkafka::ClientConfig;
-use serde_json::Map;
-use url::Url;
-
 use mz_avro::schema::{SchemaNode, SchemaPiece, SchemaPieceOrNamed};
 use mz_avro::types::{DecimalValue, Value};
 use mz_avro::Schema;
-use ore::cast::CastFrom;
-use ore::retry::Retry;
+use mz_kafka_util::client::MzClientContext;
+use mz_ore::cast::CastFrom;
+use mz_ore::cli::{self, CliConfig};
+use mz_ore::retry::Retry;
+use rand::distributions::uniform::SampleUniform;
+use rand::distributions::{Alphanumeric, Bernoulli, Uniform, WeightedIndex};
+use rand::prelude::{Distribution, ThreadRng};
+use rand::thread_rng;
+use rdkafka::error::KafkaError;
+use rdkafka::producer::{BaseRecord, Producer, ThreadedProducer};
+use rdkafka::types::RDKafkaErrorCode;
+use rdkafka::util::Timeout;
+use serde_json::Map;
+use url::Url;
 
 trait Generator<R>: FnMut(&mut ThreadRng) -> R + Send + Sync {
     fn clone_box(&self) -> Box<dyn Generator<R>>;
@@ -63,23 +61,25 @@ struct RandomAvroGenerator<'a> {
     // Generator functions for each piece of the schema. These map keys are
     // morally `*const SchemaPiece`s, but represented as `usize`s so that they
     // implement `Send`.
-    ints: HashMap<usize, Box<dyn Generator<i32>>>,
-    longs: HashMap<usize, Box<dyn Generator<i64>>>,
-    strings: HashMap<usize, Box<dyn Generator<Vec<u8>>>>,
-    bytes: HashMap<usize, Box<dyn Generator<Vec<u8>>>>,
-    unions: HashMap<usize, Box<dyn Generator<usize>>>,
-    enums: HashMap<usize, Box<dyn Generator<usize>>>,
-    bools: HashMap<usize, Box<dyn Generator<bool>>>,
-    floats: HashMap<usize, Box<dyn Generator<f32>>>,
-    doubles: HashMap<usize, Box<dyn Generator<f64>>>,
-    decimals: HashMap<usize, Box<dyn Generator<Vec<u8>>>>,
-    array_lens: HashMap<usize, Box<dyn Generator<usize>>>,
+    ints: BTreeMap<usize, Box<dyn Generator<i32>>>,
+    longs: BTreeMap<usize, Box<dyn Generator<i64>>>,
+    strings: BTreeMap<usize, Box<dyn Generator<Vec<u8>>>>,
+    bytes: BTreeMap<usize, Box<dyn Generator<Vec<u8>>>>,
+    unions: BTreeMap<usize, Box<dyn Generator<usize>>>,
+    enums: BTreeMap<usize, Box<dyn Generator<usize>>>,
+    bools: BTreeMap<usize, Box<dyn Generator<bool>>>,
+    floats: BTreeMap<usize, Box<dyn Generator<f32>>>,
+    doubles: BTreeMap<usize, Box<dyn Generator<f64>>>,
+    decimals: BTreeMap<usize, Box<dyn Generator<Vec<u8>>>>,
+    array_lens: BTreeMap<usize, Box<dyn Generator<usize>>>,
 
     schema: SchemaNode<'a>,
 }
 
 impl<'a> RandomAvroGenerator<'a> {
     fn gen_inner(&mut self, node: SchemaNode, rng: &mut ThreadRng) -> Value {
+        // TODO(benesch): rewrite to avoid `as`.
+        #[allow(clippy::as_conversions)]
         let p = &*node.inner as *const _ as usize;
         match node.inner {
             SchemaPiece::Null => Value::Null,
@@ -105,24 +105,27 @@ impl<'a> RandomAvroGenerator<'a> {
             }
             SchemaPiece::Date => {
                 let days = self.ints.get_mut(&p).unwrap()(rng);
-                let val = NaiveDate::from_ymd(1970, 1, 1).add(chrono::Duration::days(days as i64));
-                Value::Date(val)
+                Value::Date(days)
             }
             SchemaPiece::TimestampMilli => {
                 let millis = self.longs.get_mut(&p).unwrap()(rng);
 
                 let seconds = millis / 1000;
+                // TODO(benesch): rewrite to avoid `as`.
+                #[allow(clippy::as_conversions)]
                 let fraction = (millis % 1000) as u32;
-                let val = NaiveDateTime::from_timestamp_opt(seconds, fraction * 1_000_000).unwrap();
-                Value::Timestamp(val)
+                let val = DateTime::from_timestamp(seconds, fraction * 1_000_000).unwrap();
+                Value::Timestamp(val.naive_utc())
             }
             SchemaPiece::TimestampMicro => {
                 let micros = self.longs.get_mut(&p).unwrap()(rng);
 
                 let seconds = micros / 1_000_000;
+                // TODO(benesch): rewrite to avoid `as`.
+                #[allow(clippy::as_conversions)]
                 let fraction = (micros % 1_000_000) as u32;
-                let val = NaiveDateTime::from_timestamp_opt(seconds, fraction * 1_000).unwrap();
-                Value::Timestamp(val)
+                let val = DateTime::from_timestamp(seconds, fraction * 1_000).unwrap();
+                Value::Timestamp(val.naive_utc())
             }
             SchemaPiece::Decimal {
                 precision,
@@ -249,6 +252,8 @@ impl<'a> RandomAvroGenerator<'a> {
         }
         fn float_dist(json: &serde_json::Value) -> impl FnMut(&mut ThreadRng) -> f32 + Clone {
             let x = json.as_array().unwrap();
+            // TODO(benesch): rewrite to avoid `as`.
+            #[allow(clippy::as_conversions)]
             let (min, max) = (x[0].as_f64().unwrap() as f32, x[1].as_f64().unwrap() as f32);
             let dist = Uniform::new_inclusive(min, max);
             move |rng| dist.sample(rng)
@@ -264,9 +269,7 @@ impl<'a> RandomAvroGenerator<'a> {
             move |rng| {
                 let len = len(rng);
                 let cd = Alphanumeric;
-                iter::repeat_with(|| cd.sample(rng) as u8)
-                    .take(len)
-                    .collect()
+                iter::repeat_with(|| cd.sample(rng)).take(len).collect()
             }
         }
         fn bytes_dist(json: &serde_json::Value) -> impl FnMut(&mut ThreadRng) -> Vec<u8> + Clone {
@@ -302,6 +305,8 @@ impl<'a> RandomAvroGenerator<'a> {
             let dist = Uniform::<i64>::new_inclusive(min, max);
             move |rng| dist.sample(rng).to_be_bytes().to_vec()
         }
+        // TODO(benesch): rewrite to avoid `as`.
+        #[allow(clippy::as_conversions)]
         let p = &*node.inner as *const _ as usize;
 
         let dist_json = field_name.and_then(|fn_| annotations.get(fn_));
@@ -387,7 +392,7 @@ impl<'a> RandomAvroGenerator<'a> {
             } => {
                 let name = node.name.unwrap();
                 for f in fields {
-                    let fn_ = format!("{}::{}", name, f.name);
+                    let fn_ = format!("{}.{}::{}", name.namespace(), name.base_name(), f.name);
                     self.new_inner(node.step(&f.schema), annotations, Some(&fn_));
                 }
             }
@@ -473,14 +478,14 @@ impl<'a> ValueGenerator<'a> {
     }
 }
 
-#[derive(clap::ArgEnum, PartialEq, Debug, Clone)]
+#[derive(clap::ValueEnum, PartialEq, Debug, Clone)]
 pub enum KeyFormat {
     Avro,
     Random,
     Sequential,
 }
 
-#[derive(clap::ArgEnum, PartialEq, Debug, Clone)]
+#[derive(clap::ValueEnum, PartialEq, Debug, Clone)]
 pub enum ValueFormat {
     Bytes,
     Avro,
@@ -524,23 +529,23 @@ struct Args {
         short = 'k',
         long = "keys",
         ignore_case = true,
-        arg_enum,
+        value_enum,
         default_value = "sequential"
     )]
     key_format: KeyFormat,
     /// Minimum key value to generate, if using random-formatted keys.
-    #[clap(long, required_if_eq("keys", "random"))]
+    #[clap(long, required_if_eq("key_format", "random"))]
     key_min: Option<u64>,
     /// Maximum key value to generate, if using random-formatted keys.
-    #[clap(long, required_if_eq("keys", "random"))]
+    #[clap(long, required_if_eq("key_format", "random"))]
     key_max: Option<u64>,
     /// Schema describing Avro key data to randomly generate, if using
     /// Avro-formatted keys.
-    #[clap(long, required_if_eq("keys", "avro"))]
+    #[clap(long, required_if_eq("key_format", "avro"))]
     avro_key_schema: Option<Schema>,
     /// JSON object describing the distribution parameters for each field of
     /// the Avro key object, if using Avro-formatted keys.
-    #[clap(long, required_if_eq("keys", "avro"))]
+    #[clap(long, required_if_eq("key_format", "avro"))]
     avro_key_distribution: Option<serde_json::Value>,
 
     // == Value arguments. ==
@@ -549,7 +554,7 @@ struct Args {
         short = 'v',
         long = "values",
         ignore_case = true,
-        arg_enum,
+        value_enum,
         default_value = "bytes"
     )]
     value_format: ValueFormat,
@@ -557,23 +562,23 @@ struct Args {
     #[clap(
         short = 'm',
         long = "min-message-size",
-        required_if_eq("value-format", "bytes")
+        required_if_eq("value_format", "bytes")
     )]
     min_value_size: Option<usize>,
     /// Maximum value size to generate, if using bytes-formatted values.
     #[clap(
         short = 'M',
         long = "max-message-size",
-        required_if_eq("value-format", "bytes")
+        required_if_eq("value_format", "bytes")
     )]
     max_value_size: Option<usize>,
     /// Schema describing Avro value data to randomly generate, if using
     /// Avro-formatted values.
-    #[clap(long = "avro-schema", required_if_eq("value-format", "avro"))]
+    #[clap(long = "avro-schema", required_if_eq("value_format", "avro"))]
     avro_value_schema: Option<Schema>,
     /// JSON object describing the distribution parameters for each field of
     /// the Avro value object, if using Avro-formatted keys.
-    #[clap(long = "avro-distribution", required_if_eq("value-format", "avro"))]
+    #[clap(long = "avro-distribution", required_if_eq("value_format", "avro"))]
     avro_value_distribution: Option<serde_json::Value>,
 
     // == Output control. ==
@@ -584,7 +589,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Args = ore::cli::parse_args();
+    let args: Args = cli::parse_args(CliConfig::default());
 
     let value_gen = match args.value_format {
         ValueFormat::Bytes => {
@@ -612,12 +617,12 @@ async fn main() -> anyhow::Result<()> {
                 bail!("cannot specify --max-message-size without --values=bytes");
             }
             let value_schema = args.avro_value_schema.as_ref().unwrap();
-            let ccsr = ccsr::ClientConfig::new(args.schema_registry_url.clone()).build()?;
+            let ccsr = mz_ccsr::ClientConfig::new(args.schema_registry_url.clone()).build()?;
             let schema_id = ccsr
                 .publish_schema(
                     &format!("{}-value", args.topic),
                     &value_schema.to_string(),
-                    ccsr::SchemaType::Avro,
+                    mz_ccsr::SchemaType::Avro,
                     &[],
                 )
                 .await?;
@@ -642,12 +647,12 @@ async fn main() -> anyhow::Result<()> {
                 bail!("cannot specify --key-max without --keys=bytes");
             }
             let key_schema = args.avro_key_schema.as_ref().unwrap();
-            let ccsr = ccsr::ClientConfig::new(args.schema_registry_url).build()?;
+            let ccsr = mz_ccsr::ClientConfig::new(args.schema_registry_url).build()?;
             let key_schema_id = ccsr
                 .publish_schema(
                     &format!("{}-key", args.topic),
                     &key_schema.to_string(),
-                    ccsr::SchemaType::Avro,
+                    mz_ccsr::SchemaType::Avro,
                     &[],
                 )
                 .await?;
@@ -694,10 +699,11 @@ async fn main() -> anyhow::Result<()> {
             let topic = &args.topic;
             let mut key_gen = key_gen.clone();
             let mut value_gen = value_gen.clone();
-            let producer: ThreadedProducer<DefaultProducerContext> = ClientConfig::new()
-                .set("bootstrap.servers", args.bootstrap_server.to_string())
-                .create()
-                .unwrap();
+            let producer: ThreadedProducer<mz_kafka_util::client::MzClientContext> =
+                mz_kafka_util::client::create_new_client_config_simple()
+                    .set("bootstrap.servers", args.bootstrap_server.to_string())
+                    .create_with_context(MzClientContext::default())
+                    .unwrap();
             let mut key_buf = vec![];
             let mut value_buf = vec![];
             let mut n = args.num_records / threads;
@@ -722,7 +728,9 @@ async fn main() -> anyhow::Result<()> {
                         key_buf.extend(u64::cast_from(i).to_be_bytes().iter())
                     };
 
-                    let mut rec = BaseRecord::to(&topic).key(&key_buf).payload(&value_buf);
+                    let mut rec = BaseRecord::to(topic).key(&key_buf).payload(&value_buf);
+                    // TODO(benesch): rewrite to avoid `as`.
+                    #[allow(clippy::as_conversions)]
                     if args.partitions_round_robin != 0 {
                         rec = rec.partition((i % args.partitions_round_robin) as i32);
                     }
@@ -743,7 +751,7 @@ async fn main() -> anyhow::Result<()> {
                         })
                         .expect("unable to produce to Kafka");
                 }
-                producer.flush(Timeout::Never);
+                producer.flush(Timeout::Never).unwrap();
             });
         }
     })

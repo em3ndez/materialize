@@ -38,10 +38,10 @@ FROM t
 6.7  2.7  9.4  2.35  0.7000000000000002  false  false  true  true  false  true
 
 # Do not allow int4 text comparisons
-query error no overload for text < integer
+query error db error: ERROR: operator does not exist: text < integer
 SELECT 'foo'::text < 5::int;
 
-query error no overload for integer < text
+query error db error: ERROR: operator does not exist: integer < text
 SELECT 1 < ALL(VALUES(NULL))
 
 # But string *literals* can coerce to anything.
@@ -115,9 +115,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 1::smallint > 1;
 ----
-%0 =
-| Constant ()
-| Map (i16toi32(i32toi16(1)) > 1)
+Map ((smallint_to_integer(integer_to_smallint(1)) > 1))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -126,9 +128,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 1::smallint > 1.1;
 ----
-%0 =
-| Constant ()
-| Map (i16tonumeric(i32toi16(1)) > 1.1)
+Map ((smallint_to_numeric(integer_to_smallint(1)) > 1.1))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -137,9 +141,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 1::bigint > 1.11111
 ----
-%0 =
-| Constant ()
-| Map (i64tonumeric(i32toi64(1)) > 1.11111)
+Map ((bigint_to_numeric(integer_to_bigint(1)) > 1.11111))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -148,9 +154,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 1::bigint > 1.11111::float
 ----
-%0 =
-| Constant ()
-| Map (i64tof64(i32toi64(1)) > numerictof64(1.11111))
+Map ((bigint_to_double(integer_to_bigint(1)) > numeric_to_double(1.11111)))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -159,9 +167,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 1.1 > 1::float;
 ----
-%0 =
-| Constant ()
-| Map (numerictof64(1.1) > i32tof64(1))
+Map ((numeric_to_double(1.1) > integer_to_double(1)))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -170,9 +180,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 1.1 > 1.1
 ----
-%0 =
-| Constant ()
-| Map (1.1 > 1.1)
+Map ((1.1 > 1.1))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -181,9 +193,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 1::float > 1::float
 ----
-%0 =
-| Constant ()
-| Map (i32tof64(1) > i32tof64(1))
+Map ((integer_to_double(1) > integer_to_double(1)))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -192,18 +206,20 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT floor(1);
 ----
-%0 =
-| Constant ()
-| Map floorf64(i32tof64(1))
+Map (floorf64(integer_to_double(1)))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
 # Cannot implicitly cast int4 to string
-query error Cannot call function char_length\(integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function char_length\(integer\) does not exist
 SELECT char_length(321);
 
 # Cannot implicitly cast double precision to numeric
-query error Cannot call function round\(double precision, integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(double precision, integer\) does not exist
 SELECT round(1.23::float, 1);
 
 # Check that float8 is the most common type
@@ -211,9 +227,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT coalesce(1::int, 1::numeric, 1::float);
 ----
-%0 =
-| Constant ()
-| Map coalesce(i32tof64(1), numerictof64(i32tonumeric(1)), i32tof64(1))
+Map (coalesce(integer_to_double(1), numeric_to_double(integer_to_numeric(1)), integer_to_double(1)))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -234,9 +252,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT TIMESTAMPTZ '2001 03-04' - DATE '2002 03-04';
 ----
-%0 =
-| Constant ()
-| Map (strtotstz("2001 03-04") - datetotstz(strtodate("2002 03-04")))
+Map ((text_to_timestamp_with_time_zone("2001 03-04") - date_to_timestamp_with_timezone(text_to_date("2002 03-04"))))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -245,9 +265,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT TIMESTAMPTZ '2001 03-04' - TIMESTAMP '2002 03-04';
 ----
-%0 =
-| Constant ()
-| Map (strtotstz("2001 03-04") - tstotstz(strtots("2002 03-04")))
+Map ((text_to_timestamp_with_time_zone("2001 03-04") - timestamp_to_timestamp_with_time_zone(text_to_timestamp("2002 03-04"))))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -256,9 +278,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT TIMESTAMP '2001 03-04' - DATE '2002 03-04';
 ----
-%0 =
-| Constant ()
-| Map (strtots("2001 03-04") - datetots(strtodate("2002 03-04")))
+Map ((text_to_timestamp("2001 03-04") - date_to_timestamp(text_to_date("2002 03-04"))))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -267,9 +291,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT coalesce(DATE '2001', TIMESTAMP '2002', TIMESTAMPTZ '2003');
 ----
-%0 =
-| Constant ()
-| Map coalesce(datetotstz(strtodate("2001")), tstotstz(strtots("2002")), strtotstz("2003"))
+Map (coalesce(date_to_timestamp_with_timezone(text_to_date("2001")), timestamp_to_timestamp_with_time_zone(text_to_timestamp("2002")), text_to_timestamp_with_time_zone("2003")))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -278,9 +304,37 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT lower('a'::char);
 ----
-%0 =
-| Constant ()
-| Map lower(chartostr(strtochar("a")))
+Map (lower(char_to_text(text_to_char(text_to_char("a")))))
+  Constant
+    - ()
+
+Target cluster: quickstart
+
+EOF
+
+# Check that "char" vs varchar promotes to text
+query T multiline
+EXPLAIN RAW PLAN FOR
+    SELECT 'a'::"char" < 'a'::varchar;
+----
+Map (("char"_to_text(text_to_"char"("a")) < varchar_to_text(text_to_varchar("a"))))
+  Constant
+    - ()
+
+Target cluster: quickstart
+
+EOF
+
+# Check that "char" vs char promotes to text
+query T multiline
+EXPLAIN RAW PLAN FOR
+    SELECT 'a'::"char" < 'a'::char;
+----
+Map (("char"_to_text(text_to_"char"("a")) < char_to_text(text_to_char(text_to_char("a")))))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -289,9 +343,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 'a'::char < 'a'::varchar;
 ----
-%0 =
-| Constant ()
-| Map (strtochar("a") < strtochar(strtovarchar("a")))
+Map ((text_to_char(text_to_char("a")) < text_to_char(text_to_varchar("a"))))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -301,9 +357,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 'a'::char < 'a'::text;
 ----
-%0 =
-| Constant ()
-| Map (chartostr(strtochar("a")) < "a")
+Map ((char_to_text(text_to_char(text_to_char("a"))) < "a"))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -311,9 +369,11 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT 'a'::varchar < 'a'::text;
 ----
-%0 =
-| Constant ()
-| Map (varchartostr(strtovarchar("a")) < "a")
+Map ((varchar_to_text(text_to_varchar("a")) < "a"))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -322,9 +382,23 @@ query T multiline
 EXPLAIN RAW PLAN FOR
     SELECT coalesce('a'::char, 'a'::varchar, 'a'::text);
 ----
-%0 =
-| Constant ()
-| Map coalesce(chartostr(strtochar("a")), varchartostr(strtovarchar("a")), "a")
+Map (coalesce(text_to_char(text_to_char("a")), text_to_char(text_to_varchar("a")), text_to_char("a")))
+  Constant
+    - ()
+
+Target cluster: quickstart
+
+EOF
+
+query T multiline
+EXPLAIN RAW PLAN FOR
+    SELECT coalesce('a'::char, 'a'::text, 'a'::varchar);
+----
+Map (coalesce(text_to_char(text_to_char("a")), text_to_char("a"), text_to_char(text_to_varchar("a"))))
+  Constant
+    - ()
+
+Target cluster: quickstart
 
 EOF
 
@@ -393,7 +467,7 @@ SELECT '1'::varchar::smallint
 query error CAST does not support casting from time to smallint
 SELECT '01:02:03'::time::smallint
 
-query error CAST does not support casting from timestamp to smallint
+query error CAST does not support casting from timestamp without time zone to smallint
 SELECT '2002 03-04'::timestamp::smallint
 
 query error CAST does not support casting from timestamp with time zone to smallint
@@ -412,8 +486,10 @@ SELECT 1::bigint::bigint;
 ----
 1
 
-query error CAST does not support casting from boolean to bigint
+query T
 SELECT TRUE::boolean::bigint
+----
+1
 
 query error CAST does not support casting from date to bigint
 SELECT '2001 02-03'::date::bigint
@@ -467,7 +543,7 @@ SELECT '1'::varchar::bigint
 query error CAST does not support casting from time to bigint
 SELECT '01:02:03'::time::bigint
 
-query error CAST does not support casting from timestamp to bigint
+query error CAST does not support casting from timestamp without time zone to bigint
 SELECT '2002 03-04'::timestamp::bigint
 
 query error CAST does not support casting from timestamp with time zone to bigint
@@ -506,7 +582,7 @@ SELECT '1'::interval::boolean
 query error cannot cast jsonb object to type boolean
 SELECT '{}'::jsonb::boolean;
 
-query error cannot cast jsonb numeric to type boolean
+query error cannot cast jsonb number to type boolean
 SELECT '1'::jsonb::boolean;
 
 query T
@@ -527,7 +603,7 @@ true
 query error CAST does not support casting from time to boolean
 SELECT '01:02:03'::time::boolean
 
-query error CAST does not support casting from timestamp to boolean
+query error CAST does not support casting from timestamp without time zone to boolean
 SELECT '2002 03-04'::timestamp::boolean
 
 query error CAST does not support casting from timestamp with time zone to boolean
@@ -658,7 +734,7 @@ SELECT '1'::varchar::numeric
 query error CAST does not support casting from time to numeric
 SELECT '01:02:03'::time::numeric
 
-query error CAST does not support casting from timestamp to numeric
+query error CAST does not support casting from timestamp without time zone to numeric
 SELECT '2002 03-04'::timestamp::numeric
 
 query error CAST does not support casting from timestamp with time zone to numeric
@@ -729,7 +805,7 @@ SELECT '1'::varchar::double
 query error CAST does not support casting from time to double precision
 SELECT '01:02:03'::time::double
 
-query error CAST does not support casting from timestamp to double precision
+query error CAST does not support casting from timestamp without time zone to double precision
 SELECT '2002 03-04'::timestamp::double
 
 query error CAST does not support casting from timestamp with time zone to double precision
@@ -800,7 +876,7 @@ SELECT '1'::varchar::real
 query error CAST does not support casting from time to real
 SELECT '01:02:03'::time::real
 
-query error CAST does not support casting from timestamp to real
+query error CAST does not support casting from timestamp without time zone to real
 SELECT '2002 03-04'::timestamp::real
 
 query error CAST does not support casting from timestamp with time zone to real
@@ -868,7 +944,7 @@ SELECT '1'::varchar::integer
 query error CAST does not support casting from time to integer
 SELECT '01:02:03'::time::integer
 
-query error CAST does not support casting from timestamp to integer
+query error CAST does not support casting from timestamp without time zone to integer
 SELECT '2002 03-04'::timestamp::integer
 
 query error CAST does not support casting from timestamp with time zone to integer
@@ -926,7 +1002,7 @@ SELECT '01:02:03'::time::interval;
 ----
 01:02:03
 
-query error CAST does not support casting from timestamp to interval
+query error CAST does not support casting from timestamp without time zone to interval
 SELECT '2002 03-04'::timestamp::interval
 
 query error CAST does not support casting from timestamp with time zone to interval
@@ -970,7 +1046,7 @@ SELECT '1'::jsonb::jsonb;
 query error CAST does not support casting from time to jsonb
 SELECT '01:02:03'::time::jsonb
 
-query error CAST does not support casting from timestamp to jsonb
+query error CAST does not support casting from timestamp without time zone to jsonb
 SELECT '2002 03-04'::timestamp::jsonb
 
 query error CAST does not support casting from timestamp with time zone to jsonb
@@ -1443,5 +1519,146 @@ SELECT 14::oid = 14::smallint;
 ----
 true
 
-query error OID out of range
+query error "120129019392" OID out of range
 SELECT 120129019392::bigint::oid;
+
+# Check that our non-linear type promotion structure works as intended.
+# Whenever you have a uint and an int, you unify their types by selecting the
+# narrowest integer-like that the uint can be implicitly cast to. In the case
+# of 64-bit uints, this means casting the values to numeric.
+
+query TT
+SELECT pg_typeof(1::smallint + 1::uint2), 1::smallint + 1::uint2;
+----
+integer  2
+
+query TT
+SELECT pg_typeof(1::smallint + 1::uint4), 1::smallint + 1::uint4;
+----
+bigint  2
+
+query TT
+SELECT pg_typeof(1::smallint + 1::uint8), 1::smallint + 1::uint8;
+----
+numeric  2
+
+query TT
+SELECT pg_typeof(1::integer + 1::uint2), 1::integer + 1::uint2;
+----
+integer  2
+
+query TT
+SELECT pg_typeof(1::integer + 1::uint4), 1::integer + 1::uint4;
+----
+bigint  2
+
+query TT
+SELECT pg_typeof(1::integer + 1::uint8), 1::integer + 1::uint8;
+----
+numeric  2
+
+query TT
+SELECT pg_typeof(1::bigint + 1::uint2), 1::bigint + 1::uint2;
+----
+bigint  2
+
+query TT
+SELECT pg_typeof(1::bigint + 1::uint4), 1::bigint + 1::uint4;
+----
+bigint  2
+
+query TT
+SELECT pg_typeof(1::bigint + 1::uint8), 1::bigint + 1::uint8;
+----
+numeric  2
+
+query T
+SELECT 9223372036854775807::bigint / 18446744073709551615::uint8;
+----
+0.499999999999999999972894945687862389148
+
+query T
+SELECT 18446744073709551615::uint8 / 9223372036854775807::bigint;
+----
+2.00000000000000000010842021724855044341
+
+query T
+select pg_typeof(coalesce(1::uint4, 1::int));
+----
+bigint
+
+query T
+select pg_typeof(coalesce(1::uint4, 1::int, 1::numeric));
+----
+numeric
+
+query T
+select pg_typeof(coalesce(1::uint8, 1::int));
+----
+numeric
+
+query T
+SELECT pg_typeof(coalesce(1::uint4, 1::int, 1::numeric, 1::double));
+----
+double precision
+
+# These types were not converted because the function's parameters are
+# polymorphic without enfocing a relationship between the arguments, and we only
+# aggressively cast ints and uints to a wider type in cases where it exactly
+# selects a function.
+
+query T multiline
+EXPLAIN RAW PLAN FOR
+SELECT jsonb_object_agg(1::uint8, 2::int);
+----
+Reduce aggregates=[jsonb_object_agg[order_by=[]](row(row(uint8_to_text(integer_to_uint8(1)), coalesce(jsonbable_to_jsonb(integer_to_numeric(2)), json_null))))]
+  Constant
+    - ()
+
+Target cluster: quickstart
+
+EOF
+
+# This would fail to plan if we blithely unified all args into the best common
+# int/uint; the second argument to lag does not support numeric types.
+
+query T
+WITH t (f1, f2, f3) AS (VALUES (1::uint8, 'a', 1.0))
+SELECT lag(f1, 1::int) OVER (PARTITION BY f2 ORDER BY f3 DESC, f1)
+FROM t
+----
+NULL
+
+query T
+WITH t (f1, f2, f3) AS (VALUES (1::uint8, 'a', 1.0))
+SELECT pg_typeof(lag(f1, 1::int) OVER (PARTITION BY f2 ORDER BY f3 DESC, f1))
+FROM t
+----
+uint8
+
+# However, polymorphic type resolution can still appropriately upcast values,
+# while leaving other types alone.
+
+query T
+WITH t (f1, f2, f3) AS (VALUES (1::uint8, 'a', 1.0))
+SELECT lag(f1, 1::int, 0::int) OVER (PARTITION BY f2 ORDER BY f3 DESC, f1)
+FROM t
+----
+0
+
+query T
+WITH t (f1, f2, f3) AS (VALUES (1::uint8, 'a', 1.0))
+SELECT pg_typeof(lag(f1, 1::int, 0::int) OVER (PARTITION BY f2 ORDER BY f3 DESC, f1))
+FROM t
+----
+numeric
+
+# implicit timestamp_to_timestamptz cast
+query T
+values ('2023-01-01T00:00:00.666'::timestamp(6)) union all values ('2023-01-01T00:00:00.666666'::timestamptz(3));
+----
+2023-01-01 00:00:00.666+00
+2023-01-01 00:00:00.667+00
+
+query error numeric field overflow
+SELECT '1e-307'::float8::numeric

@@ -15,8 +15,7 @@
 
 //! Formatting utilities.
 
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 #[cfg(feature = "network")]
 use bytes::{BufMut, BytesMut};
@@ -30,7 +29,7 @@ use bytes::{BufMut, BytesMut};
 /// Objects that implement `FormatBuffer` can be passed to the [`write!`] macro:
 ///
 /// ```
-/// use ore::fmt::FormatBuffer;
+/// use mz_ore::fmt::FormatBuffer;
 ///
 /// let mut buf = String::new();
 /// write!(buf, "{:.02}", 1.0 / 7.0);
@@ -41,7 +40,7 @@ use bytes::{BufMut, BytesMut};
 /// write to either a [`String`] or a byte buffer:
 ///
 /// ```
-/// use ore::fmt::FormatBuffer;
+/// use mz_ore::fmt::FormatBuffer;
 ///
 /// fn write_timezone_offset<F>(buf: &mut F, mut offset_seconds: i32)
 /// where

@@ -1,120 +1,65 @@
 ---
 title: "SHOW SOURCES"
-description: "`SHOW SOURCES` returns a list of all sources available to your Materialize instances."
+description: "`SHOW SOURCES` returns a list of all sources available in Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`SHOW SOURCES` returns a list of all sources available to your Materialize
-instances.
+`SHOW SOURCES` returns a list of all sources available in Materialize.
 
 ## Syntax
 
-{{< diagram "show-sources.svg" >}}
+```mzsql
+SHOW SOURCES [ FROM <schema_name> ] [ IN CLUSTER <cluster_name> ]
+```
 
-Field | Use
-------|-----
-_schema&lowbar;name_ | The schema to show sources from. Defaults to `public` in the current database. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
-**MATERIALIZED** | Only return materialized sources, i.e. those with [indexes](../create-index). Without specifying this option, this command returns all sources, including non-materialized sources.
-**FULL** | Return details about your sources.
+Option                        | Description
+------------------------------|------------
+**FROM** <schema_name>        | If specified, only show sources from the specified schema. Defaults to first resolvable schema in the search path. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
+**IN CLUSTER** <cluster_name> | If specified, only show sources from the specified cluster. For available clusters, see [`SHOW CLUSTERS`](../show-clusters).
 
 ## Details
 
-### Output format for `SHOW FULL SOURCES`
+### Output format for `SHOW SOURCES`
 
-`SHOW FULL SOURCES`'s output is a table, with this structure:
+`SHOW SOURCES`'s output is a table, with this structure:
 
 ```nofmt
- name  | type | materialized | volatility | connector_type
--------+------+--------------+------------+---------------
- ...   | ...  | ...          | ...        | ...
+name  | type | cluster
+------+------+--------
+...   | ...  | ...
 ```
 
 Field | Meaning
 ------|--------
-**name** | The name of the source
-**type** | Whether the source was created by the `user` or the `system`
-**materialized** | Does the source have an in-memory index? For more details, see [`CREATE INDEX`](../create-index)
-**volatility** | Whether the source is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
-**connector_type** | The type of the source: `avro-ocf`, `file`, `kafka`, `kinesis`, `s3`, `postgres`, or `pubnub`.
-
-{{< version-changed v0.5.0 >}}
-The output column is renamed from `SOURCES` to `name`.
-{{< /version-changed >}}
-
-{{< version-added v0.7.2 >}}
-The `volatile` column.
-{{< /version-added >}}
-
-{{< version-added v0.9.1 >}}
-The `connector_type` column.
-{{< /version-added >}}
-
-### Internal statistic sources
-
-Materialize comes with a number of sources that contain internal statistics
-about the instance's behavior. These are kept in a "hidden" schema called
-`mz_catalog`.
-
-To view the internal statistic sources use:
-
-```sql
-SHOW SOURCES FROM mz_catalog;
-```
-
-To select from these sources, you must specify that you want to read from the
-source in the `mz_catalog` schema.
+**name** | The name of the source.
+**type** | The type of the source: `kafka`, `postgres`, `load-generator`, `progress`, or `subsource`.
+**cluster** | The cluster the source is associated with.
 
 ## Examples
 
-### Default behavior
-
-```sql
-SHOW SCHEMAS;
-```
-```nofmt
-public
-```
-```sql
-SHOW SOURCES FROM public;
-```
-```nofmt
-my_stream_source
-my_file_source
-```
-```sql
+```mzsql
 SHOW SOURCES;
 ```
 ```nofmt
-my_stream_source
-my_file_source
+            name    | type     | cluster
+--------------------+----------+---------
+ my_kafka_source    | kafka    | c1
+ my_postgres_source | postgres | c2
 ```
 
-### Only show materialized sources
-
-```sql
-SHOW MATERIALIZED SOURCES;
-```
-```nofmt
-        name
-----------------------
- my_materialized_source
-```
-
-### Show details about sources
-
-```sql
-SHOW FULL SOURCES
+```mzsql
+SHOW SOURCES IN CLUSTER c2;
 ```
 ```nofmt
-            name           | type | materialized
----------------------------+------+--------------
- my_nonmaterialized_source | user | f
- my_materialized_source    | user | t
+name               | type     | cluster
+-------------------+----------+--------
+my_postgres_source | postgres | c2
 ```
 
 ## Related pages
 
-- [`SHOW CREATE SOURCE`](../show-create-source)
 - [`CREATE SOURCE`](../create-source)
+- [`DROP SOURCE`](../drop-source)
+- [`SHOW CREATE SOURCE`](../show-create-source)

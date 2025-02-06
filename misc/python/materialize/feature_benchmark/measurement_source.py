@@ -8,76 +8,26 @@
 # by the Apache License, Version 2.0.
 
 import re
-from typing import Callable, Iterator, List, Optional
+import textwrap
+import time
+from collections.abc import Callable
 
 from materialize.feature_benchmark.executor import Executor
+from materialize.feature_benchmark.measurement import (
+    MeasurementUnit,
+    WallclockDuration,
+)
 
 
 class MeasurementSource:
     def __init__(self) -> None:
-        self._data: List[float] = []
-        self._executor: Optional[Executor] = None
-
-    def __iter__(self) -> Iterator[float]:
-        self._i = 0
-        return self
-
-    def __next__(self) -> float:
-        if self._i < len(self._data):
-            data = self._data[self._i]
-            assert data is not None
-            self._i += 1
-            return data
-        else:
-            raise StopIteration
-
-    def __call__(self, executor: Executor) -> "MeasurementSource":
-        self._executor = executor
-        return self
+        self._executor: Executor | None = None
 
     def run(
-        self, executor: Optional[Executor] = None, measure: bool = True
-    ) -> Optional[float]:
-        assert False
-
-
-class Dummy(MeasurementSource):
-    """Returns a constant stream of 1s"""
-
-    def __iter__(self) -> Iterator[float]:
-        return self
-
-    def __next__(self) -> float:
-        return 1.0
-
-
-class Assert(MeasurementSource):
-    """Asserts when iterated over"""
-
-    def __iter__(self) -> Iterator[float]:
-        return self
-
-    def __next__(self) -> float:
-        assert False
-
-
-class Lambda(MeasurementSource):
-    def __init__(self, _lambda: Callable) -> None:
-        self._lambda = _lambda
-
-    def __iter__(self) -> Iterator[float]:
-        return self
-
-    def __next__(self) -> float:
-        val = self.run()
-        assert val is not None
-        return val
-
-    def run(
-        self, executor: Optional[Executor] = None, measure: bool = True
-    ) -> Optional[float]:
-        assert self._executor is not None
-        return self._executor.Lambda(self._lambda)
+        self,
+        executor: Executor | None = None,
+    ) -> list[WallclockDuration]:
+        raise NotImplementedError
 
 
 class Td(MeasurementSource):
@@ -94,40 +44,37 @@ class Td(MeasurementSource):
 
     """
 
-    def __init__(self, td_str: str) -> None:
-        self._td_str = td_str
-        self._executor: Optional[Executor] = None
-
-    def __iter__(self) -> Iterator[float]:
-        return self
-
-    def __next__(self) -> float:
-        val = self.run()
-        assert val is not None
-        return val
+    def __init__(self, td_str: str, dedent: bool = True) -> None:
+        self._td_str = textwrap.dedent(td_str) if dedent else td_str
+        self._executor: Executor | None = None
 
     def run(
-        self, executor: Optional[Executor] = None, measure: bool = True
-    ) -> Optional[float]:
-        assert not (executor is None and self._executor is None)
+        self,
+        executor: Executor | None = None,
+    ) -> list[WallclockDuration]:
         assert not (executor is not None and self._executor is not None)
+        executor = executor or self._executor
+        assert executor
 
-        td_output = getattr((executor if executor else self._executor), "Td")(
-            self._td_str
-        )
+        # Print each query once so that it is easier to reproduce regressions
+        # based on just the logs from CI
+        if executor.add_known_fragment(self._td_str):
+            print(self._td_str)
 
-        if measure:
-            lines = td_output.splitlines()
-            lines = [l for l in lines if l]
+        td_output = executor.Td(self._td_str)
 
-            start_time = self._get_time_for_marker(lines, "A")
-            end_time = self._get_time_for_marker(lines, "B")
-            diff = end_time - start_time
-            return diff
-        else:
-            return None
+        lines = td_output.splitlines()
+        lines = [l for l in lines if l]
 
-    def _get_time_for_marker(self, lines: List[str], marker: str) -> float:
+        timestamps = []
+        for marker in ["A", "B"]:
+            timestamp = self._get_time_for_marker(lines, marker)
+            if timestamp is not None:
+                timestamps.append(WallclockDuration(timestamp, MeasurementUnit.SECONDS))
+
+        return timestamps
+
+    def _get_time_for_marker(self, lines: list[str], marker: str) -> None | float:
         matched_line_id = None
         for id, line in enumerate(lines):
             if f"/* {marker} */" in line:
@@ -137,38 +84,28 @@ class Td(MeasurementSource):
                     assert "rows didn't match" in lines[id + 1]
                     matched_line_id = id + 2
                 else:
-                    assert False
+                    raise RuntimeError("row match not found")
 
-        assert matched_line_id, f"Unable to find marker /* {marker} */"
+        if not matched_line_id:
+            # Marker /* ... */ not found
+            return None
+
         matched_line = lines[matched_line_id]
         regex = re.search("at ts ([0-9.]+)", matched_line)
         assert regex, f"'at ts' string not found on line '{matched_line}'"
         return float(regex.group(1))
 
 
-class FileMeasurementSource(MeasurementSource):
-    """Read measurements from a file. Used for testing purposes"""
+class Lambda(MeasurementSource):
+    # Execute a lambda, such as Mz restart, within a benchmark() block and record the end timestamp
+    def __init__(self, _lambda: Callable) -> None:
+        self._lambda = _lambda
 
-    def __init__(self, file_name: str) -> None:
-        file_name = file_name
-        file = open(file_name)
-        lines = file.readlines()
-        self._data = [float(line.strip("\n")) for line in lines]
-
-
-class AbsoluteFactorMeasurementSource(MeasurementSource):
-    """Report measurements that are offset from some other set of measurements by
-    a constant factor. Used for testing purposes.
-    """
-
-    def __init__(self, source: MeasurementSource, factor: float) -> None:
-        self._data = [d + factor for d in source]
-
-
-class RelativeFactorMeasurementSource(MeasurementSource):
-    """Report measurements that are offset from some other set of measurements by
-    some relative factor. Used for testing purposes.
-    """
-
-    def __init__(self, source: MeasurementSource, factor: float) -> None:
-        self._data = [d * factor for d in source]
+    def run(
+        self,
+        executor: Executor | None = None,
+    ) -> list[WallclockDuration]:
+        e = executor or self._executor
+        assert e is not None
+        e.Lambda(self._lambda)
+        return [WallclockDuration(time.time(), MeasurementUnit.SECONDS)]

@@ -14,37 +14,80 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-{% macro materialize_get_columns(relation) -%}
-  {% call statement('get_columns', fetch_result=True, auto_begin=False) %}
-    show columns from {{ relation }}
-  {% endcall %}
-  {{ return(load_result('get_columns').table) }}
+-- Due to a PostgreSQL compatibility issue in processing aliases in the GROUP BY
+-- clause, we must override this macro.
+-- See: https://github.com/dbt-labs/dbt-postgres/blob/main/dbt/include/postgres/macros/relations.sql
+
+{% macro materialize__get_relations() -%}
+
+  {%- call statement('relations', fetch_result=True) -%}
+    with relation as (
+        select
+            pg_rewrite.ev_class as class,
+            pg_rewrite.oid as id
+        from pg_rewrite
+    ),
+    class as (
+        select
+            oid as id,
+            relname as name,
+            relnamespace as schema,
+            relkind as kind
+        from pg_class
+    ),
+    dependency as (
+        select distinct
+            objid as id,
+            refobjid as ref
+        from pg_depend
+    ),
+    schema as (
+        select
+            oid as id,
+            nspname as name
+        from pg_namespace
+        where nspname != 'information_schema' and nspname not like 'pg\_%'
+    ),
+    referenced as (
+        select
+            relation.id AS id,
+            referenced_class.name,
+            referenced_class.schema,
+            referenced_class.kind
+        from relation
+        join class as referenced_class on relation.class=referenced_class.id
+        where referenced_class.kind in ('r', 'v', 'm')
+    ),
+    relationships as (
+        select
+            referenced.name as referenced_name,
+            referenced.schema as referenced_schema_id,
+            dependent_class.name as dependent_name,
+            dependent_class.schema as dependent_schema_id,
+            referenced.kind as kind
+        from referenced
+        join dependency on referenced.id=dependency.id
+        join class as dependent_class on dependency.ref=dependent_class.id
+        where
+            (referenced.name != dependent_class.name or
+             referenced.schema != dependent_class.schema)
+    )
+
+    select
+        referenced_schema.name as referenced_schema,
+        relationships.referenced_name as referenced_name,
+        dependent_schema.name as dependent_schema,
+        relationships.dependent_name as dependent_name
+    from relationships
+    join schema as dependent_schema on relationships.dependent_schema_id=dependent_schema.id
+    join schema as referenced_schema on relationships.referenced_schema_id=referenced_schema.id
+    group by referenced_schema.name, referenced_name, dependent_schema.name, dependent_name
+    order by referenced_schema, referenced_name, dependent_schema, dependent_name;
+  {%- endcall -%}
+
+  {{ return(load_result('relations').table) }}
 {% endmacro %}
 
-{% macro materialize_get_full_views(schema) -%}
-  {% call statement('get_full_views', fetch_result=True, auto_begin=False) %}
-    show full views from {{ schema }}
-  {% endcall %}
-  {{ return(load_result('get_full_views').table) }}
-{% endmacro %}
-
-{% macro materialize_get_sources(schema) -%}
-  {% call statement('get_sources', fetch_result=True, auto_begin=False) %}
-    show sources from {{ schema }}
-  {% endcall %}
-  {{ return(load_result('get_sources').table) }}
-{% endmacro %}
-
-{% macro materialize_show_view(relation) -%}
-  {% call statement('show_view', fetch_result=True, auto_begin=False) %}
-    show create view {{ relation }}
-  {% endcall %}
-  {{ return(load_result('show_view').table) }}
-{% endmacro %}
-
-{% macro materialize_get_schemas() -%}
-  {% call statement('get_schemas', fetch_result=True, auto_begin=False) %}
-    show extended schemas
-  {% endcall %}
-  {{ return(load_result('get_schemas').table) }}
+{% macro materialize_get_relations() %}
+  {{ return(materialize__get_relations()) }}
 {% endmacro %}

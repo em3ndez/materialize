@@ -1,12 +1,12 @@
 ---
 title: "DROP SINK"
-description: "`DROP SINK` removes a sink from your Materialize instances."
+description: "`DROP SINK` removes a sink from Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`DROP SINK` removes a sink from your Materialize instances.
+`DROP SINK` removes a sink from Materialize.
 
 {{% kafka-sink-drop  %}}
 
@@ -20,20 +20,28 @@ _sink&lowbar;name_ | The sink you want to drop. You can find available sink name
 
 ## Examples
 
-```sql
+```mzsql
 SHOW SINKS;
 ```
 ```nofmt
 my_sink
 ```
-```sql
+```mzsql
 DROP SINK my_sink;
 ```
 ```nofmt
 DROP SINK
 ```
 
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of the dropped sink.
+- `USAGE` privileges on the containing schema.
+
 ## Related pages
 
 - [`SHOW SINKS`](../show-sinks)
 - [`CREATE SINK`](../create-sink)
+- [DROP OWNED](../drop-owned)

@@ -8,11 +8,9 @@
 # by the Apache License, Version 2.0.
 
 name: materialized
+description: Materialize is a fast, distributed SQL database built on streaming internals.
 pre-image:
   - type: cargo-build
-    bin: materialized
-    strip: false
-    extract:
-      krb5-src:
-        - install/bin/kinit
-        - install/bin/kdestroy
+    bin: [ materialized ]
+    bazel-bin:
+      materialized: "@//src/materialized:materialized"

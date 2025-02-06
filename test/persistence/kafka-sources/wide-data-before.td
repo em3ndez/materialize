@@ -37,27 +37,39 @@ $ set schema={
 
 $ kafka-create-topic topic=wide-data-ten
 
-$ kafka-ingest format=avro topic=wide-data-ten key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=10
+$ kafka-ingest format=avro topic=wide-data-ten key-format=avro key-schema=${keyschema} schema=${schema} repeat=10
 {"f1": ${kafka-ingest.iteration}} {"f2": ${kafka-ingest.iteration}}
 
-> CREATE MATERIALIZED SOURCE wide_data_ten
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-wide-data-ten-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE CONNECTION IF NOT EXISTS kafka_conn TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
+> CREATE SOURCE wide_data_ten
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-wide-data-ten-${testdrive.seed}');
+
+> CREATE TABLE wide_data_ten_tbl FROM SOURCE wide_data_ten (REFERENCE "testdrive-wide-data-ten-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE NONE;
 
-> CREATE MATERIALIZED VIEW wide_data_view AS SELECT wide_data_ten.f2 AS key, REPEAT('x', 512 * 1024) AS value FROM wide_data_ten;
+> CREATE MATERIALIZED VIEW wide_data_view AS SELECT wide_data_ten_tbl.f2 AS key, REPEAT('x', 512 * 1024) AS value FROM wide_data_ten_tbl;
 
 > CREATE SINK wide_data_sink FROM wide_data_view
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-wide-data-${testdrive.seed}'
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-wide-data-${testdrive.seed}')
   KEY (key) NOT ENFORCED
-  WITH (reuse_topic=true)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE UPSERT;
 
-> CREATE MATERIALIZED SOURCE wide_data_source
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-wide-data-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+$ kafka-verify-topic sink=materialize.public.wide_data_sink await-value-schema=true await-key-schema=true
+
+> CREATE SOURCE wide_data_source
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-wide-data-${testdrive.seed}');
+
+> CREATE TABLE wide_data_source_tbl FROM SOURCE wide_data_source (REFERENCE "testdrive-wide-data-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  INCLUDE KEY AS key2
   ENVELOPE UPSERT;
 
-> SELECT COUNT(*) = 10 FROM wide_data_source;
-true
+> SELECT COUNT(*) FROM wide_data_source_tbl;
+10

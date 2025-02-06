@@ -42,35 +42,27 @@ That way agents in the builder stack have a warm Cargo and Docker cache, and
 will typically build much faster because they don't need to recompile all
 dependencies.
 
-## Build caching
-
-We once used sccache, a distributed build cache from Mozilla, to share built
-artifacts between agents. Unfortunately, for reasons Nikhil never fully tracked
-down, setting `RUSTC_WRAPPER=sccache` was causing Cargo to always build from
-scratch, a process that was taking 7m+ at the time sccache was removed. Even
-back when things were configured correctly, sccache was unable to cache a
-number of crates, e.g., crates with a build script could not be cached. The
-trouble doesn't seem worth it, unless sccache becomes far more mature.
-
-The current approach is to limit the number of agents that actually build
-Rust to the minimum possible. These agents thus wind up with a warm local Cargo
-cache (i.e., the cache in the `target` directory, which is quite a bit more
-reliable than sccache), and typically only need to rebuild the first-party
-crates that have changed.
-
-These agents build a number of Docker images, each with a name starting with
-`ci-, that are pushed to Docker Hub. Future steps in the build pipeline run
-tests by downloading and orchestrating these Docker images appropriately,
-effectively using Docker Hub for intra-build artifact storage. This system
-isn't ideal, but it's much faster than having each build step compile its own
-binaries.
-
 Note that most of these Docker images don't contain debug symbols, which can
 make debugging CI failures quite challenging, as backtraces won't contain
 function names, only program counters. (The debug symbols are too large to ship
 to Docker Hub; the `ci-test` image would generate several gigabytes of debug
 symbols!) Whenever possible, try to reproduce the CI failure locally to get a
 real backtrace.
+
+Build agents sometimes become corrupted and start failing all builds assigned to
+them (e.g., because they run out of disk space). If this happens, you can
+navigate to the build agent page in the navigation bar, find the affected agent,
+and press the "Stop agent" button to terminate the agent. A new agent will spin
+up automatically within a minute or two to replace the stopped agent, so feel
+free to be aggressive with stopping agents. You can determine which agent ran a
+given build job under the "Timeline" tab, listed above the build job's log
+output.
+
+## Build caching
+
+We configure [`sccache`](https://github.com/mozilla/sccache) to write
+compilation artifacts to an S3 bucket that is shared amongst the build agents.
+This makes from-scratch compilation on a fresh agent *much* faster.
 
 ## macOS agent
 
@@ -95,6 +87,50 @@ export AWS_ACCESS_KEY_ID=<redacted>
 export AWS_SECRET_ACCESS_KEY=<redacted>
 export PATH=$HOME/.cargo/bin:$PATH
 % brew services start buildkite-agent
+```
+
+To reduce the frequency of issues due to disk space being full, we
+clear the Rust target directories every week at midnight Sunday morning.
+Create the following script at `~/Library/Scripts/clean-target.sh`:
+
+```bash
+#!/usr/bin/env bash
+name="mac-1" # mac-2 on ARM
+rm -rf /opt/builds/$name/materialize/{tests,deploy}/target
+```
+
+And the following file at `~/Library/LaunchAgents/com.materialize.clean-target.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.materialize.clean-target</string>
+    <key>Program</key>
+    <string>/Users/administrator/Library/Scripts/clean-target.sh</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>0</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+</dict>
+</plist>
+```
+
+Then execute the following commands:
+
+```shell
+chmod u+x ~/Library/Scripts/clean-target.sh
+# This needs a `launchctl unload` first, if you're iterating and
+# it's already loaded. Otherwise it will fail with an obscure error.
+launchctl load ~/Library/LaunchAgents/com.materialize.clean-target.plist
+launchctl enable user/`id -u`/com.materialize.clean-target
 ```
 
 Our goal is to build binaries that will run on the last three macOS versions on
@@ -222,16 +258,16 @@ Launched instances:
 ```
 
 <small>* You may need to update the instance type and AMI above as we upgrade our Buildkite agents. The latest Buildkite AMI is available [here][elastic-yml] under
-the `AWSRegion2AMI` heading. Use the AMI for `us-east-2` and `linuxamd64`.</small>
+the `AWSRegion2AMI` heading. Use the AMI for `us-east-1` and `linuxamd64`.</small>
 
 This will create an EC2 instance that looks like a CI agent and push your local
 copy of the repository to it. You can SSH in to the agent using the instance ID
 printed by the previous command and run the CI job that is failing.
 
 Every CI job is a combination of an mzcompose "composition" and a "workflow". A
-composition is the name of a directory containing an mzcompose.yml or
-mzworkflows.py file. A workflow is the name of a service or Python function to
-run within the composition. You can see the definition of each CI job in
+composition is the name of a directory containing a mzcompose.py file. A
+workflow is the name of a service or Python function to run within the
+composition. You can see the definition of each CI job in
 [ci/test/pipeline.template.yml](./test/pipeline.template.yml). To invoke a
 workflow manually, you run `bin/mzcompose --find COMPOSITION run WORKFLOW`.
 
@@ -240,7 +276,7 @@ For example, here's how you'd run the testdrive job on the EC2 instance:
 ```
 bin/scratch ssh INSTANCE-ID
 cd materialize
-bin/mzcompose --find testdrive run testdrive-ci
+bin/mzcompose --find testdrive run default
 ```
 
 If the test fails like it did in CI, you're set! You now have a reliable way to

@@ -7,51 +7,68 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default default-storage-size=1
+
 # Test ingestion of and selection from a simple bytes-formatted topic.
 
-$ kafka-create-topic topic=bytes
+$ kafka-create-topic topic=bytes partitions=1
 
 $ kafka-ingest format=bytes topic=bytes timestamp=1
 ©1
 ©2
 
-> CREATE MATERIALIZED SOURCE data
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-bytes-${testdrive.seed}'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE CLUSTER data_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE data
+  IN CLUSTER data_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-bytes-${testdrive.seed}')
+
+> CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-bytes-${testdrive.seed}")
   FORMAT BYTES
+  INCLUDE OFFSET
 
-> SHOW COLUMNS FROM data
-name       nullable  type
---------------------------
-data       false     bytea
-mz_offset  false     bigint
+> SHOW COLUMNS FROM data_tbl
+name       nullable  type    comment
+------------------------------------
+data       false     bytea   ""
+offset     false     uint8   ""
 
-> SELECT * FROM data
-data           mz_offset
+> SELECT * FROM data_tbl
+data           offset
 ------------------------
-"\\xc2\\xa91"  1
-"\\xc2\\xa92"  2
+"\\xc2\\xa91"  0
+"\\xc2\\xa92"  1
 
 # Test that CREATE SOURCE can specify a custom name for the column.
 
-> CREATE MATERIALIZED SOURCE data_named_col (named_col)
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-bytes-${testdrive.seed}'
+> CREATE CLUSTER data_named_col_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE data_named_col
+  IN CLUSTER data_named_col_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-bytes-${testdrive.seed}')
+
+> CREATE TABLE data_named_col_tbl (named_col) FROM SOURCE data_named_col (REFERENCE "testdrive-bytes-${testdrive.seed}")
   FORMAT BYTES
 
-> SHOW COLUMNS FROM data_named_col
-name       nullable  type
---------------------------
-named_col  false     bytea
-mz_offset  false     bigint
+> SHOW COLUMNS FROM data_named_col_tbl
+name       nullable  type   comment
+-----------------------------------
+named_col  false     bytea  ""
 
-> CREATE MATERIALIZED SOURCE data_offset
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-bytes-${testdrive.seed}'
-  WITH (start_offset=1)
+> CREATE CLUSTER data_offset_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE data_offset
+  IN CLUSTER data_offset_cluster
+  FROM KAFKA CONNECTION kafka_conn (START OFFSET=[1], TOPIC 'testdrive-bytes-${testdrive.seed}')
+
+> CREATE TABLE data_offset_tbl FROM SOURCE data_offset (REFERENCE "testdrive-bytes-${testdrive.seed}")
   FORMAT BYTES
+  INCLUDE OFFSET
 
-> SELECT * FROM data_offset
-data           mz_offset
+> SELECT * FROM data_offset_tbl
+data           offset
 ------------------------
-"\\xc2\\xa92"  2
+"\\xc2\\xa92"  1
 
 $ kafka-create-topic topic=bytes-partitions partitions=2
 
@@ -61,12 +78,16 @@ $ kafka-ingest format=bytes topic=bytes-partitions timestamp=1 partition=0
 $ kafka-ingest format=bytes topic=bytes-partitions timestamp=1 partition=1
 ©2
 
-> CREATE MATERIALIZED SOURCE data_offset_2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-bytes-partitions-${testdrive.seed}'
-  WITH (start_offset=[0,1])
-  FORMAT BYTES
+> CREATE CLUSTER data_offset_2_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE data_offset_2
+  IN CLUSTER data_offset_2_cluster
+  FROM KAFKA CONNECTION kafka_conn (START OFFSET=[0,1], TOPIC 'testdrive-bytes-partitions-${testdrive.seed}')
 
-> SELECT * FROM data_offset_2
-data           mz_offset
+> CREATE TABLE data_offset_2_tbl FROM SOURCE data_offset_2 (REFERENCE "testdrive-bytes-partitions-${testdrive.seed}")
+  FORMAT BYTES
+  INCLUDE OFFSET
+
+> SELECT * FROM data_offset_2_tbl
+data           offset
 ------------------------
-"\\xc2\\xa91"  1
+"\\xc2\\xa91"  0

@@ -1,50 +1,35 @@
 ---
 title: "SHOW TYPES"
-description: "`SHOW TYPES` returns a list of the data types in your Materialize instance."
+description: "`SHOW TYPES` returns a list of the data types in Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`SHOW TYPES` returns a list of the data types in your Materialize instance. By default, only custom types are returned.
+`SHOW TYPES` returns a list of the data types in Materialize. Only custom types
+are returned.
 
 ## Syntax
 
-{{< diagram "show-types.svg" >}}
+```mzsql
+SHOW TYPES [FROM <schema_name>]
+```
 
-Field | Use
-------|-----
-`EXTENDED` |  Returns system types as well as user-created types. By default, only user-created types are returned.
-`FULL`| Returns the creator of the data type (user or system).
+Option                 | Description
+-----------------------|------------
+**FROM** <schema_name> | If specified, only show types from the specified schema. Defaults to first resolvable schema in the search path. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
 
 ## Examples
 
 ### Show custom data types
 
-```sql
+```mzsql
 SHOW TYPES;
 ```
 ```
-      name
-----------------
-  int4_list
-```
-
-### Show all data types
-
-```sql
-SHOW EXTENDED FULL TYPES;
-```
-```
-     name       |  type
-----------------+--------
- _bool          | system
- _bytea         | system
- _date          | system
- _float4        | system
- _float8        | system
- int4_list      | user
-...
+   name
+-----------
+ int4_list
 ```
 
 ## Related pages

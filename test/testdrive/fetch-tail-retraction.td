@@ -1,4 +1,3 @@
-
 # Copyright Materialize, Inc. and contributors. All rights reserved.
 #
 # Use of this software is governed by the Business Source License
@@ -9,7 +8,7 @@
 # by the Apache License, Version 2.0.
 
 #
-# Observe the retraction of records from a TAIL stream
+# Observe the retraction of records from a SUBSCRIBE stream
 #
 
 $ set-regex match=\d{13} replacement=<TIMESTAMP>
@@ -29,7 +28,7 @@ $ set-regex match=\d{13} replacement=<TIMESTAMP>
 
 > BEGIN
 
-> DECLARE c CURSOR FOR TAIL v1;
+> DECLARE c CURSOR FOR SUBSCRIBE v1;
 
 > FETCH 2 c;
 <TIMESTAMP> 2 123
@@ -43,9 +42,9 @@ $ set-regex match=\d{13} replacement=<TIMESTAMP>
 # that no erroneous retractions will be issued.
 #
 
-$ postgres-execute connection=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-execute connection=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 INSERT INTO deletes VALUES (123), (123), (NULL), (999);
-SELECT * FROM v1 AS OF NOW();
+SELECT * FROM v1;
 
 > FETCH ALL c;
 <TIMESTAMP> -2 123

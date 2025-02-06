@@ -21,11 +21,14 @@
 // The original source code is subject to the terms of the MIT license, a copy
 // of which can be found in the LICENSE file at the root of this repository.
 
-use crate::types::ScalarKind;
-use crate::{util::TsUnit, ParseSchemaError, SchemaResolutionError};
-
-use fmt::{Debug, Display};
 use std::fmt;
+
+use chrono::NaiveDateTime;
+use fmt::{Debug, Display};
+
+use crate::types::ScalarKind;
+use crate::util::TsUnit;
+use crate::{ParseSchemaError, SchemaResolutionError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeError {
@@ -41,8 +44,7 @@ pub enum DecodeError {
     ExpectedNonnegInteger(i64),
     BadTimestamp {
         unit: TsUnit,
-        seconds: i64,
-        fraction: u32,
+        value: i64,
     },
     BadBoolean(u8),
     BadDate(i32),
@@ -87,12 +89,21 @@ pub enum DecodeError {
     I32OutOfRange(i64),
     IntConversionError,
     IntDecodeOverflow,
-    BadJson(serde_json::error::Category),
+    BadJson {
+        category: serde_json::error::Category,
+        /// A string representation of what we attempted to decode.
+        /// Ideally the original bytes,
+        /// but might be a re-serialization of a deserialized value,
+        /// if we no longer have access to the original.
+        bytes: Vec<u8>,
+    },
     BadUuid(uuid::Error),
     MismatchedBlockHeader {
         expected: [u8; 16],
         actual: [u8; 16],
     },
+    DateOutOfRange(i32),
+    TimestampOutOfRange(NaiveDateTime),
     Custom(String),
 }
 
@@ -108,11 +119,9 @@ impl DecodeError {
             DecodeError::ExpectedNonnegInteger(i) => {
                 write!(f, "Expected non-negative integer, got {}", i)
             }
-            DecodeError::BadTimestamp {
-                unit,
-                seconds,
-                fraction,
-            } => write!(f, "Invalid {} timestamp {}.{}", unit, seconds, fraction),
+            DecodeError::BadTimestamp { unit, value } => {
+                write!(f, "Invalid timestamp {value} {unit}")
+            }
             DecodeError::BadBoolean(byte) => write!(f, "Invalid boolean: {:x}", byte),
             DecodeError::BadDate(since_epoch) => {
                 write!(f, "Invalid num days since epoch: {}", since_epoch)
@@ -166,13 +175,20 @@ impl DecodeError {
             DecodeError::StringUtf8Error => write!(f, "String was not valid UTF-8"),
             DecodeError::UuidUtf8Error => write!(f, "UUID was not valid UTF-8"),
             DecodeError::IntConversionError => write!(f, "Integer conversion failed"),
-            DecodeError::BadJson(inner_kind) => write!(f, "Json decoding failed: {:?}", inner_kind),
+            DecodeError::BadJson { category, bytes } => {
+                write!(f, "Json decoding failed: {:?}", category)?;
+                write!(f, " (got {})", String::from_utf8_lossy(bytes))
+            }
             DecodeError::BadUuid(inner) => write!(f, "UUID decoding failed: {}", inner),
             DecodeError::MismatchedBlockHeader { expected, actual } => write!(
                 f,
                 "Block marker ({:x?}) does not match header marker ({:x?})",
                 actual, expected
             ),
+            DecodeError::DateOutOfRange(inner) => write!(f, "Date out of range: {}", inner),
+            DecodeError::TimestampOutOfRange(inner) => {
+                write!(f, "Timestamp out of range: {}", inner)
+            }
         }
     }
 }

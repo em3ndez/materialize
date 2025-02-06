@@ -7,7 +7,19 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default default-storage-size=1
+$ set-arg-default single-replica-cluster=quickstart
+
+$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+ALTER SYSTEM SET max_clusters = 20
+
 # Test support for Avro sources without using the Confluent Schema Registry.
+
+$ set key-schema={
+    "type": "record",
+    "name": "Key",
+    "fields": [{"name": "a", "type": "long"}]
+  }
 
 $ set schema={
     "type": "record",
@@ -62,6 +74,7 @@ $ set schema={
         ]
       },
       { "name": "after", "type": ["row", "null"] },
+      { "name": "op", "type": "string" },
       {
         "name": "source",
         "type": {
@@ -99,104 +112,30 @@ $ set schema={
     ]
   }
 
-$ kafka-create-topic topic=data
+$ kafka-create-topic topic=data partitions=1
 
 $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"row": {"a": 1, "b": 1, "json": "null", "c": "True", "d": "False", "e": {"nested_data_1": {"n1_a": 42, "n1_b": {"double": 86.5}}}, "f": null}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"boolean": false}}}
-{"before": null, "after": {"row": {"a": 2, "b": 3, "json": "{\"hello\": \"world\"}", "c": "False", "d": "FileNotFound", "e": {"nested_data_1": {"n1_a": 43, "n1_b":{"nested_data_2": {"n2_a": 44, "n2_b": -1}}}}, "f": {"nested_data_2": {"n2_a": 45, "n2_b": -2}}}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"boolean": false}}}
-{"before": null, "after": {"row": {"a": -1, "b": 7, "json": "[1, 2, 3]", "c": "FileNotFound", "d": "True", "e": null, "f": null}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"boolean": false}}}
+{"before": null, "after": {"row": {"a": 1, "b": 1, "json": "null", "c": "True", "d": "False", "e": {"nested_data_1": {"n1_a": 42, "n1_b": {"double": 86.5}}}, "f": null}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"boolean": false}}, "op": "c"}
+{"before": null, "after": {"row": {"a": 2, "b": 3, "json": "{\"hello\": \"world\"}", "c": "False", "d": "FileNotFound", "e": {"nested_data_1": {"n1_a": 43, "n1_b":{"nested_data_2": {"n2_a": 44, "n2_b": -1}}}}, "f": {"nested_data_2": {"n2_a": 45, "n2_b": -2}}}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"boolean": false}}, "op": "c"}
+{"before": null, "after": {"row": {"a": -1, "b": 7, "json": "[1, 2, 3]", "c": "FileNotFound", "d": "True", "e": null, "f": null}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"boolean": false}}, "op": "c"}
 
-# We should refuse to create a source with invalid WITH options
-! CREATE MATERIALIZED SOURCE invalid_with_option
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  WITH (
-      badoption = true,
-      deduplication = 'full_in_range',
-      deduplication_pad_start = '2020-09-13 10:00:00',
-      deduplication_start = '2020-09-13 12:26:00',
-      deduplication_end = '2020-09-13 13:00:00'
-  )
-  FORMAT AVRO USING SCHEMA '${schema}'
-  ENVELOPE DEBEZIUM
-unexpected parameters for CREATE SOURCE: badoption
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > SHOW SOURCES
-name
-----
+name    type   cluster   comment
+--------------------------------
 
+# [btv] uncomment if we bring back classic debezium mode
+# ! CREATE SOURCE fast_forwarded
+#   IN CLUSTER ${arg.single-replica-cluster}
+#   FROM KAFKA CONNECTION kafka_conn (START OFFSET=[2], TOPIC 'testdrive-data-${testdrive.seed}')
 
-# Create a source using an inline schema.
-
-> CREATE MATERIALIZED SOURCE data_schema_inline
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${schema}'
-  ENVELOPE DEBEZIUM
-
-> SHOW CREATE SOURCE data_schema_inline
-Source   "Create Source"
-------------------------
-materialize.public.data_schema_inline "CREATE SOURCE \"materialize\".\"public\".\"data_schema_inline\" FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}' FORMAT AVRO USING SCHEMA \'{   \"type\": \"record\",   \"name\": \"envelope\",   \"fields\": [     {       \"name\": \"before\",       \"type\": [         {           \"name\": \"row\",           \"type\": \"record\",           \"fields\": [             {\"name\": \"a\", \"type\": \"long\"},             {\"name\": \"b\", \"type\": \"long\"},             {               \"name\": \"json\",               \"type\": {                 \"connect.name\": \"io.debezium.data.Json\",                 \"type\": \"string\"               }             },             {               \"name\": \"c\",               \"type\": {                 \"type\": \"enum\",                 \"name\": \"Bool\",                 \"symbols\": [\"True\", \"False\", \"FileNotFound\"]               }             },             {\"name\": \"d\", \"type\": \"Bool\"},             {\"name\": \"e\", \"type\": [\"null\",{               \"type\": \"record\",               \"name\": \"nested_data_1\",               \"fields\": [                   {\"name\": \"n1_a\", \"type\": \"long\"},                   {\"name\": \"n1_b\", \"type\": [\"null\", \"double\", {                       \"type\": \"record\",                       \"name\": \"nested_data_2\",                       \"fields\": [                         {\"name\": \"n2_a\", \"type\": \"long\"},                         {\"name\": \"n2_b\", \"type\": \"int\"}                       ]                     }]                   }                 ]               }]             },             {\"name\": \"f\", \"type\": [\"null\", \"nested_data_2\"]}           ]         },         \"null\"       ]     },     { \"name\": \"after\", \"type\": [\"row\", \"null\"] },     {       \"name\": \"source\",       \"type\": {         \"type\": \"record\",         \"name\": \"Source\",         \"namespace\": \"io.debezium.connector.mysql\",         \"fields\": [           {             \"name\": \"file\",             \"type\": \"string\"           },           {             \"name\": \"pos\",             \"type\": \"long\"           },           {             \"name\": \"row\",             \"type\": \"int\"           },           {             \"name\": \"snapshot\",             \"type\": [               {                 \"type\": \"boolean\",                 \"connect.default\": false               },               \"null\"             ],             \"default\": false           }         ],         \"connect.name\": \"io.debezium.connector.mysql.Source\"       }     }   ] }\' ENVELOPE DEBEZIUM"
-
-> SELECT a, b, json, c, d, e::text, f::text FROM data_schema_inline
-a  b  json                     c            d             e                   f
-------------------------------------------------------------------------------------
-1  1  null                     True         False         "(42,86.5,)"        <null>
-2  3  "{\"hello\":\"world\"}"  False        FileNotFound  "(43,,\"(44,-1)\")" (45,-2)
--1  7 "[1,2,3]"                FileNotFound True          <null>              <null>
-
-> CREATE MATERIALIZED SOURCE fast_forwarded
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  WITH (start_offset=2)
-  FORMAT AVRO USING SCHEMA '${schema}'
-  ENVELOPE DEBEZIUM
-
-> SELECT a, b, json, c, d FROM fast_forwarded
-a  b  json            c            d
----------------------------------------
--1  7 "[1,2,3]"       FileNotFound True
-
-# Check that repeated Debezium messages are skipped.
-$ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"row": {"a": 2, "b": 3, "json": "{\"hello\": \"world\"}", "c": "False", "d": "FileNotFound", "e": null, "f": null}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"boolean": false}}}
-{"before": null, "after": {"row": {"a": 42, "b": 19, "json": "[4, 5, 6]", "c": "FileNotFound", "d": "True", "e": null, "f": null}}, "source": {"file": "binlog2", "pos": 1, "row": 1, "snapshot": {"boolean": false}}}
-
-> SELECT a, b, json, c, d, e::text, f::text FROM data_schema_inline
-a  b  json                     c            d             e                   f
-------------------------------------------------------------------------------------
-1  1  null                     True         False         "(42,86.5,)"        <null>
-2  3  "{\"hello\":\"world\"}"  False        FileNotFound  "(43,,\"(44,-1)\")" (45,-2)
--1  7 "[1,2,3]"                FileNotFound True          <null>              <null>
-42 19 "[4,5,6]"                FileNotFound True          <null>              <null>
-
-# Create a source using a file schema. This should fail if the named schema file
-# does not exist.
-
-! CREATE MATERIALIZED SOURCE data_schema_file
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA FILE 'data-schema.json'
-  ENVELOPE DEBEZIUM
-No such file or directory
-
-$ file-append path=data-schema.json
-\${schema}
-
-> CREATE MATERIALIZED SOURCE data_schema_file
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA FILE '${testdrive.temp-dir}/data-schema.json'
-  ENVELOPE DEBEZIUM
-
-> SHOW CREATE SOURCE data_schema_file
-Source   "Create Source"
-------------------------
-materialize.public.data_schema_file  "CREATE SOURCE \"materialize\".\"public\".\"data_schema_file\" FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}' FORMAT AVRO USING SCHEMA \'{   \"type\": \"record\",   \"name\": \"envelope\",   \"fields\": [     {       \"name\": \"before\",       \"type\": [         {           \"name\": \"row\",           \"type\": \"record\",           \"fields\": [             {\"name\": \"a\", \"type\": \"long\"},             {\"name\": \"b\", \"type\": \"long\"},             {               \"name\": \"json\",               \"type\": {                 \"connect.name\": \"io.debezium.data.Json\",                 \"type\": \"string\"               }             },             {               \"name\": \"c\",               \"type\": {                 \"type\": \"enum\",                 \"name\": \"Bool\",                 \"symbols\": [\"True\", \"False\", \"FileNotFound\"]               }             },             {\"name\": \"d\", \"type\": \"Bool\"},             {\"name\": \"e\", \"type\": [\"null\",{               \"type\": \"record\",               \"name\": \"nested_data_1\",               \"fields\": [                   {\"name\": \"n1_a\", \"type\": \"long\"},                   {\"name\": \"n1_b\", \"type\": [\"null\", \"double\", {                       \"type\": \"record\",                       \"name\": \"nested_data_2\",                       \"fields\": [                         {\"name\": \"n2_a\", \"type\": \"long\"},                         {\"name\": \"n2_b\", \"type\": \"int\"}                       ]                     }]                   }                 ]               }]             },             {\"name\": \"f\", \"type\": [\"null\", \"nested_data_2\"]}           ]         },         \"null\"       ]     },     { \"name\": \"after\", \"type\": [\"row\", \"null\"] },     {       \"name\": \"source\",       \"type\": {         \"type\": \"record\",         \"name\": \"Source\",         \"namespace\": \"io.debezium.connector.mysql\",         \"fields\": [           {             \"name\": \"file\",             \"type\": \"string\"           },           {             \"name\": \"pos\",             \"type\": \"long\"           },           {             \"name\": \"row\",             \"type\": \"int\"           },           {             \"name\": \"snapshot\",             \"type\": [               {                 \"type\": \"boolean\",                 \"connect.default\": false               },               \"null\"             ],             \"default\": false           }         ],         \"connect.name\": \"io.debezium.connector.mysql.Source\"       }     }   ] }\n\' WITH (\"confluent_wire_format\" = true) ENVELOPE DEBEZIUM"
-
-> SELECT a, b, json, c, d FROM data_schema_file
-a  b  json                     c            d
---------------------------------------------------------
-1  1  null                     True         False
-2  3  "{\"hello\":\"world\"}"  False        FileNotFound
--1  7 "[1,2,3]"                FileNotFound True
-42 19 "[4,5,6]"                FileNotFound True
+# ! CREATE TABLE fast_forwarded_tbl FROM SOURCE fast_forwarded (REFERENCE "testdrive-data-${testdrive.seed}")
+#   KEY FORMAT AVRO USING SCHEMA '${key-schema}'
+#   VALUE FORMAT AVRO USING SCHEMA '${schema}'
+#   ENVELOPE DEBEZIUM
+# contains:START OFFSET is not supported with ENVELOPE DEBEZIUM
 
 # Test an Avro source without a Debezium envelope.
 
@@ -209,18 +148,22 @@ $ set non-dbz-schema={
     ]
   }
 
-$ kafka-create-topic topic=non-dbz-data
+$ kafka-create-topic topic=non-dbz-data partitions=1
 
 $ kafka-ingest format=avro topic=non-dbz-data schema=${non-dbz-schema} timestamp=1
 {"a": 1, "b": 2}
 {"a": 2, "b": 3}
 
-> CREATE MATERIALIZED SOURCE non_dbz_data
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-${testdrive.seed}'
+> CREATE CLUSTER non_dbz_data_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data
+  IN CLUSTER non_dbz_data_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-non-dbz-data-${testdrive.seed}')
+
+> CREATE TABLE non_dbz_data_tbl FROM SOURCE non_dbz_data (REFERENCE "testdrive-non-dbz-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data
+> SELECT * FROM non_dbz_data_tbl
 a b
 ---
 1 2
@@ -228,36 +171,37 @@ a b
 
 # test INCLUDE metadata
 
-! CREATE MATERIALIZED SOURCE non_dbz_data_metadata
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
-  INCLUDE TOPIC
-  ENVELOPE NONE
-INCLUDE TOPIC not yet supported
+> CREATE CLUSTER non_dbz_data_metadata_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_metadata
+  IN CLUSTER non_dbz_data_metadata_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-non-dbz-data-${testdrive.seed}')
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_metadata
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-${testdrive.seed}'
+> CREATE TABLE non_dbz_data_metadata_tbl FROM SOURCE non_dbz_data_metadata (REFERENCE "testdrive-non-dbz-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   INCLUDE PARTITION, OFFSET
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data_metadata
+> SELECT * FROM non_dbz_data_metadata_tbl
 a b partition offset
 --------------------
-1 2 0         1
-2 3 0         2
+1 2 0         0
+2 3 0         1
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_metadata_named
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-${testdrive.seed}'
+> CREATE CLUSTER non_dbz_data_metadata_named_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_metadata_named
+  IN CLUSTER non_dbz_data_metadata_named_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-non-dbz-data-${testdrive.seed}')
+
+> CREATE TABLE non_dbz_data_metadata_named_tbl FROM SOURCE non_dbz_data_metadata_named (REFERENCE "testdrive-non-dbz-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   INCLUDE PARTITION as part, OFFSET as mzo
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data_metadata_named
+> SELECT * FROM non_dbz_data_metadata_named_tbl
 a b  part  mzo
 --------------
-1 2  0     1
-2 3  0     2
+1 2  0     0
+2 3  0     1
 
 # Test an Avro source without a Debezium envelope starting at specified partition offsets.
 
@@ -269,47 +213,59 @@ $ kafka-ingest format=avro topic=non-dbz-data-multi-partition schema=${non-dbz-s
 $ kafka-ingest format=avro topic=non-dbz-data-multi-partition schema=${non-dbz-schema} timestamp=1 partition=0
 {"a": 1, "b": 2}
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_multi_partition
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}'
-  WITH (start_offset=1)
+> CREATE CLUSTER non_dbz_data_multi_partition_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_multi_partition
+  IN CLUSTER non_dbz_data_multi_partition_cluster
+  FROM KAFKA CONNECTION kafka_conn (START OFFSET=[1], TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}')
+
+> CREATE TABLE non_dbz_data_multi_partition_tbl FROM SOURCE non_dbz_data_multi_partition (REFERENCE "testdrive-non-dbz-data-multi-partition-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data_multi_partition
+> SELECT * FROM non_dbz_data_multi_partition_tbl
 a  b
 -----
 4  1
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_multi_partition_2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}'
-  WITH (start_offset=[0,0])
+> CREATE CLUSTER non_dbz_data_multi_partition_2_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_multi_partition_2
+  IN CLUSTER non_dbz_data_multi_partition_2_cluster
+  FROM KAFKA CONNECTION kafka_conn (START OFFSET=[0,0], TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}')
+
+> CREATE TABLE non_dbz_data_multi_partition_2_tbl FROM SOURCE non_dbz_data_multi_partition_2 (REFERENCE "testdrive-non-dbz-data-multi-partition-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data_multi_partition_2
+> SELECT * FROM non_dbz_data_multi_partition_2_tbl
 a  b
 -----
 1  2
 4  1
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_multi_partition_fast_forwarded
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}'
-  WITH (start_offset=[0,1])
+> CREATE CLUSTER non_dbz_data_multi_partition_fast_forwarded_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_multi_partition_fast_forwarded
+  IN CLUSTER non_dbz_data_multi_partition_fast_forwarded_cluster
+  FROM KAFKA CONNECTION kafka_conn (START OFFSET=[0,1], TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}')
+
+> CREATE TABLE non_dbz_data_multi_partition_fast_forwarded_tbl FROM SOURCE non_dbz_data_multi_partition_fast_forwarded (REFERENCE "testdrive-non-dbz-data-multi-partition-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data_multi_partition_fast_forwarded
+> SELECT * FROM non_dbz_data_multi_partition_fast_forwarded_tbl
 a  b
 ----
 1  2
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_multi_partition_fast_forwarded_2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}'
-  WITH (start_offset=[1,0])
+> CREATE CLUSTER non_dbz_data_multi_partition_fast_forwarded_2_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_multi_partition_fast_forwarded_2
+  IN CLUSTER non_dbz_data_multi_partition_fast_forwarded_2_cluster
+  FROM KAFKA CONNECTION kafka_conn (START OFFSET=[1,0], TOPIC 'testdrive-non-dbz-data-multi-partition-${testdrive.seed}')
+
+> CREATE TABLE non_dbz_data_multi_partition_fast_forwarded_2_tbl FROM SOURCE non_dbz_data_multi_partition_fast_forwarded_2 (REFERENCE "testdrive-non-dbz-data-multi-partition-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data_multi_partition_fast_forwarded_2
+> SELECT * FROM non_dbz_data_multi_partition_fast_forwarded_2_tbl
 a  b
 ----
 4  1
@@ -321,30 +277,24 @@ $ kafka-create-topic topic=non-dbz-data-varying-partition partitions=1
 $ kafka-ingest format=avro topic=non-dbz-data-varying-partition schema=${non-dbz-schema} timestamp=1 partition=0
 {"a": 5, "b": 6}
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_varying_partition
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-varying-partition-${testdrive.seed}'
-  WITH (start_offset=1, topic_metadata_refresh_interval_ms=10)
+> CREATE CLUSTER non_dbz_data_varying_partition_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_varying_partition
+  IN CLUSTER non_dbz_data_varying_partition_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+    TOPIC 'testdrive-non-dbz-data-varying-partition-${testdrive.seed}',
+    START OFFSET=[1]
+  )
+
+> CREATE TABLE non_dbz_data_varying_partition_tbl FROM SOURCE non_dbz_data_varying_partition (REFERENCE "testdrive-non-dbz-data-varying-partition-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
 
-> SELECT * FROM non_dbz_data_varying_partition
-
-# Erroneously adds start_offsets for non-existent partitions.
-> CREATE MATERIALIZED SOURCE non_dbz_data_varying_partition_2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-varying-partition-${testdrive.seed}'
-  WITH (start_offset=[0,1], topic_metadata_refresh_interval_ms=10)
-  FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
-  ENVELOPE NONE
-
-> SELECT * FROM non_dbz_data_varying_partition_2
-a  b
-----
-5  6
+> SELECT * FROM non_dbz_data_varying_partition_tbl
 
 $ kafka-add-partitions topic=non-dbz-data-varying-partition total-partitions=2
 
 # Reading data that's ingested to a new partition takes longer than the default timeout.
-$ set-sql-timeout duration=60s
+$ set-sql-timeout duration=180s
 
 $ kafka-ingest format=avro topic=non-dbz-data-varying-partition schema=${non-dbz-schema} timestamp=1 partition=1
 {"a": 7, "b": 8}
@@ -352,23 +302,21 @@ $ kafka-ingest format=avro topic=non-dbz-data-varying-partition schema=${non-dbz
 
 # Because the start offset for any new partitions will be 0, the first record sent to the new
 # partition will be included.
-> SELECT * FROM non_dbz_data_varying_partition
+> SELECT * FROM non_dbz_data_varying_partition_tbl
 a  b
 -----
 7  8
 9  10
 
-# Because the start offsets erronously included an offset for partition 1 (which didn't exist at the time),
-# the first record ingested into partition 1 will be ignored.
-> SELECT * FROM non_dbz_data_varying_partition_2
-a  b
------
-5  6
-9  10
+> CREATE CLUSTER non_dbz_data_varying_partition_2_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_dbz_data_varying_partition_2
+  IN CLUSTER non_dbz_data_varying_partition_2_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+    TOPIC 'testdrive-non-dbz-data-varying-partition-${testdrive.seed}',
+    START OFFSET=[1,1]
+  )
 
-> CREATE MATERIALIZED SOURCE non_dbz_data_varying_partition_3
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-varying-partition-${testdrive.seed}'
-  WITH (start_offset=[1,1], topic_metadata_refresh_interval_ms=10)
+> CREATE TABLE non_dbz_data_varying_partition_2_tbl FROM SOURCE non_dbz_data_varying_partition_2 (REFERENCE "testdrive-non-dbz-data-varying-partition-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
 
@@ -379,13 +327,13 @@ $ kafka-ingest format=avro topic=non-dbz-data-varying-partition schema=${non-dbz
 
 # Because the start offset for any new partitions will be 0, the first record sent to the new
 # partition will be included.
-> SELECT * FROM non_dbz_data_varying_partition_3
+> SELECT * FROM non_dbz_data_varying_partition_2_tbl
 a  b
 -----
 9  10
 11 12
 
-$ set-sql-timeout duration=12.7s
+$ set-sql-timeout duration=default
 
 # Source with new-style three-valued "snapshot".
 $ set new-dbz-schema={
@@ -407,6 +355,7 @@ $ set new-dbz-schema={
         ]
       },
       { "name": "after", "type": ["row", "null"] },
+      { "name": "op", "type": "string" },
       {
         "name": "source",
         "type": {
@@ -449,206 +398,70 @@ $ set new-dbz-schema={
     ]
   }
 
-$ kafka-create-topic topic=new-dbz-data
+$ kafka-create-topic topic=new-dbz-data partitions=1
 
 # We don't do anything sensible yet for snapshot "true" or "last", so just test that those are ingested.
 
-$ kafka-ingest format=avro topic=new-dbz-data schema=${new-dbz-schema} timestamp=1
-{"before": null, "after": {"row":{"a": 9, "b": 10}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "true"}}}
-{"before": null, "after": {"row":{"a": 11, "b": 11}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "last"}}}
-{"before": null, "after": {"row":{"a": 14, "b": 6}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": null}}
-{"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}}
+# [btv] uncomment if we bring back classic debezium mode
+# $ kafka-ingest format=avro topic=new-dbz-data key-format=avro key-schema=${key-schema} schema=${new-dbz-schema} timestamp=1
+# {"a": 9} {"before": null, "after": {"row":{"a": 9, "b": 10}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "true"}}, "op": "r"}
+# {"a": 11} {"before": null, "after": {"row":{"a": 11, "b": 11}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "last"}}, "op": "r"}
+# {"a": 14} {"before": null, "after": {"row":{"a": 14, "b": 6}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": null}, "op": "c"}
+# {"a": 1} {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "false"}}, "op": "c"}
+# {"a": 2} {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}, "op": "c"}
+# {"a": -1} {"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}, "op": "c"}
+# {"a": -1} {"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}, "op": "c"}
 
-> CREATE MATERIALIZED SOURCE new_dbz
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-new-dbz-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${new-dbz-schema}'
-  ENVELOPE DEBEZIUM
+# > CREATE SOURCE new_dbz
+#   IN CLUSTER ${arg.single-replica-cluster}
+#   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-new-dbz-data-${testdrive.seed}')
 
-> SELECT * FROM new_dbz
-a b
----
-9 10
-11 11
-14 6
-2 3
--1 7
+# > CREATE TABLE new_dbz_tbl FROM SOURCE new_dbz (REFERENCE "testdrive-new-dbz-data-${testdrive.seed}")
+#   KEY FORMAT AVRO USING SCHEMA '${key-schema}'
+#   VALUE FORMAT AVRO USING SCHEMA '${new-dbz-schema}'
+#   ENVELOPE DEBEZIUM
 
-# Test that deduplication=ordered does the same thing as the default.
+# > SELECT * FROM new_dbz_tbl
+# a b
+# ---
+# 9 10
+# 11 11
+# 14 6
+# 2 3
+# -1 7
 
-> CREATE MATERIALIZED SOURCE new_dbz2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-new-dbz-data-${testdrive.seed}'
-  WITH (deduplication = 'ordered')
-  FORMAT AVRO USING SCHEMA '${new-dbz-schema}'
-  ENVELOPE DEBEZIUM
+$ kafka-create-topic topic=ignored partitions=1
 
-> SELECT * FROM new_dbz2
-a b
----
-9 10
-11 11
-14 6
-2 3
--1 7
+> CREATE SOURCE recursive
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-ignored-${testdrive.seed}')
 
-# Test that deduplication=full accepts mis-ordered Debezium data.
-
-$ kafka-create-topic topic=misordered-dbz-data
-
-$ set new-dbz-key-schema={"type": "record", "name": "row", "fields": [{"name": "a", "type": "long"}]}
-
-$ kafka-ingest format=avro key-format=avro topic=misordered-dbz-data schema=${new-dbz-schema} key-schema=${new-dbz-key-schema} timestamp=1 publish=true
-{"a": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}}
-{"a": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}}
-{"a": 1} {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 2, "row": 0, "snapshot": {"string": "false"}}}
-{"a": 2} {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
-{"a": -1} {"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}}
-{"a": 2} {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
-{"a": 1} {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 2, "row": 0, "snapshot": {"string": "false"}}}
-{"a": 3} {"before": null, "after": {"row":{"a": 3, "b": 4}}, "source": {"file": "binlog2", "pos": 2, "row": 0, "snapshot": {"string": "false"}}}
-
-> CREATE MATERIALIZED SOURCE misordered_dbz
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-misordered-dbz-data-${testdrive.seed}'
-  WITH (deduplication = 'full')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  ENVELOPE DEBEZIUM
-
-> SELECT * FROM misordered_dbz
-a b
----
-1 1
-2 3
--1 7
-3 4
-5 3
-#
-# Test that deduplication=full bails on invalid keys
-
-$ kafka-create-topic topic=invalid-keyed-dbz-data
-
-$ set wrong-dbz-key-schema={"type": "record", "name": "row", "fields": [{"name": "c", "type": "long"}]}
-
-$ kafka-ingest format=avro key-format=avro topic=invalid-keyed-dbz-data schema=${new-dbz-schema} key-schema=${wrong-dbz-key-schema} timestamp=1 publish=true
-{"c": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}}
-
-! CREATE MATERIALIZED SOURCE invalid_keyed_dbz
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-invalid-keyed-dbz-data-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  ENVELOPE DEBEZIUM
-Cannot use key due to error: Value schema missing primary key column: c
-
-! CREATE MATERIALIZED SOURCE invalid_keyed_dbz_with_dedup
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-invalid-keyed-dbz-data-${testdrive.seed}'
-  WITH (deduplication = 'full')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  ENVELOPE DEBEZIUM
-Cannot use key due to error: Value schema missing primary key column: c
-
-! CREATE MATERIALIZED SOURCE invalid_keyed_dbz_with_range_dedup
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-invalid-keyed-dbz-data-${testdrive.seed}'
-  WITH (
-      deduplication = 'full_in_range',
-      deduplication_start = '2020-09-13 12:26:00',
-      deduplication_end = '2020-09-13 13:00:00'
-  )
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  ENVELOPE DEBEZIUM
-Cannot use key due to error: Value schema missing primary key column: c
-
-# Test that deduplication=full_in_range accepts mis-ordered debezium data in the range
-
-$ kafka-create-topic topic=misordered-dbz-in-range-data
-
-# timestamps:
-# * 1599990000000 = 2020-09-13 09:40 -- more than an hour before the duplicate items
-# * 1599999600000 = 2020-09-13 12:20 -- in the hard-coded padding window
-# * 1600000000000 = 2020-09-13 12:26 -- duplicate items
-# * 1600005000000 = 2020-09-13 13:50 -- no longer possibly duplicate
-
-$ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1599990000000
-{"before": null, "after": {"row":{"a": 1, "b": 0}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
-
-# padding window
-$ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1599999600000
-{"before": null, "after": {"row":{"a": 4, "b": 0}}, "source": {"file": "binlog", "pos": 4, "row": 0, "snapshot": {"string": "false"}}}
-
-$ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1600000000000
-{"before": null, "after": {"row":{"a": 3, "b": 1}}, "source": {"file": "binlog", "pos": 3, "row": 0, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"row":{"a": 4, "b": 0}}, "source": {"file": "binlog", "pos": 4, "row": 0, "snapshot": {"string": "false"}}}
-
-# full dedupe catches reversed, invalid data
-$ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1600000000000
-{"before": null, "after": {"row":{"a": 6, "b": 0}}, "source": {"file": "binlog", "pos": 6, "row": 0, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"row":{"a": 5, "b": 0}}, "source": {"file": "binlog", "pos": 5, "row": 0, "snapshot": {"string": "false"}}}
-
-# return to just binlog-based deduplication, item 7 will be stripped because it is out of order!
-$ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1600005000000
-{"before": null, "after": {"row":{"a": 8, "b": 0}}, "source": {"file": "binlog", "pos": 8, "row": 0, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"row":{"a": 7, "b": 0}}, "source": {"file": "binlog", "pos": 7, "row": 0, "snapshot": {"string": "false"}}}
-
-> CREATE MATERIALIZED SOURCE misordered_dbz_in_range
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-misordered-dbz-in-range-data-${testdrive.seed}'
-  WITH (
-      deduplication = 'full_in_range',
-      deduplication_start = '2020-09-13 12:26:00',
-      deduplication_end = '2020-09-13 13:00:00'
-  )
-  FORMAT AVRO USING SCHEMA '${new-dbz-schema}'
-  ENVELOPE DEBEZIUM
-
-> SELECT * FROM misordered_dbz_in_range
-a b
----
-1 0
-4 0
-3 1
-6 0
-5 0
-8 0
-
-# same thing, but with an explicit pad start
-> CREATE MATERIALIZED SOURCE misordered_dbz_in_range_with_start
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-misordered-dbz-in-range-data-${testdrive.seed}'
-  WITH (
-      deduplication = 'full_in_range',
-      deduplication_pad_start = '2020-09-13 10:00:00',
-      deduplication_start = '2020-09-13 12:26:00',
-      deduplication_end = '2020-09-13 13:00:00'
-  )
-  FORMAT AVRO USING SCHEMA '${new-dbz-schema}'
-  ENVELOPE DEBEZIUM
-
-> SELECT * FROM misordered_dbz_in_range_with_start
-a b
----
-1 0
-4 0
-3 1
-6 0
-5 0
-8 0
-
-! CREATE SOURCE recursive
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'ignored'
+! CREATE TABLE recursive_tbl FROM SOURCE recursive (REFERENCE "testdrive-ignored-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '{"type":"record","name":"a","fields":[{"name":"f","type":["a","null"]}]}'
-validating avro schema: Recursive types are not supported: .a
+contains:validating avro schema: Recursive types are not supported: .a
 
 $ set key-schema={"type": "string"}
 $ set value-schema={"type": "record", "name": "r", "fields": [{"name": "a", "type": "string"}]}
 
 $ kafka-create-topic topic=non-subset-key
 
-$ kafka-ingest format=avro topic=non-subset-key key-format=avro key-schema=${key-schema} schema=${value-schema} publish=true
+$ kafka-ingest format=avro topic=non-subset-key key-format=avro key-schema=${key-schema} schema=${value-schema}
 "asdf" {"a": "asdf"}
 
-> CREATE MATERIALIZED SOURCE non_subset_key
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-subset-key-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
+> CREATE CLUSTER non_subset_key_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE non_subset_key
+  IN CLUSTER non_subset_key_cluster
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-non-subset-key-${testdrive.seed}')
+
+> CREATE TABLE non_subset_key_tbl FROM SOURCE non_subset_key (REFERENCE "testdrive-non-subset-key-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE NONE
 
-> SELECT * FROM non_subset_key
+> SELECT * FROM non_subset_key_tbl
 a
 ---
 "asdf"
@@ -673,6 +486,7 @@ $ set pg-dbz-schema={
         ]
       },
       { "name": "after", "type": ["row", "null"] },
+      { "name": "op", "type": "string" },
       {
         "name": "source",
         "type": {
@@ -699,19 +513,10 @@ $ set pg-dbz-schema={
             {
               "name": "lsn",
               "type": ["long", "null"]
-            }
-          ]
-        }
-      },
-      {
-        "name": "transaction",
-        "type": {
-          "type": "record",
-          "name": "TransactionMetadata",
-          "fields": [
+            },
             {
-              "name": "total_order",
-              "type": "long"
+              "name": "sequence",
+              "type": ["string", "null"]
             }
           ]
         }
@@ -719,178 +524,156 @@ $ set pg-dbz-schema={
     ]
   }
 
-$ kafka-create-topic topic=pg-dbz-data
+# $ kafka-create-topic topic=pg-dbz-data partitions=1
 
-# The third and fourth records will be skipped, since `(lsn, total_order)` has gone backwards.
-$ kafka-ingest format=avro topic=pg-dbz-data schema=${pg-dbz-schema} timestamp=1
-{"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"lsn": {"long": 1}, "snapshot": {"string": "false"}}, "transaction": {"total_order": 0}}
-{"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"lsn": {"long": 2}, "snapshot": {"string": "false"}}, "transaction": {"total_order": 1}}
-{"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"lsn": {"long": 0}, "snapshot": {"string": "false"}}, "transaction": {"total_order": 0}}
-{"before": null, "after": {"row":{"a": 4, "b": 5}}, "source": {"lsn": {"long": 2}, "snapshot": {"string": "false"}}, "transaction": {"total_order": 0}}
+# # The third and fourth records will be skipped, since `sequence` has gone backwards.
+# $ kafka-ingest format=avro topic=pg-dbz-data schema=${pg-dbz-schema} timestamp=1
+# {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"lsn": {"long": 1}, "sequence": {"string": "[\"1\", \"1\"]"}, "snapshot": {"string": "false"}}, "op": "c"}
+# {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"lsn": {"long": 2}, "sequence": {"string": "[\"1\", \"2\"]"}, "snapshot": {"string": "false"}}, "op": "c"}
+# {"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"lsn": {"long": 0}, "sequence": {"string": "[\"0\", \"1\"]"}, "snapshot": {"string": "false"}}, "op": "c"}
+# {"before": null, "after": {"row":{"a": 4, "b": 5}}, "source": {"lsn": {"long": 2}, "sequence": {"string": "[\"1\", \"2\"]"}, "snapshot": {"string": "false"}}, "op": "c"}
 
-> CREATE MATERIALIZED SOURCE pg_dbz
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-pg-dbz-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${pg-dbz-schema}'
-  ENVELOPE DEBEZIUM
+# > CREATE SOURCE pg_dbz
+#   IN CLUSTER ${arg.single-replica-cluster}
+#   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-pg-dbz-data-${testdrive.seed}')
 
-> SELECT * FROM pg_dbz
-a b
----
-1 1
-2 3
+# > CREATE TABLE pg_dbz_tbl FROM SOURCE pg_dbz (REFERENCE "testdrive-pg-dbz-data-${testdrive.seed}")
+#   KEY FORMAT AVRO USING SCHEMA '${key-schema}'
+#   VALUE FORMAT AVRO USING SCHEMA '${pg-dbz-schema}'
+#   ENVELOPE DEBEZIUM
+
+# > SELECT * FROM pg_dbz_tbl
+# a b
+# ---
+# 1 1
+# 2 3
 
 # Test that SQL Server-style sources can be ingested.
-$ set ms-dbz-schema={
-    "connect.name": "com.materialize.test.Envelope",
-    "fields": [
-      {
-        "default": null,
-        "name": "before",
-        "type": [
-          "null",
-          {
-            "connect.name": "com.materialize.test.Value",
-            "fields": [
-              {
-                "name": "a",
-                "type": "int"
-              },
-              {
-                "name": "b",
-                "type": "int"
-              }
-            ],
-            "name": "Value",
-            "type": "record"
-          }
-        ]
-      },
-      {
-        "default": null,
-        "name": "after",
-        "type": [
-          "null",
-          "Value"
-        ]
-      },
-      {
-        "name": "source",
-        "type": {
-          "connect.name": "io.debezium.connector.sqlserver.Source",
-          "fields": [
-            {
-              "default": "false",
-              "name": "snapshot",
-              "type": [
-                {
-                  "connect.default": "false",
-                  "connect.name": "io.debezium.data.Enum",
-                  "connect.parameters": {
-                    "allowed": "true,last,false"
-                  },
-                  "connect.version": 1,
-                  "type": "string"
-                },
-                "null"
-              ]
-            },
-            {
-              "default": null,
-              "name": "change_lsn",
-              "type": [
-                "null",
-                "string"
-              ]
-            },
-            {
-              "default": null,
-              "name": "sequence",
-              "type": [
-                "null",
-                "string"
-              ]
-            },
-            {
-              "default": null,
-              "name": "event_serial_no",
-              "type": [
-                "null",
-                "long"
-              ]
-            }
-          ],
-          "name": "Source",
-          "namespace": "io.debezium.connector.sqlserver",
-          "type": "record"
-        }
-      }
-    ],
-    "name": "Envelope",
-    "namespace": "com.materialize.test",
-    "type": "record"
-  }
+# $ set ms-dbz-schema={
+#     "connect.name": "com.materialize.test.Envelope",
+#     "fields": [
+#       {
+#         "default": null,
+#         "name": "before",
+#         "type": [
+#           "null",
+#           {
+#             "connect.name": "com.materialize.test.Value",
+#             "fields": [
+#               {
+#                 "name": "a",
+#                 "type": "int"
+#               },
+#               {
+#                 "name": "b",
+#                 "type": "int"
+#               }
+#             ],
+#             "name": "Value",
+#             "type": "record"
+#           }
+#         ]
+#       },
+#       {
+#         "default": null,
+#         "name": "after",
+#         "type": [
+#           "null",
+#           "Value"
+#         ]
+#       },
+#       { "name": "op", "type": "string" },
+#       {
+#         "name": "source",
+#         "type": {
+#           "connect.name": "io.debezium.connector.sqlserver.Source",
+#           "fields": [
+#             {
+#               "default": "false",
+#               "name": "snapshot",
+#               "type": [
+#                 {
+#                   "connect.default": "false",
+#                   "connect.name": "io.debezium.data.Enum",
+#                   "connect.parameters": {
+#                     "allowed": "true,last,false"
+#                   },
+#                   "connect.version": 1,
+#                   "type": "string"
+#                 },
+#                 "null"
+#               ]
+#             },
+#             {
+#               "default": null,
+#               "name": "change_lsn",
+#               "type": [
+#                 "null",
+#                 "string"
+#               ]
+#             },
+#             {
+#               "default": null,
+#               "name": "sequence",
+#               "type": [
+#                 "null",
+#                 "string"
+#               ]
+#             },
+#             {
+#               "default": null,
+#               "name": "event_serial_no",
+#               "type": [
+#                 "null",
+#                 "long"
+#               ]
+#             }
+#           ],
+#           "name": "Source",
+#           "namespace": "io.debezium.connector.sqlserver",
+#           "type": "record"
+#         }
+#       }
+#     ],
+#     "name": "Envelope",
+#     "namespace": "com.materialize.test",
+#     "type": "record"
+#   }
 
-$ kafka-create-topic topic=ms-dbz-data
+# $ kafka-create-topic topic=ms-dbz-data partitions=1
 
-# The third record will be skipped, since `lsn` has gone backwards.
-$ kafka-ingest format=avro topic=ms-dbz-data schema=${ms-dbz-schema} timestamp=1
-{"before": null, "after": {"Value":{"a": 1, "b": 1}}, "source": {"change_lsn": {"string": "00000025:00000728:001b"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"Value":{"a": 2, "b": 3}}, "source": {"change_lsn": {"string": "00000025:00000728:001c"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}}
-{"before": null, "after": {"Value":{"a": -1, "b": 7}}, "source": {"change_lsn": {"string": "00000025:00000728:001a"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}}
+# # The third record will be skipped, since `lsn` has gone backwards.
+# $ kafka-ingest format=avro topic=ms-dbz-data schema=${ms-dbz-schema} timestamp=1
+# {"before": null, "after": {"Value":{"a": 1, "b": 1}}, "source": {"change_lsn": {"string": "00000025:00000728:001b"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}, "op": "c"}
+# {"before": null, "after": {"Value":{"a": 2, "b": 3}}, "source": {"change_lsn": {"string": "00000025:00000728:001c"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}, "op": "c"}
+# {"before": null, "after": {"Value":{"a": -1, "b": 7}}, "source": {"change_lsn": {"string": "00000025:00000728:001a"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}, "op": "c"}
 
-> CREATE MATERIALIZED SOURCE ms_dbz
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-ms-dbz-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${ms-dbz-schema}'
-  ENVELOPE DEBEZIUM
+# > CREATE SOURCE ms_dbz
+#   IN CLUSTER ${arg.single-replica-cluster}
+#   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-ms-dbz-data-${testdrive.seed}')
 
-> SELECT * FROM ms_dbz
-a b
----
-1 1
-2 3
+# > CREATE TABLE ms_dbz_tbl FROM SOURCE ms_dbz (REFERENCE "testdrive-ms-dbz-data-${testdrive.seed}")
+#   KEY FORMAT AVRO USING SCHEMA '${key-schema}'
+#   VALUE FORMAT AVRO USING SCHEMA '${ms-dbz-schema}'
+#   ENVELOPE DEBEZIUM
 
-> CREATE MATERIALIZED SOURCE ms_dbz_uncommitted
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-ms-dbz-data-${testdrive.seed}'
-  WITH (isolation_level='read_uncommitted')
-  FORMAT AVRO USING SCHEMA '${ms-dbz-schema}'
-  ENVELOPE DEBEZIUM
+# > SELECT * FROM ms_dbz_tbl
+# a b
+# ---
+# 1 1
+# 2 3
 
-> SELECT * FROM ms_dbz
-a b
----
-1 1
-2 3
+# > CREATE SOURCE ms_dbz_uncommitted
+#   IN CLUSTER ${arg.single-replica-cluster}
+#   FROM KAFKA CONNECTION kafka_conn (ISOLATION LEVEL = 'read_uncommitted', TOPIC 'testdrive-ms-dbz-data-${testdrive.seed}')
 
-# Make sure that we don't fetch any messages that we don't want to fetch
+# > CREATE TABLE ms_dbz_uncommitted_tbl FROM SOURCE ms_dbz_uncommitted (REFERENCE "testdrive-ms-dbz-data-${testdrive.seed}")
+#   KEY FORMAT AVRO USING SCHEMA '${key-schema}'
+#   VALUE FORMAT AVRO USING SCHEMA '${ms-dbz-schema}'
+#   ENVELOPE DEBEZIUM
 
-$ kafka-create-topic topic=no-fetch-test partitions=1
-
-$ kafka-ingest format=bytes topic=no-fetch-test timestamp=1
-apple
-pie
-
-> CREATE MATERIALIZED SOURCE verify_no_fetch
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-no-fetch-test-${testdrive.seed}'
-  WITH (start_offset = 2)
-  FORMAT TEXT
-
-
-> SELECT * FROM verify_no_fetch
-text      mz_offset
--------------------
-
-> SELECT SUM((statistics->'topics'->'testdrive-no-fetch-test-${testdrive.seed}'->'partitions'->'0'->'msgs')::int) from mz_kafka_source_statistics;
-0
-
-$ kafka-ingest format=bytes topic=no-fetch-test timestamp=2
-mud
-pie
-
-> SELECT * FROM verify_no_fetch
-text      mz_offset
--------------------
-mud       3
-pie       4
-
-> SELECT SUM((statistics->'topics'->'testdrive-no-fetch-test-${testdrive.seed}'->'partitions'->'0'->'msgs')::int) from mz_kafka_source_statistics;
-2
+# > SELECT * FROM ms_dbz_uncommitted_tbl
+# a b
+# ---
+# 1 1
+# 2 3

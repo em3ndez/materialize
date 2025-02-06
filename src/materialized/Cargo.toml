@@ -1,139 +1,23 @@
 [package]
-name = "materialized"
-description = "Streaming SQL materialized views."
-version = "0.15.1-dev"
-authors = ["Materialize, Inc."]
-license = "proprietary"
-edition = "2021"
+name = "mz-materialized"
+description = "Materialize's unified binary."
+version = "0.133.0-dev.0"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
-default-run = "materialized"
-build = "build/main.rs"
 
-[package.metadata.deb]
-assets = [
-    ["../../misc/dist/materialized.service", "lib/systemd/system/", "644"],
-    ["target/release/materialized", "usr/bin/", "755"],
-]
-conflicts = "materialized"
-depends = "libc6 (>= 2.12.1)"
-maintainer-scripts = "misc/dist/deb-scripts"
-
-[package.metadata.deb.variants.materialized]
-conflicts = "materialized-unstable"
-name = "materialized"
-
-[package.metadata.deb.variants.materialized-unstable]
-conflicts = "materialized"
-name = "materialized-unstable"
+[lints]
+workspace = true
 
 [dependencies]
-anyhow = "1.0.52"
-askama = { version = "0.11.0", default-features = false, features = ["config", "serde-json"] }
-async-trait = "0.1.52"
-atty = "0.2.14"
-backtrace = "0.3.63"
-build-info = { path = "../build-info" }
-cfg-if = "1.0.0"
-chrono = { version = "0.4.0", default-features = false, features = ["std"] }
-clap = { version = "3.0.0", features = ["wrap_help", "env", "derive"] }
-compile-time-run = "0.2.12"
-coord = { path = "../coord" }
-crossbeam-channel = "0.5.1"
-dataflow = { path = "../dataflow" }
-dataflowd = { path = "../dataflowd" }
-dataflow-types = { path = "../dataflow-types" }
-differential-dataflow = { git = "https://github.com/TimelyDataflow/differential-dataflow.git" }
-fail = { version = "0.5.0", features = ["failpoints"] }
-futures = "0.3.19"
-hex = "0.4.3"
-hyper = { version = "0.14.16", features = ["http1", "server"] }
-hyper-openssl = "0.9.1"
-include_dir = "0.7.2"
-itertools = "0.10.3"
-krb5-src = { version = "0.3.1", features = ["binaries"] }
-lazy_static = "1.4.0"
-libc = "0.2.112"
-log = "0.4.13"
-mz-http-proxy = { path = "../http-proxy", features = ["reqwest"] }
-mz-process-collector = { path = "../mz-process-collector" }
-nix = "0.23.1"
-num_cpus = "1.13.1"
-openssl = { version = "0.10.38", features = ["vendored"] }
-openssl-sys = { version = "0.9.72", features = ["vendored"] }
-ore = { path = "../ore" }
-os_info = "3.0.9"
-pid-file = { path = "../pid-file" }
-pgwire = { path = "../pgwire" }
-prof = { path = "../prof" }
-prometheus = { git = "https://github.com/MaterializeInc/rust-prometheus.git", default-features = false }
-rdkafka-sys = { git = "https://github.com/fede1024/rust-rdkafka.git", features = ["cmake-build", "libz-static"] }
-repr = { path = "../repr" }
-reqwest = { version = "0.11.8", features = ["json"] }
-rlimit = "0.6.2"
-semver = "1.0.4"
-serde = { version = "1.0.133", features = ["derive"] }
-serde_json = "1.0.74"
-shell-words = "1.0.0"
-sql = { path = "../sql" }
-sysctl = "0.4.3"
-sysinfo = "0.22.4"
-tempfile = "3.2.0"
-timely = { git = "https://github.com/TimelyDataflow/timely-dataflow", default-features = false, features = ["bincode"] }
-tokio = { version = "1.15.0", features = ["sync"] }
-tokio-openssl = "0.6.3"
-tokio-stream = { version = "0.1.8", features = ["net"] }
-tracing = "0.1.29"
-tracing-subscriber = "0.3.5"
-url = "2.2.2"
-uuid = "0.8.2"
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-# According to jemalloc developers, `background_threads` should always be
-# enabled, except in "esoteric" situations that don't apply to Materialize
-# (Namely: if the application relies on new threads not being created for whatever reason)
-#
-# See: https://github.com/jemalloc/jemalloc/issues/956#issuecomment-316224733
-prof = { path = "../prof", features = ["jemalloc"] }
-tikv-jemallocator = { version = "0.4.1", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"] }
-
-[dev-dependencies]
-assert_cmd = "2.0.2"
-bytes = "1.1.0"
-coordtest = { path = "../coordtest" }
-datadriven = "0.6.0"
-fallible-iterator = "0.2.0"
-itertools = "0.10.3"
-kafka-util = { path = "../kafka-util" }
-pgrepr = { path = "../pgrepr" }
-pgtest = { path = "../pgtest" }
-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2", features = ["with-chrono-0_4"] }
-postgres-openssl = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
-postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
-postgres_array = { git = "https://github.com/MaterializeInc/rust-postgres-array", branch = "mz-0.7.2" }
-predicates = "2.1.0"
-rand = "0.8.4"
-repr = { path = "../repr" }
-reqwest = { version = "0.11.8", features = ["blocking"] }
-serde_json = "1.0.74"
-tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2", features = ["with-chrono-0_4"] }
-
-[build-dependencies]
-anyhow = "1.0.52"
-askama_shared = { version = "0.12.0", features = ["json"] }
-cc = "1.0.72"
-flate2 = "1.0.22"
-hex = "0.4.3"
-hex-literal = "0.3.4"
-reqwest = { version = "0.11.8", features = ["blocking"] }
-sha2 = "0.10.0"
-tar = "0.4.38"
-walkdir = "2.3.2"
+mz-clusterd = { path = "../clusterd", default-features = false }
+mz-environmentd = { path = "../environmentd", default-features = false }
+workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }
 
 [features]
-# When enabled, static assets for the web UI are loaded from disk on every HTTP
-# request rather than compiled into the binary. This vastly speeds up the
-# iteration cycle when developing the web UI.
-#
-# WARNING: For development use only! When enabled, may allow unrestricted read
-# access to the file system.
-dev-web = []
+default = ["mz-clusterd/default", "mz-environmentd/default", "workspace-hack"]
+jemalloc = ["mz-clusterd/jemalloc", "mz-environmentd/jemalloc"]
+tokio-console = ["mz-clusterd/tokio-console", "mz-environmentd/tokio-console"]
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["mz-alloc-default", "workspace-hack"]

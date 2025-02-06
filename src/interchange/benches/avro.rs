@@ -7,15 +7,16 @@
 // by the Apache License, Version 2.0.
 
 use byteorder::{NetworkEndian, WriteBytesExt};
-use chrono::{Duration, NaiveDate};
 use criterion::{black_box, Criterion, Throughput};
-use futures::executor::block_on;
 use mz_avro::types::Value as AvroValue;
-
-use interchange::avro::{parse_schema, Decoder, EnvelopeType};
-use std::ops::Add;
+use mz_interchange::avro::{parse_schema, Decoder};
+use mz_ore::cast::CastFrom;
+use mz_repr::adt::date::Date;
+use tokio::runtime::Runtime;
 
 pub fn bench_avro(c: &mut Criterion) {
+    let runtime = Runtime::new().unwrap();
+
     let schema_str = r#"
 {
   "type": "record",
@@ -243,8 +244,10 @@ pub fn bench_avro(c: &mut Criterion) {
 "#;
     let schema = parse_schema(schema_str).unwrap();
 
-    fn since_epoch(days: i64) -> NaiveDate {
-        NaiveDate::from_ymd(1970, 1, 1).add(Duration::days(days))
+    fn since_epoch(days: i64) -> i32 {
+        Date::from_unix_epoch(days.try_into().unwrap())
+            .unwrap()
+            .unix_epoch_days()
     }
     let record = AvroValue::Record(vec![
         (
@@ -387,22 +390,20 @@ pub fn bench_avro(c: &mut Criterion) {
     buf.write_u8(0).unwrap();
     buf.write_i32::<NetworkEndian>(0).unwrap();
     buf.extend(mz_avro::to_avro_datum(&schema, record).unwrap());
-    let len = buf.len() as u64;
+    let len = u64::cast_from(buf.len());
 
-    let mut decoder = Decoder::new(
-        schema_str,
-        None,
-        EnvelopeType::Debezium,
-        "avro_bench".to_string(),
-        true,
-        false,
-    )
-    .unwrap();
+    let mut decoder = Decoder::new(schema_str, None, "avro_bench".to_string(), false).unwrap();
 
     let mut bg = c.benchmark_group("avro");
     bg.throughput(Throughput::Bytes(len));
     bg.bench_function("decode", move |b| {
-        b.iter(|| black_box(block_on(decoder.decode(&mut buf.as_slice(), None)).unwrap()))
+        b.iter(|| {
+            black_box(
+                runtime
+                    .block_on(decoder.decode(&mut buf.as_slice()))
+                    .unwrap(),
+            )
+        })
     });
     bg.finish();
 }

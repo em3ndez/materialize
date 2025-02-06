@@ -52,18 +52,18 @@ use std::fmt;
 pub const STACK_RED_ZONE: usize = {
     #[cfg(debug_assertions)]
     {
-        256 << 10 // 256KiB
+        1024 << 10 // 1024KiB
     }
     #[cfg(not(debug_assertions))]
     {
-        32 << 10 // 32KiB
+        64 << 10 // 64KiB
     }
 };
 
 /// The size of any freshly allocated stacks. It was chosen to match the default
 /// stack size for threads in Rust.
 ///
-/// The default stack size is larger in debug builds to correspond to the the
+/// The default stack size is larger in debug builds to correspond to the
 /// larger [`STACK_RED_ZONE`].
 pub const STACK_SIZE: usize = {
     #[cfg(debug_assertions)]
@@ -114,7 +114,7 @@ where
 /// Consider a simple expression evaluator:
 ///
 /// ```
-/// # use std::collections::HashMap;
+/// # use std::collections::BTreeMap;
 ///
 /// enum Expr {
 ///     Var { name: String },
@@ -122,7 +122,7 @@ where
 /// }
 ///
 /// struct Evaluator {
-///     vars: HashMap<String, i64>,
+///     vars: BTreeMap<String, i64>,
 /// }
 ///
 /// impl Evaluator {
@@ -140,15 +140,15 @@ where
 /// so:
 ///
 /// ```
-/// # use std::collections::HashMap;
+/// # use std::collections::BTreeMap;
 /// # enum Expr {
 /// #     Var { name: String },
 /// #     Add { left: Box<Expr>, right: Box<Expr> },
 /// # }
-/// use ore::stack::{CheckedRecursion, RecursionGuard, RecursionLimitError};
+/// use mz_ore::stack::{CheckedRecursion, RecursionGuard, RecursionLimitError};
 ///
 /// struct Evaluator {
-///     vars: HashMap<String, i64>,
+///     vars: BTreeMap<String, i64>,
 ///     recursion_guard: RecursionGuard,
 /// }
 ///
@@ -217,6 +217,12 @@ pub struct RecursionGuard {
     limit: usize,
 }
 
+impl CheckedRecursion for RecursionGuard {
+    fn recursion_guard(&self) -> &RecursionGuard {
+        self
+    }
+}
+
 impl RecursionGuard {
     /// Constructs a new recursion guard with the specified recursion
     /// limit.
@@ -246,6 +252,7 @@ impl RecursionGuard {
 #[derive(Clone, Debug)]
 pub struct RecursionLimitError {
     limit: usize,
+    // todo: add backtrace (say, bottom 20 frames) once `std::backtrace` stabilizes in Rust 1.65
 }
 
 impl fmt::Display for RecursionLimitError {

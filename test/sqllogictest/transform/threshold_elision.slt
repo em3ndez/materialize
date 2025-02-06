@@ -1,0 +1,569 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+mode cockroach
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_table_keys = true
+----
+COMPLETE 0
+
+statement ok
+DROP TABLE IF EXISTS band_members;
+
+statement ok
+DROP TABLE IF EXISTS people;
+
+statement ok
+DROP TABLE IF EXISTS bands;
+
+statement ok
+CREATE TABLE bands (
+    id INT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL
+)
+
+statement ok
+CREATE TABLE people (
+    id INT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    born DATE NOT NULL,
+    died DATE
+)
+
+statement ok
+CREATE TABLE band_members (
+    b_id INT NOT NULL, -- REFERENCES bands(id),
+    p_id INT NOT NULL -- REFERENCES people(id)
+)
+
+statement ok
+INSERT INTO bands VALUES
+    (1, 'The Beatles')
+
+statement ok
+INSERT INTO people VALUES
+    (1, 'John Lennon', '1940-10-09', '1980-12-08'),
+    (2, 'George Harrison', '1943-02-25', '2001-11-29'),
+    (3, 'Paul McCartney', '1942-06-18', NULL),
+    (4, 'Richard Starkey', '1940-07-07', NULL)
+
+statement ok
+INSERT INTO band_members VALUES
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (1, 4)
+
+# Simple case: EXCEPT ALL with a const literal constraint.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+(
+    SELECT id FROM people
+)
+EXCEPT
+(
+    SELECT id FROM people WHERE id = 5
+)
+----
+Explained Query:
+  Union // { non_negative: true }
+    Project (#0) // { non_negative: true }
+      ReadStorage materialize.public.people // { non_negative: true }
+    Negate // { non_negative: false }
+      Project (#0) // { non_negative: true }
+        Filter (#0 = 5) // { non_negative: true }
+          ReadStorage materialize.public.people // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Simple case: EXCEPT ALL with an IS NOT NULL filter.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+(
+    SELECT id FROM people
+)
+EXCEPT ALL
+(
+    SELECT id FROM people WHERE died IS NOT NULL
+)
+----
+Explained Query:
+  Union // { non_negative: true }
+    Project (#0) // { non_negative: true }
+      ReadStorage materialize.public.people // { non_negative: true }
+    Negate // { non_negative: false }
+      Project (#0) // { non_negative: true }
+        Filter (#3) IS NOT NULL // { non_negative: true }
+          ReadStorage materialize.public.people // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Simple case: EXCEPT.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+SELECT name FROM people
+EXCEPT
+SELECT name FROM people WHERE id > 1
+----
+Explained Query:
+  Union // { non_negative: true }
+    Distinct project=[#0] // { non_negative: true }
+      Project (#1) // { non_negative: true }
+        ReadStorage materialize.public.people // { non_negative: true }
+    Negate // { non_negative: false }
+      Distinct project=[#0] // { non_negative: true }
+        Project (#1) // { non_negative: true }
+          Filter (#0 > 1) // { non_negative: true }
+            ReadStorage materialize.public.people // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Negative example: EXCEPT ALL that should not be confused for an EXCEPT
+# the two inputs have a Reduce *with aggregates*.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+SELECT MAX(id) FROM people GROUP BY name
+EXCEPT ALL
+SELECT MAX(id) FROM (SELECT * FROM people WHERE id > 1) GROUP BY name
+----
+Explained Query:
+  Threshold // { non_negative: true }
+    Union // { non_negative: false }
+      Project (#1) // { non_negative: true }
+        Reduce group_by=[#1] aggregates=[max(#0)] // { non_negative: true }
+          Project (#0, #1) // { non_negative: true }
+            ReadStorage materialize.public.people // { non_negative: true }
+      Negate // { non_negative: false }
+        Project (#1) // { non_negative: true }
+          Reduce group_by=[#1] aggregates=[max(#0)] // { non_negative: true }
+            Project (#0, #1) // { non_negative: true }
+              Filter (#0 > 1) // { non_negative: true }
+                ReadStorage materialize.public.people // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Complex example: EXCEPT ALL.
+# Here ThresholdElision can only match in after some prior simplifications
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+(
+    SELECT
+        id, name
+    FROM
+        people
+)
+EXCEPT ALL
+(
+    SELECT
+        *
+    FROM
+        (SELECT DISTINCT id FROM people) people_ids,
+        LATERAL (
+            SELECT name FROM people
+            WHERE people.id = people_ids.id
+            LIMIT 1
+        )
+)
+----
+Explained Query:
+  With
+    cte l0 =
+      Project (#0, #1) // { non_negative: true }
+        ReadStorage materialize.public.people // { non_negative: true }
+  Return // { non_negative: true }
+    Union // { non_negative: true }
+      Get l0 // { non_negative: true }
+      Negate // { non_negative: false }
+        TopK group_by=[#0] limit=1 // { non_negative: true }
+          Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Complex example: EXCEPT.
+# Here ThresholdElision can only match in after some prior simplifications
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+(
+    SELECT
+        id, name
+    FROM
+        people
+)
+EXCEPT
+(
+    SELECT
+        *
+    FROM
+        (SELECT DISTINCT id FROM people) people_ids,
+        LATERAL (
+            SELECT name FROM people
+            WHERE people.id = people_ids.id
+            LIMIT 1
+        )
+)
+----
+Explained Query:
+  With
+    cte l0 =
+      Project (#0, #1) // { non_negative: true }
+        ReadStorage materialize.public.people // { non_negative: true }
+  Return // { non_negative: true }
+    Union // { non_negative: true }
+      Get l0 // { non_negative: true }
+      Negate // { non_negative: false }
+        TopK group_by=[#0] limit=1 // { non_negative: true }
+          Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Complex example: CTE with a join.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+WITH cte AS (SELECT people.id FROM people, bands)
+SELECT * FROM cte EXCEPT ALL SELECT * FROM cte where id > 5;
+----
+Explained Query:
+  With
+    cte l0 =
+      CrossJoin type=differential // { non_negative: true }
+        ArrangeBy keys=[[]] // { non_negative: true }
+          Project (#0) // { non_negative: true }
+            ReadStorage materialize.public.people // { non_negative: true }
+        ArrangeBy keys=[[]] // { non_negative: true }
+          Project () // { non_negative: true }
+            ReadStorage materialize.public.bands // { non_negative: true }
+  Return // { non_negative: true }
+    Union // { non_negative: true }
+      Get l0 // { non_negative: true }
+      Negate // { non_negative: false }
+        Filter (#0 > 5) // { non_negative: true }
+          Get l0 // { non_negative: true }
+
+Source materialize.public.bands
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Complex example: CTE with a DISTINCT.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+WITH cte AS (SELECT DISTINCT name FROM people)
+SELECT * FROM cte EXCEPT ALL SELECT * FROM cte WHERE name LIKE 'J%'
+----
+Explained Query:
+  With
+    cte l0 =
+      Distinct project=[#0] // { non_negative: true }
+        Project (#1) // { non_negative: true }
+          ReadStorage materialize.public.people // { non_negative: true }
+  Return // { non_negative: true }
+    Union // { non_negative: true }
+      Get l0 // { non_negative: true }
+      Negate // { non_negative: false }
+        Filter like["J%"](#0) // { non_negative: true }
+          Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Complex example: CTE with a GROUP BY.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+WITH a(birth_year, no_people_born) AS (
+    SELECT EXTRACT(year from born), COUNT(*)
+    FROM people
+    GROUP BY EXTRACT(year from born)
+)
+SELECT * FROM a EXCEPT (SELECT * FROM a WHERE birth_year > 1940);
+----
+Explained Query:
+  With
+    cte l0 =
+      Reduce group_by=[extract_year_d(#0)] aggregates=[count(*)] // { non_negative: true }
+        Project (#2) // { non_negative: true }
+          ReadStorage materialize.public.people // { non_negative: true }
+  Return // { non_negative: true }
+    Union // { non_negative: true }
+      Get l0 // { non_negative: true }
+      Negate // { non_negative: false }
+        Filter (#0 > 1940) // { non_negative: true }
+          Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Complex example: a chain of CTEs with:
+# (1) an EXCEPT ALL in cte1 (that is, a plan containing Negate),
+# (2) a non-pushable operation (Distinct) in the cte2,
+# (3) an EXCEPT in the final result,
+# The optimization still removes the Threshold operators in both
+# (1) and (3) because the non negative value inferred for cte1
+# prior to the rewrite is maintained for downstream rewrites.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+WITH cte1 AS (
+    SELECT * FROM people
+    EXCEPT ALL
+    SELECT * FROM people WHERE name LIKE 'J%'
+), cte2 AS (
+    SELECT DISTINCT * FROM cte1
+)
+SELECT * FROM cte2
+EXCEPT
+SELECT * FROM cte2 WHERE name LIKE 'P%';
+----
+Explained Query:
+  With
+    cte l0 =
+      Distinct project=[#0..=#3] // { non_negative: true }
+        Union // { non_negative: true }
+          ReadStorage materialize.public.people // { non_negative: true }
+          Negate // { non_negative: false }
+            Filter like["J%"](#1) // { non_negative: true }
+              ReadStorage materialize.public.people // { non_negative: true }
+  Return // { non_negative: true }
+    Union // { non_negative: true }
+      Get l0 // { non_negative: true }
+      Negate // { non_negative: false }
+        Filter like["P%"](#1) // { non_negative: true }
+          Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# Complex example (unsupported): A - (σ(p)(A) ⊎ σ(q)(A)).
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+SELECT name FROM people
+EXCEPT ALL
+(
+    SELECT name FROM people WHERE id = 1
+    UNION ALL
+    SELECT name FROM people WHERE id = 2
+)
+----
+Explained Query:
+  Threshold // { non_negative: true }
+    Union // { non_negative: false }
+      Project (#1) // { non_negative: true }
+        ReadStorage materialize.public.people // { non_negative: true }
+      Negate // { non_negative: false }
+        Project (#1) // { non_negative: true }
+          Filter (#0 = 1) // { non_negative: true }
+            ReadStorage materialize.public.people // { non_negative: true }
+      Negate // { non_negative: false }
+        Project (#1) // { non_negative: true }
+          Filter (#0 = 2) // { non_negative: true }
+            ReadStorage materialize.public.people // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# WMR
+# https://github.com/MaterializeInc/database-issues/issues/5344
+
+# WMR -- Threshold in the loop-invariant part
+# The "Very basic" implementation from database-issues#5344 should handle this.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+WITH MUTUALLY RECURSIVE
+  c0(id int, name text) as (
+    SELECT id, name FROM people
+    EXCEPT
+    SELECT id, name FROM people WHERE id > 1
+  ),
+  c1(id int, name text) as (
+    (SELECT id, name || '_init' FROM c0)
+    UNION
+    (
+      SELECT id, name || '_iter' FROM c1
+    )
+  )
+SELECT * FROM c1
+----
+Explained Query:
+  With Mutually Recursive
+    cte l0 =
+      Distinct project=[#0, #1] // { non_negative: true }
+        Union // { non_negative: true }
+          Project (#0, #2) // { non_negative: true }
+            Map ((#1 || "_init")) // { non_negative: true }
+              Union // { non_negative: true }
+                Project (#0, #1) // { non_negative: true }
+                  ReadStorage materialize.public.people // { non_negative: true }
+                Negate // { non_negative: false }
+                  Project (#0, #1) // { non_negative: true }
+                    Filter (#0 > 1) // { non_negative: true }
+                      ReadStorage materialize.public.people // { non_negative: true }
+          Project (#0, #2) // { non_negative: true }
+            Map ((#1 || "_iter")) // { non_negative: true }
+              Get l0 // { non_negative: true }
+  Return // { non_negative: true }
+    Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# WMR -- Threshold inside the cycle -- Two Thresholds, the second one should be easy to eliminate, because the result of
+# the first one is obviously non-negative.
+# The "Basic" implementation from database-issues#5344 should handle this.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+WITH MUTUALLY RECURSIVE
+  c1(id int, name text) as (
+    (SELECT id, name || '_init' FROM people)
+    UNION
+    (
+      SELECT id, name || '_iter' FROM c2
+      EXCEPT
+      SELECT id, name || '_iter' FROM c2 WHERE id > 1
+    )
+  ),
+  c2(id int, name text) as (
+    SELECT * FROM c1
+    EXCEPT
+    SELECT * FROM c1 WHERE id > 2
+  )
+SELECT * FROM c1
+----
+Explained Query:
+  With Mutually Recursive
+    cte l0 =
+      Distinct project=[#0, #1] // { non_negative: true }
+        Union // { non_negative: false }
+          Project (#0, #4) // { non_negative: true }
+            Map ((#1 || "_init")) // { non_negative: true }
+              ReadStorage materialize.public.people // { non_negative: true }
+          Distinct project=[#0, (#1 || "_iter")] // { non_negative: true }
+            Get l1 // { non_negative: true }
+          Negate // { non_negative: false }
+            Distinct project=[#0, (#1 || "_iter")] // { non_negative: true }
+              Filter (#0 > 1) // { non_negative: true }
+                Get l1 // { non_negative: true }
+    cte l1 =
+      Union // { non_negative: true }
+        Get l0 // { non_negative: true }
+        Negate // { non_negative: false }
+          Filter (#0 > 2) // { non_negative: true }
+            Get l0 // { non_negative: true }
+  Return // { non_negative: true }
+    Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+# WMR -- Threshold inside the cycle.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+WITH MUTUALLY RECURSIVE
+  c0(id int, name text) as (
+    (SELECT id, name || '_init' FROM people)
+    UNION
+    (
+      SELECT id, name || '_iter' FROM c0
+      EXCEPT
+      SELECT id, name || '_iter' FROM c0 WHERE id > 1
+    )
+  )
+SELECT * FROM c0
+----
+Explained Query:
+  With Mutually Recursive
+    cte l0 =
+      Distinct project=[#0, #1] // { non_negative: true }
+        Union // { non_negative: false }
+          Project (#0, #4) // { non_negative: true }
+            Map ((#1 || "_init")) // { non_negative: true }
+              ReadStorage materialize.public.people // { non_negative: true }
+          Distinct project=[#0, (#1 || "_iter")] // { non_negative: true }
+            Get l0 // { non_negative: true }
+          Negate // { non_negative: false }
+            Distinct project=[#0, (#1 || "_iter")] // { non_negative: true }
+              Filter (#0 > 1) // { non_negative: true }
+                Get l0 // { non_negative: true }
+  Return // { non_negative: true }
+    Get l0 // { non_negative: true }
+
+Source materialize.public.people
+
+Target cluster: quickstart
+
+EOF
+
+statement ok
+CREATE TABLE t1 (f1 INTEGER, f2 INTEGER);
+
+# Literal filter, which would be made unrecognizable by
+# ColumnKnowledge, LiteralLifting, EquivalencePropagation.
+query T multiline
+EXPLAIN OPTIMIZED PLAN WITH(non negative) FOR
+SELECT f1 FROM t1 EXCEPT SELECT f1 FROM t1 WHERE f1 = 5;
+----
+Explained Query:
+  Union // { non_negative: false }
+    Distinct project=[#0] // { non_negative: true }
+      Project (#0) // { non_negative: true }
+        ReadStorage materialize.public.t1 // { non_negative: true }
+    Negate // { non_negative: false }
+      Map (5) // { non_negative: true }
+        Distinct project=[] // { non_negative: true }
+          Project () // { non_negative: true }
+            Filter (#0 = 5) // { non_negative: true }
+              ReadStorage materialize.public.t1 // { non_negative: true }
+
+Source materialize.public.t1
+
+Target cluster: quickstart
+
+EOF

@@ -7,12 +7,13 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use repr::{Datum, DatumList};
+use mz_repr::{Datum, DatumList};
 
 use crate::EvalError;
 
 sqlfunc!(
     #[sqlname = "isnull"]
+    #[is_monotone = true]
     fn is_null<'a>(a: Datum<'a>) -> bool {
         a.is_null()
     }
@@ -37,18 +38,20 @@ sqlfunc!(
         match a {
             Datum::Null => Ok(None),
             datum => {
-                let sz = repr::datum_size(&datum);
+                let sz = mz_repr::datum_size(&datum);
                 i32::try_from(sz)
                     .map(Some)
-                    .or(Err(EvalError::Int32OutOfRange))
+                    .or(Err(EvalError::Int32OutOfRange(sz.to_string().into())))
             }
         }
     }
 );
 
 sqlfunc!(
+    // TODO[btv] - if we plan to keep changing row format,
+    // should we make this unmaterializable?
     fn mz_row_size<'a>(a: DatumList<'a>) -> Result<i32, EvalError> {
-        let sz = repr::row_size(a.iter());
-        i32::try_from(sz).or(Err(EvalError::Int32OutOfRange))
+        let sz = mz_repr::row_size(a.iter());
+        i32::try_from(sz).or(Err(EvalError::Int32OutOfRange(sz.to_string().into())))
     }
 );

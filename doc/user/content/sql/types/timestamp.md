@@ -1,5 +1,5 @@
 ---
-title: "Timestamp Data Types"
+title: "Timestamp types"
 description: "Expresses a date and time"
 menu:
   main:
@@ -21,7 +21,7 @@ Detail | Info
 **OID** | 1083
 **Min value** | 4713 BC
 **Max value** | 294276 AD
-**Resolution** | 1 microsecond / 14 digits
+**Max resolution** | 1 microsecond
 
 ## `timestamp with time zone` info
 
@@ -34,7 +34,7 @@ Detail | Info
 **OID** | 1184
 **Min value** | 4713 BC
 **Max value** | 294276 AD
-**Resolution** | 1 microsecond / 14 digits
+**Max resolution** | 1 microsecond
 
 ## Syntax
 
@@ -42,9 +42,11 @@ Detail | Info
 
 Field | Use
 ------|-----
-**WITH TIME ZONE** | Apply the _tz&lowbar;offset_ field. If not specified, don't.
-**TIMESTAMPTZ** | Apply the _tz&lowbar;offset_ field.
-_date&lowbar;str_ | _date&lowbar;str_ | A string representing a date in `Y-M-D`, `Y M-D`, `Y M D` or `YMD` format.
+**WITH TIME ZONE** | Apply the _tz&lowbar;offset_ field.
+**WITHOUT TIME ZONE** | Ignore the _tz&lowbar;offset_ field.<br>This is the default if neither `WITH TIME ZONE` nor `WITHOUT TIME ZONE` is specified.
+**TIMESTAMPTZ** | A shorter alias for `TIMESTAMP WITH TIME ZONE`.
+_precision_ | The number of digits of precision to use to represent fractional seconds. If unspecified, timestamps use six digits of precision—i.e., they have a resolution of one microsecond.
+_date&lowbar;str_ | A string representing a date in `Y-M-D`, `Y M-D`, `Y M D` or `YMD` format.
 _time&lowbar;str_ | A string representing a time of day in `H:M:S.NS` format.
 _tz&lowbar;offset_ | The timezone's distance, in hours, from UTC.
 
@@ -96,7 +98,7 @@ Operation | Computes
 
 ### Return timestamp
 
-```sql
+```mzsql
 SELECT TIMESTAMP '2007-02-01 15:04:05' AS ts_v;
 ```
 ```nofmt
@@ -107,7 +109,7 @@ SELECT TIMESTAMP '2007-02-01 15:04:05' AS ts_v;
 
 ### Return timestamp with time zone
 
-```sql
+```mzsql
 SELECT TIMESTAMPTZ '2007-02-01 15:04:05+06' AS tstz_v;
 ```
 ```nofmt

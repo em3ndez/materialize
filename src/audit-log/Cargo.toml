@@ -1,0 +1,26 @@
+[package]
+name = "mz-audit-log"
+description = "Audit log data structures."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.66"
+mz-ore = { path = "../ore", features = ["test"] }
+proptest = { version = "1.6.0", default-features = false, features = ["std"] }
+proptest-derive = { version = "0.5.1", features = ["boxed_union"] }
+serde = { version = "1.0.152", features = ["derive"] }
+serde_json = "1.0.125"
+serde_plain = "1.0.1"
+workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["workspace-hack"]
+
+[features]
+default = ["workspace-hack"]

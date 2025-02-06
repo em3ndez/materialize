@@ -11,9 +11,12 @@
 #
 # ci-builder — builds and releases CI builder image.
 
+# NOTE(benesch): this script is reaching the breaking point in Bash. We should
+# rewrite it in Python before adding much more logic to it.
+
 set -euo pipefail
 
-NIGHTLY_RUST_DATE=2021-11-29
+NIGHTLY_RUST_DATE=2024-12-02
 
 cd "$(dirname "$0")/.."
 
@@ -21,7 +24,7 @@ cd "$(dirname "$0")/.."
 
 if [[ $# -lt 2 ]]
 then
-    echo "usage: $0 <command> <stable|nightly> [<args>...]
+    echo "usage: $0 <command> <stable|nightly|min> [<args>...]
 
 Manages the ci-builder Docker image, which contains the dependencies required
 to build, test, and deploy the code in this repository.
@@ -37,17 +40,25 @@ For details, consult ci/builder/README.md."
 fi
 
 cmd=$1 && shift
-channel=$1 && shift
+flavor=$1 && shift
 
 rust_date=
-case "$channel" in
-    stable) rust_version=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" rust-toolchain.toml) ;;
+case "$flavor" in
+    min)
+        docker_target=ci-builder-min
+        rust_version=$(sed -n 's/rust-version = "\(.*\)"/\1/p' Cargo.toml)
+        ;;
+    stable)
+        docker_target=ci-builder-full
+        rust_version=$(sed -n 's/rust-version = "\(.*\)"/\1/p' Cargo.toml)
+        ;;
     nightly)
+        docker_target=ci-builder-full
         rust_version=nightly
         rust_date=/$NIGHTLY_RUST_DATE
         ;;
     *)
-        printf "unknown rust channel %q\n" "$channel"
+        printf "unknown CI builder flavor %q\n" "$flavor"
         exit 1
         ;;
 esac
@@ -55,14 +66,16 @@ esac
 arch_gcc=${MZ_DEV_CI_BUILDER_ARCH:-$(arch_gcc)}
 arch_go=$(arch_go "$arch_gcc")
 
-cid_file=ci/builder/.${channel%%-*}.cidfile
+cid_file=ci/builder/.${flavor%%-*}.cidfile
 
-rust_components=rustc,cargo,rust-std-$arch_gcc-unknown-linux-gnu
+rust_components=rustc,cargo,rust-std-$arch_gcc-unknown-linux-gnu,llvm-tools-preview
 if [[ $rust_version = nightly ]]; then
     rust_components+=,miri-preview
 else
     rust_components+=,clippy-preview,rustfmt-preview
 fi
+
+bazel_version=$(cat .bazelversion)
 
 uid=$(id -u)
 gid=$(id -g)
@@ -78,8 +91,10 @@ build() {
         --build-arg "RUST_VERSION=$rust_version" \
         --build-arg "RUST_DATE=$rust_date" \
         --build-arg "RUST_COMPONENTS=$rust_components" \
+        --build-arg "BAZEL_VERSION=$bazel_version" \
         --tag materialize/ci-builder:"$tag" \
         --tag materialize/ci-builder:"$cache_tag" \
+        --target $docker_target \
         "$@" ci/builder
 }
 
@@ -97,13 +112,15 @@ fi
 # *inside* this image. See materialize.git.expand_globs in the Python code for
 # details on this computation.
 files=$(cat \
-        <(git diff --name-only -z 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ci/builder) \
+        <(git diff --name-only -z 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ci/builder .bazelversion) \
         <(git ls-files --others --exclude-standard -z ci/builder) \
     | LC_ALL=C sort -z \
-    | xargs -0 sha1sum)
+    | xargs -0 "$shasum")
 files+="
-date:$rust_date
+rust-version:$rust_version
+rust-date:$rust_date
 arch:$arch_gcc
+flavor:$flavor
 "
 tag=$(echo "$files" | python3 -c '
 import base64
@@ -114,7 +131,7 @@ input = sys.stdin.buffer.read()
 hash = base64.b32encode(hashlib.sha1(input).digest())
 print(hash.decode())
 ')
-cache_tag=cache-$rust_version-$arch_go
+cache_tag=cache-$flavor-$rust_version-$arch_go
 
 
 case "$cmd" in
@@ -130,30 +147,120 @@ case "$cmd" in
         docker push materialize/ci-builder:"$cache_tag"
         ;;
     run)
+        docker_command=()
+
+        detach_container=false
+        container_name_param=""
+
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --detach)
+                    detach_container=true
+                    shift # past argument
+                    ;;
+                --name)
+                    container_name_param="$2"
+                    shift # past argument
+                    shift # past value
+                    ;;
+                *)
+                    docker_command+=("$1")
+                    shift # past argument
+                    ;;
+            esac
+        done
+
+        mkdir -p target-xcompile ~/.kube
         args=(
             --cidfile "$cid_file"
             --rm --interactive
             --init
+            --volume "$(pwd)/target-xcompile:/mnt/build"
             --volume "$(pwd):$(pwd)"
             --workdir "$(pwd)"
             --env AWS_ACCESS_KEY_ID
             --env AWS_DEFAULT_REGION
             --env AWS_SECRET_ACCESS_KEY
             --env AWS_SESSION_TOKEN
-            --env BUILDKITE
-            --env BUILDKITE_AGENT_ACCESS_TOKEN
-            --env BUILDKITE_BRANCH
-            --env BUILDKITE_BUILD_ID
-            --env BUILDKITE_BUILD_NUMBER
-            --env BUILDKITE_COMMIT
-            --env BUILDKITE_JOB_ID
-            --env BUILDKITE_TAG
-            --env CI
+            --env CANARY_LOADTEST_APP_PASSWORD
+            --env CANARY_LOADTEST_PASSWORD
+            --env CLOUDTEST_CLUSTER_DEFINITION_FILE
+            --env COMMON_ANCESTOR_OVERRIDE
+            --env CONFLUENT_CLOUD_DEVEX_KAFKA_PASSWORD
+            --env CONFLUENT_CLOUD_DEVEX_KAFKA_USERNAME
+            --env GCP_SERVICE_ACCOUNT_JSON
+            --env GITHUB_TOKEN
             --env GPG_KEY
+            --env LAUNCHDARKLY_API_TOKEN
+            --env LAUNCHDARKLY_SDK_KEY
+            --env NIGHTLY_CANARY_APP_PASSWORD
+            --env MZ_CLI_APP_PASSWORD
+            --env MZ_SOFT_ASSERTIONS
+            --env NO_COLOR
+            --env NPM_TOKEN
+            --env POLAR_SIGNALS_API_TOKEN
+            --env PRODUCTION_ANALYTICS_USERNAME
+            --env PRODUCTION_ANALYTICS_APP_PASSWORD
             --env PYPI_TOKEN
+            --env RUST_MIN_STACK
+            --env MZ_DEV_BUILD_SHA
+            # For Miri with nightly Rust
+            --env ZOOKEEPER_ADDR
+            --env KAFKA_ADDRS
+            --env SCHEMA_REGISTRY_URL
+            --env STEP_START_TIMESTAMP_WITH_TZ
+            --env POSTGRES_URL
+            --env COCKROACH_URL
+            # For ci-closed-issues-detect
+            --env GITHUB_CI_ISSUE_REFERENCE_CHECKER_TOKEN
+            # For auto_cut_release
+            --env GIT_AUTHOR_EMAIL
+            --env GIT_AUTHOR_NAME
+            --env GIT_COMMITTER_EMAIL
+            --env GIT_COMMITTER_NAME
+            # For cloud canary
+            --env REDPANDA_CLOUD_CLIENT_ID
+            --env REDPANDA_CLOUD_CLIENT_SECRET
+            --env QA_BENCHMARKING_APP_PASSWORD
+            # For self managed docs
+            --env BUILDKITE_BRANCH
+            --env BUILDKITE_ORGANIZATION_SLUG
         )
+
+        if [[ $detach_container == "true" ]]; then
+            args+=("--detach")
+        fi
+
+        if [[ -n "$container_name_param" ]]; then
+            args+=("--name=$container_name_param")
+        fi
+
+        for env in $(printenv | grep -E '^(BUILDKITE|MZCOMPOSE|CI)' | sed 's/=.*//'); do
+            args+=(--env "$env")
+        done
         if [[ -t 1 ]]; then
             args+=(--tty)
+        fi
+        # Forward the host's Kubernetes config.
+        args+=(
+            # Need to forward the entire directory to allow creation and
+            # deletion of config.lock.
+            --volume "$HOME/.kube:/kube"
+            --env "KUBECONFIG=/kube/config"
+        )
+        # Forward the host's SSH agent, if available.
+        if [[ "${SSH_AUTH_SOCK:-}" ]]; then
+            args+=(
+                --volume "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
+                --env "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"
+            )
+        fi
+        # Forward the GitHub output file, if available.
+        if [[ "${GITHUB_OUTPUT:-}" ]]; then
+            args+=(
+                --volume "$GITHUB_OUTPUT:/tmp/github-output"
+                --env "GITHUB_OUTPUT=/tmp/github-output"
+            )
         fi
         if [[ "$(uname -s)" = Linux ]]; then
             # Allow Docker-in-Docker by mounting the Docker socket in the
@@ -163,7 +270,17 @@ case "$cmd" in
                 --volume "/var/run/docker.sock:/var/run/docker.sock"
                 --user "$(id -u):$(stat -c %g /var/run/docker.sock)"
                 --network host
+                --env "DOCKER_TLS_VERIFY=${DOCKER_TLS_VERIFY-}"
+                --env "DOCKER_HOST=${DOCKER_HOST-}"
             )
+
+            # Forward Docker daemon certificates, if requested.
+            if [[ "${DOCKER_CERT_PATH:-}" ]]; then
+                args+=(
+                    --volume "$DOCKER_CERT_PATH:/docker-certs"
+                    --env "DOCKER_CERT_PATH=/docker-certs"
+                )
+            fi
 
             # Forward Docker configuration too, if available.
             docker_dir=${DOCKER_CONFIG:-$HOME/.docker}
@@ -174,13 +291,11 @@ case "$cmd" in
                 )
             fi
 
-            # Forward the host's SSH agent, if available.
-            if [[ "${SSH_AUTH_SOCK:-}" ]]; then
-                args+=(
-                    --volume "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
-                    --env "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"
-                )
-            fi
+            # Override the Docker daemon we use to run the builder itself, if
+            # requested.
+            export DOCKER_HOST=${MZ_DEV_CI_BUILDER_DOCKER_HOST-${DOCKER_HOST-}}
+            export DOCKER_TLS_VERIFY=${MZ_DEV_CI_BUILDER_DOCKER_TLS_VERIFY-${DOCKER_TLS_VERIFY-}}
+            export DOCKER_CERT_PATH=${MZ_DEV_CI_BUILDER_DOCKER_CERT_PATH-${DOCKER_CERT_PATH-}}
 
             # Forward the host's buildkite-agent binary, if available.
             if command -v buildkite-agent > /dev/null 2>&1; then
@@ -195,8 +310,24 @@ case "$cmd" in
         else
             args+=(--user "$(id -u):1001")
         fi
+        if [[ "${CI_BUILDER_SCCACHE:-}" ]]; then
+            args+=(
+                --env "RUSTC_WRAPPER=sccache"
+                --env SCCACHE_BUCKET
+            )
+        fi
+        if [[ "${CI_BAZEL_BUILD:-}" ]]; then
+            args+=(
+                --tmpfs "/dev/shm:exec,dev,suid,size=128g"
+            )
+        fi
+        # For git-worktrees add the original repository at its original path
+        if [[ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]]; then
+            GIT_ROOT_DIR="$(git rev-parse --git-dir | sed -e "s#/.git/worktrees/.*#/#")"
+            args+=(--volume "$GIT_ROOT_DIR:$GIT_ROOT_DIR")
+        fi
         rm -f "$cid_file"
-        docker run "${args[@]}" "materialize/ci-builder:$tag" "$@"
+        docker run "${args[@]}" "materialize/ci-builder:$tag" "${docker_command[@]}"
         ;;
     root-shell)
         docker exec --interactive --tty --user 0:0 "$(<"$cid_file")" ci/builder/root-shell.sh

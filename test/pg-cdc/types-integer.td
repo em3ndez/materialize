@@ -10,6 +10,14 @@
 #
 # Test various variants of integer types
 
+> CREATE SECRET pgpass AS 'postgres'
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass
+  )
+
 
 # Insert data pre-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
@@ -19,32 +27,30 @@ DROP PUBLICATION IF EXISTS mz_source;
 
 CREATE SCHEMA public;
 
-CREATE TABLE t1 (f1 SMALLINT, f2 INTEGER, f3 BIGINT);
+CREATE TABLE t1 (f1 SMALLINT, f2 INTEGER, f3 BIGINT, f4 _int4, f5 int2);
 ALTER TABLE t1 REPLICA IDENTITY FULL;
 
-INSERT INTO t1 VALUES (-32768, -2147483648, -9223372036854775808);
-INSERT INTO t1 VALUES (32767, 2147483647, 9223372036854775807);
+INSERT INTO t1 VALUES (-32768, -2147483648, -9223372036854775808, null, 0);
+INSERT INTO t1 VALUES (32767, 2147483647, 9223372036854775807, null, 1);
 
 CREATE PUBLICATION mz_source FOR ALL TABLES;
 
-> CREATE MATERIALIZED SOURCE mz_source
-  FROM POSTGRES CONNECTION 'host=postgres port=5432 user=postgres password=postgres sslmode=require dbname=postgres'
-  PUBLICATION 'mz_source';
+> CREATE SOURCE mz_source FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
 
-> SELECT COUNT(*) > 0 FROM mz_source;
+> CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE t1);
+
+> SELECT COUNT(*) > 0 FROM t1;
 true
-
-> CREATE VIEWS FROM SOURCE mz_source;
 
 # Insert the same data post-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 INSERT INTO t1 SELECT * FROM t1;
 
-> SELECT pg_typeof(f1), pg_typeof(f2), pg_typeof(f3) FROM t1 LIMIT 1;
-smallint integer bigint
+> SELECT pg_typeof(f1), pg_typeof(f2), pg_typeof(f3), pg_typeof(f4), pg_typeof(f5) FROM t1 LIMIT 1;
+smallint integer bigint integer[] smallint
 
 > SELECT * FROM t1;
--32768 -2147483648 -9223372036854775808
-32767 2147483647 9223372036854775807
--32768 -2147483648 -9223372036854775808
-32767 2147483647 9223372036854775807
+-32768 -2147483648 -9223372036854775808 <null> 0
+32767 2147483647 9223372036854775807 <null> 1
+-32768 -2147483648 -9223372036854775808 <null> 0
+32767 2147483647 9223372036854775807 <null> 1

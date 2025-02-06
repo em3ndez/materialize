@@ -26,7 +26,7 @@
 //! by invoking the right visitor method of each of its fields.
 //!
 //! ```
-//! # use sql_parser::ast::{Expr, Function, FunctionArgs, UnresolvedObjectName, WindowSpec, Raw, AstInfo};
+//! # use mz_sql_parser::ast::{Expr, Function, FunctionArgs, WindowSpec, Raw, AstInfo};
 //! #
 //! pub trait Visit<'ast, T: AstInfo> {
 //!     /* ... */
@@ -36,7 +36,7 @@
 //!     }
 //!
 //!     /* ... */
-//!     # fn visit_unresolved_object_name(&mut self, node: &'ast UnresolvedObjectName);
+//!     # fn visit_item_name(&mut self, node: &'ast <T as AstInfo>::ItemName);
 //!     # fn visit_function_args(&mut self, node: &'ast FunctionArgs<T>);
 //!     # fn visit_expr(&mut self, node: &'ast Expr<T>);
 //!     # fn visit_window_spec(&mut self, node: &'ast WindowSpec<T>);
@@ -46,7 +46,7 @@
 //! where
 //!     V: Visit<'ast, T> + ?Sized,
 //! {
-//!     visitor.visit_unresolved_object_name(&node.name);
+//!     visitor.visit_item_name(&node.name);
 //!     visitor.visit_function_args(&node.args);
 //!     if let Some(filter) = &node.filter {
 //!         visitor.visit_expr(&*filter);
@@ -66,8 +66,8 @@
 //! ```
 //! use std::error::Error;
 //!
-//! use sql_parser::ast::{AstInfo, Query, Raw};
-//! use sql_parser::ast::visit::{self, Visit};
+//! use mz_sql_parser::ast::{AstInfo, Query, Raw};
+//! use mz_sql_parser::ast::visit::{self, Visit};
 //!
 //! struct SubqueryCounter {
 //!     count: usize,
@@ -77,7 +77,7 @@
 //!     fn visit_query(&mut self, query: &'ast Query<Raw>) {
 //!         self.count += 1;
 //!
-//!         // Delegate to the default implentation to visit any nested
+//!         // Delegate to the default implementation to visit any nested
 //!         // subqueries. Placing this call at the end of the method results
 //!         // in a pre-order traversal. Place it at the beginning for a
 //!         // post-order traversal instead.
@@ -87,11 +87,11 @@
 //!
 //! fn main() -> Result<(), Box<dyn Error>> {
 //!     let sql = "SELECT (SELECT 1) FROM (SELECT 1) WHERE EXISTS (SELECT (SELECT 1))";
-//!     let stmts = sql_parser::parser::parse_statements(sql.into())?;
+//!     let stmts = mz_sql_parser::parser::parse_statements(sql.into())?;
 //!
 //!     let mut counter = SubqueryCounter { count: 0 };
 //!     for stmt in &stmts {
-//!         counter.visit_statement(stmt);
+//!         counter.visit_statement(&stmt.ast);
 //!     }
 //!     assert_eq!(counter.count, 5);
 //!     Ok(())
@@ -105,8 +105,8 @@
 //! ```
 //! use std::error::Error;
 //!
-//! use sql_parser::ast::{Ident, Raw, AstInfo, RawName};
-//! use sql_parser::ast::visit::{self, Visit};
+//! use mz_sql_parser::ast::{Ident, Raw, AstInfo, RawItemName};
+//! use mz_sql_parser::ast::visit::{self, Visit};
 //!
 //! struct IdentCollector<'ast> {
 //!     idents: Vec<&'ast Ident>,
@@ -117,9 +117,9 @@
 //!         self.idents.push(node);
 //!         visit::visit_ident(self, node);
 //!     }
-//!     fn visit_object_name(&mut self, name: &'ast <Raw as AstInfo>::ObjectName) {
+//!     fn visit_item_name(&mut self, name: &'ast <Raw as AstInfo>::ItemName) {
 //!         match name {
-//!             RawName::Name(n) | RawName::Id(_, n) => {
+//!             RawItemName::Name(n) | RawItemName::Id(_, n, _) => {
 //!                 for node in &n.0 {
 //!                     self.idents.push(node);
 //!                     visit::visit_ident(self, node);
@@ -131,19 +131,24 @@
 //!
 //! fn main() -> Result<(), Box<dyn Error>> {
 //!     let sql = "SELECT a FROM b.c WHERE 1 + d(e)";
-//!     let stmts = sql_parser::parser::parse_statements(sql.into())?;
+//!     let stmts = mz_sql_parser::parser::parse_statements(sql.into())?;
 //!
 //!     let mut collector = IdentCollector { idents: vec![] };
 //!     for stmt in &stmts {
-//!         collector.visit_statement(stmt);
+//!         collector.visit_statement(&stmt.ast);
 //!     }
 //!     assert_eq!(collector.idents, &[
-//!         &Ident::new("a"), &Ident::new("b"), &Ident::new("c"),
-//!         &Ident::new("d"), &Ident::new("e"),
+//!         &Ident::new_unchecked("a"), &Ident::new_unchecked("b"),
+//!         &Ident::new_unchecked("c"), &Ident::new_unchecked("d"),
+//!         &Ident::new_unchecked("e"),
 //!     ]);
 //!     Ok(())
 //! }
 //! ```
+//!
+//! The [`VisitNode`] trait is implemented for every node in the AST and can be
+//! used to write generic functions that apply a `Visit` implementation to any
+//! node in the AST.
 //!
 //! # Implementation notes
 //!
@@ -159,6 +164,6 @@
 #![allow(clippy::all)]
 #![allow(unused_variables)]
 
-use super::*;
+use crate::ast::*;
 
 include!(concat!(env!("OUT_DIR"), "/visit.rs"));

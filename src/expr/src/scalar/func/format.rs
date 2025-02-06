@@ -11,19 +11,26 @@
 //!
 //! <https://www.postgresql.org/docs/current/functions-formatting.html>
 
+#![allow(non_camel_case_types)]
+
 use std::fmt;
 
 use aho_corasick::AhoCorasickBuilder;
-use enum_iterator::IntoEnumIterator;
+use enum_iterator::Sequence;
+use mz_lowertest::MzReflect;
+use mz_ore::cast::CastFrom;
+use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use serde::{Deserialize, Serialize};
 
 use crate::scalar::func::TimestampLike;
 
+include!(concat!(env!("OUT_DIR"), "/mz_expr.scalar.func.format.rs"));
+
 /// The raw tokens that can appear in a format string. Many of these tokens
 /// overlap, in which case the longest matching token should be selected.
-#[allow(non_camel_case_types)]
 #[repr(u8)]
-#[derive(Eq, PartialEq, TryFromPrimitive, IntoPrimitive, IntoEnumIterator)]
+#[derive(Eq, PartialEq, TryFromPrimitive, IntoPrimitive, Sequence)]
 enum DateTimeToken {
     a_d,
     A_D,
@@ -133,7 +140,7 @@ enum DateTimeToken {
 impl DateTimeToken {
     /// Returns the literal sequence of characters that this `DateTimeToken`
     /// matches.
-    fn pattern(&self) -> &'static str {
+    const fn pattern(&self) -> &'static str {
         match self {
             DateTimeToken::AD => "AD",
             DateTimeToken::ad => "ad",
@@ -244,7 +251,7 @@ impl DateTimeToken {
     /// Returns the list of all known patterns, in the same order as the enum
     /// variants.
     fn patterns() -> Vec<&'static str> {
-        Self::into_enum_iter().map(|v| v.pattern()).collect()
+        enum_iterator::all::<Self>().map(|v| v.pattern()).collect()
     }
 
     /// Returns the `DateTimeField` associated with this token, if any.
@@ -401,7 +408,9 @@ impl DateTimeToken {
 }
 
 /// Specifies the ordinal suffix that should be attached to numeric fields.
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+#[derive(
+    Debug, Eq, PartialEq, PartialOrd, Ord, Copy, Clone, Hash, Serialize, Deserialize, MzReflect,
+)]
 enum OrdinalMode {
     /// No ordinal suffix.
     None,
@@ -438,9 +447,38 @@ impl OrdinalMode {
     }
 }
 
+impl RustType<ProtoOrdinalMode> for OrdinalMode {
+    fn into_proto(&self) -> ProtoOrdinalMode {
+        use proto_ordinal_mode::*;
+
+        let kind = match self {
+            Self::None => Kind::None(()),
+            Self::Lower => Kind::Lower(()),
+            Self::Upper => Kind::Upper(()),
+        };
+        ProtoOrdinalMode { kind: Some(kind) }
+    }
+
+    fn from_proto(proto: ProtoOrdinalMode) -> Result<Self, TryFromProtoError> {
+        use proto_ordinal_mode::*;
+
+        let kind = proto
+            .kind
+            .ok_or_else(|| TryFromProtoError::missing_field("ProtoOrdinalMode::kind"))?;
+        let x = match kind {
+            Kind::None(()) => Self::None,
+            Kind::Lower(()) => Self::Lower,
+            Kind::Upper(()) => Self::Upper,
+        };
+        Ok(x)
+    }
+}
+
 /// Specifies the capitalization of a word.
 #[allow(clippy::enum_variant_names)] // Having "Caps" in the variant names is clarifying.
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+#[derive(
+    Debug, Eq, PartialEq, PartialOrd, Ord, Copy, Clone, Hash, Serialize, Deserialize, MzReflect,
+)]
 enum WordCaps {
     /// All of the letters should be capitalized.
     AllCaps,
@@ -450,11 +488,38 @@ enum WordCaps {
     NoCaps,
 }
 
+impl RustType<ProtoWordCaps> for WordCaps {
+    fn into_proto(&self) -> ProtoWordCaps {
+        use proto_word_caps::*;
+
+        let kind = match self {
+            Self::AllCaps => Kind::AllCaps(()),
+            Self::FirstCaps => Kind::FirstCaps(()),
+            Self::NoCaps => Kind::NoCaps(()),
+        };
+        ProtoWordCaps { kind: Some(kind) }
+    }
+
+    fn from_proto(proto: ProtoWordCaps) -> Result<Self, TryFromProtoError> {
+        use proto_word_caps::*;
+
+        let kind = proto
+            .kind
+            .ok_or_else(|| TryFromProtoError::missing_field("ProtoWordCaps::kind"))?;
+        let x = match kind {
+            Kind::AllCaps(()) => Self::AllCaps,
+            Kind::FirstCaps(()) => Self::FirstCaps,
+            Kind::NoCaps(()) => Self::NoCaps,
+        };
+        Ok(x)
+    }
+}
+
 /// A date-time field.
 ///
 /// The variants are largely self-evident, but are described in detail in the
 /// PostgreSQL documentation if necessary.
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Clone, Hash, Serialize, Deserialize, MzReflect)]
 enum DateTimeField {
     Hour12,
     Hour24,
@@ -494,8 +559,131 @@ enum DateTimeField {
     TimezoneOffset,
 }
 
+impl RustType<ProtoDateTimeField> for DateTimeField {
+    fn into_proto(&self) -> ProtoDateTimeField {
+        use proto_date_time_field::*;
+
+        let kind = match self {
+            Self::Hour12 => Kind::Hour12(()),
+            Self::Hour24 => Kind::Hour24(()),
+            Self::Minute => Kind::Minute(()),
+            Self::Second => Kind::Second(()),
+            Self::Millisecond => Kind::Millisecond(()),
+            Self::Microsecond => Kind::Microsecond(()),
+            Self::SecondsPastMidnight => Kind::SecondsPastMidnight(()),
+            Self::Meridiem { dots, caps } => Kind::Meridiem(ProtoIndicator {
+                dots: dots.into_proto(),
+                caps: caps.into_proto(),
+            }),
+            Self::Year1 => Kind::Year1(()),
+            Self::Year2 => Kind::Year2(()),
+            Self::Year3 => Kind::Year3(()),
+            Self::Year4 { separator } => Kind::Year4(separator.into_proto()),
+            Self::IsoYear1 => Kind::IsoYear1(()),
+            Self::IsoYear2 => Kind::IsoYear2(()),
+            Self::IsoYear3 => Kind::IsoYear3(()),
+            Self::IsoYear4 => Kind::IsoYear4(()),
+            Self::Era { dots, caps } => Kind::Era(ProtoIndicator {
+                dots: dots.into_proto(),
+                caps: caps.into_proto(),
+            }),
+            Self::MonthName { abbrev, caps } => Kind::MonthName(ProtoName {
+                abbrev: abbrev.into_proto(),
+                caps: Some(caps.into_proto()),
+            }),
+            Self::MonthOfYear => Kind::MonthOfYear(()),
+            Self::DayName { abbrev, caps } => Kind::DayName(ProtoName {
+                abbrev: abbrev.into_proto(),
+                caps: Some(caps.into_proto()),
+            }),
+            Self::DayOfWeek => Kind::DayOfWeek(()),
+            Self::IsoDayOfWeek => Kind::IsoDayOfWeek(()),
+            Self::DayOfMonth => Kind::DayOfMonth(()),
+            Self::DayOfYear => Kind::DayOfYear(()),
+            Self::IsoDayOfYear => Kind::IsoDayOfYear(()),
+            Self::WeekOfMonth => Kind::WeekOfMonth(()),
+            Self::WeekOfYear => Kind::WeekOfYear(()),
+            Self::IsoWeekOfYear => Kind::IsoWeekOfYear(()),
+            Self::Century => Kind::Century(()),
+            Self::JulianDay => Kind::JulianDay(()),
+            Self::Quarter => Kind::Quarter(()),
+            Self::MonthInRomanNumerals { caps } => Kind::MonthInRomanNumerals(caps.into_proto()),
+            Self::Timezone { caps } => Kind::Timezone(caps.into_proto()),
+            Self::TimezoneHours => Kind::TimezoneHours(()),
+            Self::TimezoneMinutes => Kind::TimezoneMinutes(()),
+            Self::TimezoneOffset => Kind::TimezoneOffset(()),
+        };
+        ProtoDateTimeField { kind: Some(kind) }
+    }
+
+    fn from_proto(proto: ProtoDateTimeField) -> Result<Self, TryFromProtoError> {
+        use proto_date_time_field::*;
+
+        let kind = proto
+            .kind
+            .ok_or_else(|| TryFromProtoError::missing_field("ProtoDateTimeField::kind"))?;
+        let x = match kind {
+            Kind::Hour12(()) => Self::Hour12,
+            Kind::Hour24(()) => Self::Hour24,
+            Kind::Minute(()) => Self::Minute,
+            Kind::Second(()) => Self::Second,
+            Kind::Millisecond(()) => Self::Millisecond,
+            Kind::Microsecond(()) => Self::Microsecond,
+            Kind::SecondsPastMidnight(()) => Self::SecondsPastMidnight,
+            Kind::Meridiem(x) => Self::Meridiem {
+                dots: x.dots.into_rust()?,
+                caps: x.caps.into_rust()?,
+            },
+            Kind::Year1(()) => Self::Year1,
+            Kind::Year2(()) => Self::Year2,
+            Kind::Year3(()) => Self::Year3,
+            Kind::Year4(x) => Self::Year4 {
+                separator: x.into_rust()?,
+            },
+            Kind::IsoYear1(()) => Self::IsoYear1,
+            Kind::IsoYear2(()) => Self::IsoYear2,
+            Kind::IsoYear3(()) => Self::IsoYear3,
+            Kind::IsoYear4(()) => Self::IsoYear4,
+            Kind::Era(x) => Self::Era {
+                dots: x.dots.into_rust()?,
+                caps: x.caps.into_rust()?,
+            },
+            Kind::MonthName(x) => Self::MonthName {
+                abbrev: x.abbrev.into_rust()?,
+                caps: x.caps.into_rust_if_some("ProtoName::caps")?,
+            },
+            Kind::MonthOfYear(()) => Self::MonthOfYear,
+            Kind::DayName(x) => Self::DayName {
+                abbrev: x.abbrev.into_rust()?,
+                caps: x.caps.into_rust_if_some("ProtoName::caps")?,
+            },
+            Kind::DayOfWeek(()) => Self::DayOfWeek,
+            Kind::IsoDayOfWeek(()) => Self::IsoDayOfWeek,
+            Kind::DayOfMonth(()) => Self::DayOfMonth,
+            Kind::DayOfYear(()) => Self::DayOfYear,
+            Kind::IsoDayOfYear(()) => Self::IsoDayOfYear,
+            Kind::WeekOfMonth(()) => Self::WeekOfMonth,
+            Kind::WeekOfYear(()) => Self::WeekOfYear,
+            Kind::IsoWeekOfYear(()) => Self::IsoWeekOfYear,
+            Kind::Century(()) => Self::Century,
+            Kind::JulianDay(()) => Self::JulianDay,
+            Kind::Quarter(()) => Self::Quarter,
+            Kind::MonthInRomanNumerals(x) => Self::MonthInRomanNumerals {
+                caps: x.into_rust()?,
+            },
+            Kind::Timezone(x) => Self::Timezone {
+                caps: x.into_rust()?,
+            },
+            Kind::TimezoneHours(()) => Self::TimezoneHours,
+            Kind::TimezoneMinutes(()) => Self::TimezoneMinutes,
+            Kind::TimezoneOffset(()) => Self::TimezoneOffset,
+        };
+        Ok(x)
+    }
+}
+
 /// An element of a date-time format string.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, MzReflect)]
 enum DateTimeFormatNode {
     /// A field whose value will be computed from the input timestamp.
     Field {
@@ -511,6 +699,43 @@ enum DateTimeFormatNode {
     },
     /// A literal character.
     Literal(char),
+}
+
+impl RustType<ProtoDateTimeFormatNode> for DateTimeFormatNode {
+    fn into_proto(&self) -> ProtoDateTimeFormatNode {
+        use proto_date_time_format_node::*;
+
+        let kind = match self {
+            Self::Field {
+                field,
+                fill,
+                ordinal,
+            } => Kind::Field(ProtoField {
+                field: Some(field.into_proto()),
+                fill: fill.into_proto(),
+                ordinal: Some(ordinal.into_proto()),
+            }),
+            Self::Literal(c) => Kind::Literal(c.into_proto()),
+        };
+        ProtoDateTimeFormatNode { kind: Some(kind) }
+    }
+
+    fn from_proto(proto: ProtoDateTimeFormatNode) -> Result<Self, TryFromProtoError> {
+        use proto_date_time_format_node::*;
+
+        let kind = proto
+            .kind
+            .ok_or_else(|| TryFromProtoError::missing_field("ProtoDateTimeFormatNode::kind"))?;
+        let x = match kind {
+            Kind::Field(x) => Self::Field {
+                field: x.field.into_rust_if_some("ProtoField::field")?,
+                fill: x.fill.into_rust()?,
+                ordinal: x.ordinal.into_rust_if_some("ProtoField::ordinal")?,
+            },
+            Kind::Literal(x) => Self::Literal(x.into_rust()?),
+        };
+        Ok(x)
+    }
 }
 
 const WEEKDAYS_ALL_CAPS: [&str; 7] = [
@@ -734,34 +959,34 @@ impl DateTimeFormatNode {
                     DateTimeField::MonthName {
                         abbrev: true,
                         caps: AllCaps,
-                    } => write_str!(MONTHS_ABBREV_ALL_CAPS[ts.month0() as usize]),
+                    } => write_str!(MONTHS_ABBREV_ALL_CAPS[usize::cast_from(ts.month0())]),
                     DateTimeField::MonthName {
                         abbrev: true,
                         caps: FirstCaps,
-                    } => write_str!(MONTHS_ABBREV_FIRST_CAPS[ts.month0() as usize]),
+                    } => write_str!(MONTHS_ABBREV_FIRST_CAPS[usize::cast_from(ts.month0())]),
                     DateTimeField::MonthName {
                         abbrev: true,
                         caps: NoCaps,
-                    } => write_str!(MONTHS_ABBREV_NO_CAPS[ts.month0() as usize]),
+                    } => write_str!(MONTHS_ABBREV_NO_CAPS[usize::cast_from(ts.month0())]),
                     DateTimeField::MonthName {
                         abbrev: false,
                         caps: AllCaps,
-                    } => write_str!(MONTHS_ALL_CAPS[ts.month0() as usize], 9),
+                    } => write_str!(MONTHS_ALL_CAPS[usize::cast_from(ts.month0())], 9),
                     DateTimeField::MonthName {
                         abbrev: false,
                         caps: FirstCaps,
-                    } => write_str!(MONTHS_FIRST_CAPS[ts.month0() as usize], 9),
+                    } => write_str!(MONTHS_FIRST_CAPS[usize::cast_from(ts.month0())], 9),
                     DateTimeField::MonthName {
                         abbrev: false,
                         caps: NoCaps,
-                    } => write_str!(MONTHS_NO_CAPS[ts.month0() as usize], 9),
+                    } => write_str!(MONTHS_NO_CAPS[usize::cast_from(ts.month0())], 9),
                     DateTimeField::Millisecond => write_num!(ts.nanosecond() / 1_000_000, 3),
                     DateTimeField::Quarter => write_num!(ts.month0() / 3 + 1),
                     DateTimeField::MonthInRomanNumerals { caps: true } => {
-                        write_str!(MONTHS_ROMAN_CAPS[ts.month0() as usize], 4)
+                        write_str!(MONTHS_ROMAN_CAPS[usize::cast_from(ts.month0())], 4)
                     }
                     DateTimeField::MonthInRomanNumerals { caps: false } => {
-                        write_str!(MONTHS_ROMAN_NO_CAPS[ts.month0() as usize], 4)
+                        write_str!(MONTHS_ROMAN_NO_CAPS[usize::cast_from(ts.month0())], 4)
                     }
                     DateTimeField::Second => write_num!(ts.second(), 2),
                     DateTimeField::SecondsPastMidnight => {
@@ -790,12 +1015,13 @@ impl DateTimeFormatNode {
 }
 
 /// A compiled date-time format string.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, MzReflect)]
 pub struct DateTimeFormat(Vec<DateTimeFormatNode>);
 
 impl DateTimeFormat {
     /// Compiles a new `DateTimeFormat` from the input string `s`.
     pub fn compile(s: &str) -> DateTimeFormat {
-        // The approach here uses the Aho-Coarsick string searching algorithm to
+        // The approach here uses the Aho-Corasick string searching algorithm to
         // repeatedly and efficiently find the next token of interest. Tokens of
         // interest are typically field specifiers, like "DDDD", or field
         // modifiers, like "FM". Characters in between tokens of interest are
@@ -811,14 +1037,18 @@ impl DateTimeFormat {
 
         let matcher = AhoCorasickBuilder::new()
             .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-            .build(DateTimeToken::patterns());
+            .build(DateTimeToken::patterns())
+            .unwrap_or_else(|e| panic!("automaton build error: {e}"));
 
         let matches: Vec<_> = matcher
             .find_iter(&s)
             .map(|m| Match {
                 start: m.start(),
                 end: m.end(),
-                token: DateTimeToken::try_from(m.pattern() as u8).expect("match pattern missing"),
+                token: DateTimeToken::try_from(
+                    u8::try_from(m.pattern().as_u32()).expect("match index fits in a u8"),
+                )
+                .expect("match pattern missing"),
             })
             .collect();
 
@@ -872,12 +1102,29 @@ impl DateTimeFormat {
     /// Renders the format string using the timestamp `ts` as the input. The
     /// placeholders in the format string will be filled in appropriately
     /// according to the value of `ts`.
-    pub fn render(&self, ts: impl TimestampLike) -> String {
+    pub fn render(&self, ts: &impl TimestampLike) -> String {
         let mut out = String::new();
         for node in &self.0 {
-            node.render(&mut out, &ts)
+            node.render(&mut out, ts)
                 .expect("rendering to string cannot fail");
         }
         out
+    }
+}
+
+impl RustType<ProtoDateTimeFormat> for DateTimeFormat {
+    fn into_proto(&self) -> ProtoDateTimeFormat {
+        ProtoDateTimeFormat {
+            nodes: self.0.iter().map(RustType::into_proto).collect(),
+        }
+    }
+
+    fn from_proto(proto: ProtoDateTimeFormat) -> Result<Self, TryFromProtoError> {
+        let nodes = proto
+            .nodes
+            .into_iter()
+            .map(RustType::from_proto)
+            .collect::<Result<_, _>>()?;
+        Ok(Self(nodes))
     }
 }

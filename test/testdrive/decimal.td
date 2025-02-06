@@ -7,53 +7,43 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # This test exercises decimals at the boundary (e.g., by sending them through
 # pgwire). Operations on decimals are more thoroughly tested in decimal.slt.
 
 $ set schema={
+    "name": "row",
     "type": "record",
-    "name": "envelope",
     "fields": [
       {
-        "name": "before",
-        "type": [
-          {
-            "name": "row",
-            "type": "record",
-            "fields": [
-              {
-                "name": "a",
-                "type": {
-                  "type": "bytes",
-                  "scale": 2,
-                  "precision": 15,
-                  "logicalType": "decimal"
-                }
-              }
-            ]
-          },
-          "null"
-        ]
-      },
-      { "name": "after", "type": ["row", "null"] }
+        "name": "a",
+        "type": {
+          "type": "bytes",
+          "scale": 2,
+          "precision": 15,
+          "logicalType": "decimal"
+        }
+      }
     ]
   }
 
 $ kafka-create-topic topic=data
 
-$ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"row":{"a": [7, 2]}}}
-{"before": null, "after": {"row":{"a": [186]}}}
+$ kafka-ingest format=avro topic=data schema=${schema}
+{"a": [7, 2]}
+{"a": [186]}
 
-$ kafka-ingest format=avro topic=data schema=${schema} timestamp=2
-{"before": null, "after": null}
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE SOURCE data
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
 
-> CREATE MATERIALIZED VIEW data_view as SELECT * from data
+> CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-data-${testdrive.seed}")
+  FORMAT AVRO USING SCHEMA '${schema}'
 
-> SELECT * FROM data_view
+> SELECT * FROM data_tbl
 17.94
 -0.7

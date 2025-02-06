@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Root union schemas are expanded to multiple columns
 #
@@ -18,10 +20,16 @@ $ kafka-create-topic topic=avro-decode-type-multi-record
 $ kafka-ingest format=avro topic=avro-decode-type-multi-record schema=${multi-record} timestamp=1
 {"f1": {"f1":123}}
 
-> CREATE MATERIALIZED SOURCE avro_decode_type_multi_record
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-decode-type-multi-record-${testdrive.seed}'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE avro_decode_type_multi_record
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-avro-decode-type-multi-record-${testdrive.seed}')
+
+> CREATE TABLE avro_decode_type_multi_record_tbl FROM SOURCE avro_decode_type_multi_record (REFERENCE "testdrive-avro-decode-type-multi-record-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${multi-record}'
   ENVELOPE NONE
 
-> SELECT (f1).f1, (f2).f2 FROM avro_decode_type_multi_record
+> SELECT (f1).f1, (f2).f2 FROM avro_decode_type_multi_record_tbl
 123 <null>

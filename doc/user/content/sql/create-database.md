@@ -3,7 +3,7 @@ title: "CREATE DATABASE"
 description: "`CREATE DATABASE` creates a new database."
 menu:
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
 
 `CREATE DATABASE` creates a new database.
@@ -38,16 +38,22 @@ details](../namespaces/#database-details).
 
 ## Examples
 
-```sql
+```mzsql
 CREATE DATABASE IF NOT EXISTS my_db;
 ```
-```sql
+```mzsql
 SHOW DATABASES;
 ```
 ```nofmt
 materialize
 my_db
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `CREATEDB` privileges on the system.
 
 ## Related pages
 

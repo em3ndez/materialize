@@ -11,42 +11,53 @@
 
 #![warn(missing_debug_implementations)]
 
-use std::fmt;
+use std::collections::BTreeSet;
 use std::ops::Deref;
 
+use mz_repr::GlobalId;
+use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 
-use repr::{ColumnType, ScalarType};
-
 mod id;
+mod interpret;
 mod linear;
 mod relation;
 mod scalar;
 
 pub mod explain;
+pub mod row;
+pub mod virtual_syntax;
+pub mod visit;
 
-pub use relation::canonicalize;
-
-pub use id::{GlobalId, Id, LocalId, PartitionId, SourceInstanceId};
+pub use id::{Id, LocalId, ProtoId, ProtoLocalId, SourceInstanceId};
+pub use interpret::{ColumnSpec, ColumnSpecs, Interpreter, ResultSpec, Trace, TraceSummary};
+pub use linear::plan::{MfpPlan, SafeMfpPlan};
+pub use linear::util::{join_permutations, permutation_for_arrangement};
 pub use linear::{
-    memoize_expr,
-    plan::{MfpPlan, SafeMfpPlan},
-    util::permutation_to_map_and_new_arity,
-    MapFilterProject,
+    memoize_expr, MapFilterProject, ProtoMapFilterProject, ProtoMfpPlan, ProtoSafeMfpPlan,
 };
-pub use relation::func::{AggregateFunc, TableFunc};
-pub use relation::func::{AnalyzedRegex, CaptureGroupDesc};
+pub use relation::func::order_aggregate_datums as order_aggregate_datums_exported_for_benchmarking;
+pub use relation::func::{
+    AggregateFunc, AnalyzedRegex, CaptureGroupDesc, LagLeadType, NaiveOneByOneAggr, OneByOneAggr,
+    TableFunc,
+};
 pub use relation::join_input_mapper::JoinInputMapper;
 pub use relation::{
-    compare_columns, AggregateExpr, ColumnOrder, JoinImplementation, MirRelationExpr,
-    RowSetFinishing, RECURSION_LIMIT,
+    canonicalize, compare_columns, non_nullable_columns, AccessStrategy, AggregateExpr,
+    CollectionPlan, ColumnOrder, JoinImplementation, JoinInputCharacteristics, LetRecLimit,
+    MirRelationExpr, ProtoAggregateExpr, ProtoAggregateFunc, ProtoColumnOrder,
+    ProtoRowSetFinishing, ProtoTableFunc, RowSetFinishing, WindowFrame, WindowFrameBound,
+    WindowFrameUnits, RECURSION_LIMIT,
 };
-pub use scalar::func::{self, BinaryFunc, NullaryFunc, UnaryFunc, VariadicFunc};
-pub use scalar::{like_pattern, EvalError, MirScalarExpr};
+pub use scalar::func::{self, BinaryFunc, UnaryFunc, UnmaterializableFunc, VariadicFunc};
+pub use scalar::{
+    like_pattern, EvalError, FilterCharacteristics, MirScalarExpr, ProtoDomainLimit,
+    ProtoEvalError, ProtoMirScalarExpr,
+};
 
 /// A [`MirRelationExpr`] that claims to have been optimized, e.g., by an
 /// `transform::Optimizer`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Arbitrary)]
 pub struct OptimizedMirRelationExpr(pub MirRelationExpr);
 
 impl OptimizedMirRelationExpr {
@@ -56,6 +67,14 @@ impl OptimizedMirRelationExpr {
     /// machinery of the optimizer.
     pub fn declare_optimized(expr: MirRelationExpr) -> OptimizedMirRelationExpr {
         OptimizedMirRelationExpr(expr)
+    }
+
+    /// Get mutable access to the inner [MirRelationExpr]
+    ///
+    /// Callers of this method need to ensure that the underlying expression stays optimized after
+    /// any mutations are applied
+    pub fn as_inner(&self) -> &MirRelationExpr {
+        &self.0
     }
 
     /// Get mutable access to the inner [MirRelationExpr]
@@ -79,42 +98,8 @@ impl Deref for OptimizedMirRelationExpr {
     }
 }
 
-/// A trait for humanizing components of an expression.
-pub trait ExprHumanizer: fmt::Debug {
-    /// Attempts to return the a human-readable string for the relation
-    /// identified by `id`.
-    fn humanize_id(&self, id: GlobalId) -> Option<String>;
-
-    /// Returns a human-readable name for the specified scalar type.
-    fn humanize_scalar_type(&self, ty: &ScalarType) -> String;
-
-    /// Returns a human-readable name for the specified scalar type.
-    fn humanize_column_type(&self, typ: &ColumnType) -> String {
-        format!(
-            "{}{}",
-            self.humanize_scalar_type(&typ.scalar_type),
-            if typ.nullable { "?" } else { "" }
-        )
-    }
-}
-
-/// A bare-minimum implementation of [`ExprHumanizer`].
-///
-/// The `DummyHumanizer` does a poor job of humanizing expressions. It is
-/// intended for use in contexts where polish is not required, like in tests or
-/// while debugging.
-#[derive(Debug)]
-pub struct DummyHumanizer;
-
-impl ExprHumanizer for DummyHumanizer {
-    fn humanize_id(&self, _: GlobalId) -> Option<String> {
-        // Returning `None` allows the caller to fall back to displaying the
-        // ID, if they so desire.
-        None
-    }
-
-    fn humanize_scalar_type(&self, ty: &ScalarType) -> String {
-        // The debug implementation is better than nothing.
-        format!("{:?}", ty)
+impl CollectionPlan for OptimizedMirRelationExpr {
+    fn depends_on_into(&self, out: &mut BTreeSet<GlobalId>) {
+        self.0.depends_on_into(out)
     }
 }

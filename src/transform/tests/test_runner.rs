@@ -7,29 +7,37 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-/// This module defines a small language for directly constructing RelationExprs and running
-/// various optimizations on them. It uses datadriven, so the output of each test can be rewritten
-/// by setting the REWRITE environment variable.
-/// TODO(justin):
-/// * It's currently missing a mechanism to run just a single test file
-/// * There is some duplication between this and the SQL planner
+//! This module defines a small language for directly constructing RelationExprs and running
+//! various optimizations on them. It uses datadriven, so the output of each test can be rewritten
+//! by setting the REWRITE environment variable.
+//! TODO(justin):
+//! * It's currently missing a mechanism to run just a single test file
+//! * There is some duplication between this and the SQL planner
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::fmt::Write;
 
     use anyhow::{anyhow, Error};
-    use expr::{GlobalId, Id, MirRelationExpr};
-    use expr_test_util::{
-        build_rel, generate_explanation, json_to_spec, MirRelationExprDeserializeContext,
-        TestCatalog, RTI,
+    use mz_expr::explain::ExplainContext;
+    use mz_expr::{Id, MirRelationExpr};
+    use mz_expr_test_util::{
+        build_rel, json_to_spec, MirRelationExprDeserializeContext, TestCatalog,
     };
-    use lowertest::{deserialize, tokenize};
-    use ore::str::separated;
+    use mz_lowertest::{deserialize, tokenize};
+    use mz_ore::collections::HashMap;
+    use mz_ore::str::separated;
+    use mz_repr::explain::{Explain, ExplainConfig, ExplainFormat};
+    use mz_repr::optimize::{OptimizerFeatures, OverrideFrom};
+    use mz_repr::GlobalId;
+    use mz_transform::dataflow::{
+        optimize_dataflow_demand_inner, optimize_dataflow_filters_inner, DataflowMetainfo,
+    };
+    use mz_transform::{typecheck, Optimizer, Transform, TransformCtx};
     use proc_macro2::TokenTree;
-    use transform::dataflow::{optimize_dataflow_demand_inner, optimize_dataflow_filters_inner};
-    use transform::{Optimizer, Transform, TransformArgs};
+
+    use crate::explain::Explainable;
 
     // Global options
     const IN: &str = "in";
@@ -39,20 +47,26 @@ mod tests {
     const TEST: &str = "test";
 
     thread_local! {
-        static FULL_TRANSFORM_LIST: Vec<Box<dyn Transform>> =
-            Optimizer::logical_optimizer()
+        static FULL_TRANSFORM_LIST: Vec<Box<dyn Transform>> = {
+            let features = OptimizerFeatures::default();
+            let typecheck_ctx = typecheck::empty_context();
+            let mut df_meta = DataflowMetainfo::default();
+            let mut transform_ctx = TransformCtx::local(&features, &typecheck_ctx, &mut df_meta, None);
+
+            #[allow(deprecated)]
+            Optimizer::logical_optimizer(&mut transform_ctx)
                 .transforms
                 .into_iter()
-                .chain(std::iter::once(
-                    Box::new(transform::projection_pushdown::ProjectionPushdown)
-                        as Box<dyn Transform>,
+                .chain(std::iter::once::<Box<dyn Transform>>(
+                    Box::new(mz_transform::movement::ProjectionPushdown::default())
                 ))
-                .chain(std::iter::once(
-                    Box::new(transform::update_let::UpdateLet::default()) as Box<dyn Transform>
+                .chain(std::iter::once::<Box<dyn Transform>>(
+                    Box::new(mz_transform::normalize_lets::NormalizeLets::new(false))
                 ))
-                .chain(Optimizer::logical_cleanup_pass().transforms.into_iter())
-                .chain(Optimizer::physical_optimizer().transforms.into_iter())
-                .collect::<Vec<_>>();
+                .chain(Optimizer::logical_cleanup_pass(&mut transform_ctx, false).transforms.into_iter())
+                .chain(Optimizer::physical_optimizer(&mut transform_ctx).transforms.into_iter())
+                .collect::<Vec<_>>()
+            };
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -111,27 +125,64 @@ mod tests {
                 json_to_spec(&serde_json::to_string(rel).unwrap(), cat).0
             ),
             FormatType::Json => format!("{}\n", serde_json::to_string(rel).unwrap()),
-            FormatType::Explain(format) => generate_explanation(cat, rel, *format),
+            FormatType::Explain(format) => {
+                let format_contains = |key: &str| {
+                    format
+                        .map(|format| format.contains(&key.to_string()))
+                        .unwrap_or(false)
+                };
+
+                let config = ExplainConfig {
+                    arity: false,
+                    join_impls: true,
+                    keys: format_contains("types"), // FIXME: use `keys`
+                    linear_chains: false,
+                    non_negative: false,
+                    raw_plans: false,
+                    raw_syntax: false,
+                    subtree_size: false,
+                    equivalences: false,
+                    timing: false,
+                    types: format_contains("types"),
+                    ..ExplainConfig::default()
+                };
+
+                // Create OptimizerFeatures and override from the config overrides layer.
+                let features = OptimizerFeatures::default().override_from(&config.features);
+
+                let context = ExplainContext {
+                    config: &config,
+                    features: &features,
+                    humanizer: cat,
+                    cardinality_stats: Default::default(), // empty stats
+                    used_indexes: Default::default(),
+                    finishing: Default::default(),
+                    duration: Default::default(),
+                    target_cluster: Default::default(),
+                    optimizer_notices: Default::default(),
+                };
+
+                Explainable(&mut rel.clone())
+                    .explain(&ExplainFormat::Text, &context)
+                    .unwrap()
+            }
         }
     }
 
+    #[mz_ore::instrument(fields(s))]
     fn run_single_view_testcase(
         s: &str,
         cat: &TestCatalog,
         args: &HashMap<String, Vec<String>>,
         test_type: TestType,
     ) -> Result<String, Error> {
+        let features = OptimizerFeatures::default();
+        let typecheck_ctx = typecheck::empty_context();
+        let mut df_meta = DataflowMetainfo::default();
+        let mut transform_ctx = TransformCtx::local(&features, &typecheck_ctx, &mut df_meta, None);
         let mut rel = parse_relation(s, cat, args)?;
-        let mut id_gen = Default::default();
-        let indexes = HashMap::new();
         for t in args.get("apply").cloned().unwrap_or_else(Vec::new).iter() {
-            get_transform(t)?.transform(
-                &mut rel,
-                TransformArgs {
-                    id_gen: &mut id_gen,
-                    indexes: &indexes,
-                },
-            )?;
+            get_transform(t)?.transform(&mut rel, &mut transform_ctx)?;
         }
 
         let format_type = get_format_type(args);
@@ -139,17 +190,11 @@ mod tests {
         let out = match test_type {
             TestType::Opt => FULL_TRANSFORM_LIST.with(|transforms| -> Result<_, Error> {
                 for transform in transforms.iter() {
-                    transform.transform(
-                        &mut rel,
-                        TransformArgs {
-                            id_gen: &mut id_gen,
-                            indexes: &indexes,
-                        },
-                    )?;
+                    transform.transform(&mut rel, &mut transform_ctx)?;
                 }
-                Ok(convert_rel_to_string(&rel, &cat, &format_type))
+                Ok(convert_rel_to_string(&rel, cat, &format_type))
             })?,
-            TestType::Build => convert_rel_to_string(&rel, &cat, &format_type),
+            TestType::Build => convert_rel_to_string(&rel, cat, &format_type),
             TestType::Steps => {
                 // TODO(justin): this thing does not currently peek into fixpoints, so it's not
                 // that helpful for optimizations that involve those (which is most of them).
@@ -157,19 +202,13 @@ mod tests {
                 // Buffer of the names of the transformations that have been applied with no changes.
                 let mut no_change: Vec<String> = Vec::new();
 
-                writeln!(out, "{}", convert_rel_to_string(&rel, &cat, &format_type))?;
+                writeln!(out, "{}", convert_rel_to_string(&rel, cat, &format_type))?;
                 writeln!(out, "====")?;
 
                 FULL_TRANSFORM_LIST.with(|transforms| -> Result<_, Error> {
                     for transform in transforms {
                         let prev = rel.clone();
-                        transform.transform(
-                            &mut rel,
-                            TransformArgs {
-                                id_gen: &mut id_gen,
-                                indexes: &indexes,
-                            },
-                        )?;
+                        transform.transform(&mut rel, &mut transform_ctx)?;
 
                         if rel != prev {
                             if no_change.len() > 0 {
@@ -184,7 +223,7 @@ mod tests {
                             no_change = vec![];
 
                             write!(out, "Applied {:?}:", transform)?;
-                            writeln!(out, "\n{}", convert_rel_to_string(&rel, &cat, &format_type))?;
+                            writeln!(out, "\n{}", convert_rel_to_string(&rel, cat, &format_type))?;
                             writeln!(out, "====")?;
                         } else {
                             no_change.push(format!("{:?}", transform));
@@ -204,7 +243,7 @@ mod tests {
                 }
 
                 writeln!(out, "Final:")?;
-                writeln!(out, "{}", convert_rel_to_string(&rel, &cat, &format_type))?;
+                writeln!(out, "{}", convert_rel_to_string(&rel, cat, &format_type))?;
                 writeln!(out, "====")?;
 
                 out
@@ -227,39 +266,51 @@ mod tests {
         // TODO(justin): is there a way to just extract these from the Optimizer list of
         // transforms?
         match name {
-            "CanonicalizeMfp" => Ok(Box::new(transform::canonicalize_mfp::CanonicalizeMfp)),
-            "ColumnKnowledge" => Ok(Box::new(
-                transform::column_knowledge::ColumnKnowledge::default(),
+            "CanonicalizeMfp" => Ok(Box::new(mz_transform::canonicalize_mfp::CanonicalizeMfp)),
+            "EquivalencePropagation" => Ok(Box::new(
+                mz_transform::equivalence_propagation::EquivalencePropagation::default(),
             )),
-            "Demand" => Ok(Box::new(transform::demand::Demand::default())),
-            "FilterFusion" => Ok(Box::new(transform::fusion::filter::Filter)),
-            "FoldConstants" => Ok(Box::new(transform::reduction::FoldConstants {
+            "Demand" => Ok(Box::new(mz_transform::demand::Demand::default())),
+            "Fusion" => Ok(Box::new(mz_transform::fusion::Fusion)),
+            "FoldConstants" => Ok(Box::new(mz_transform::fold_constants::FoldConstants {
                 limit: None,
             })),
-            "JoinFusion" => Ok(Box::new(transform::fusion::join::Join)),
-            "LiteralLifting" => Ok(Box::new(transform::map_lifting::LiteralLifting::default())),
+            "FlatMapToMap" => Ok(Box::new(mz_transform::canonicalization::FlatMapToMap)),
+            "JoinFusion" => Ok(Box::new(mz_transform::fusion::join::Join)),
+            "LiteralLifting" => Ok(Box::new(
+                mz_transform::literal_lifting::LiteralLifting::default(),
+            )),
             "NonNullRequirements" => Ok(Box::new(
-                transform::nonnull_requirements::NonNullRequirements::default(),
+                mz_transform::non_null_requirements::NonNullRequirements::default(),
             )),
             "PredicatePushdown" => Ok(Box::new(
-                transform::predicate_pushdown::PredicatePushdown::default(),
+                mz_transform::predicate_pushdown::PredicatePushdown::default(),
             )),
             "ProjectionExtraction" => Ok(Box::new(
-                transform::projection_extraction::ProjectionExtraction,
+                mz_transform::canonicalization::ProjectionExtraction,
             )),
             "ProjectionLifting" => Ok(Box::new(
-                transform::projection_lifting::ProjectionLifting::default(),
+                mz_transform::movement::ProjectionLifting::default(),
             )),
-            "ProjectionPushdown" => {
-                Ok(Box::new(transform::projection_pushdown::ProjectionPushdown))
-            }
-            "ReductionPushdown" => Ok(Box::new(transform::reduction_pushdown::ReductionPushdown)),
-            "RedundantJoin" => Ok(Box::new(transform::redundant_join::RedundantJoin::default())),
-            "TopKFusion" => Ok(Box::new(transform::fusion::top_k::TopK)),
-            "UnionBranchCancellation" => {
-                Ok(Box::new(transform::union_cancel::UnionBranchCancellation))
-            }
-            "UnionFusion" => Ok(Box::new(transform::fusion::union::Union)),
+            "ProjectionPushdown" => Ok(Box::new(
+                mz_transform::movement::ProjectionPushdown::default(),
+            )),
+            "ReductionPushdown" => Ok(Box::new(
+                mz_transform::reduction_pushdown::ReductionPushdown,
+            )),
+            "ReduceElision" => Ok(Box::new(mz_transform::reduce_elision::ReduceElision)),
+            "RedundantJoin" => Ok(Box::new(
+                mz_transform::redundant_join::RedundantJoin::default(),
+            )),
+            "RelationCSE" => Ok(Box::new(mz_transform::cse::relation_cse::RelationCSE::new(
+                false,
+            ))),
+            "ThresholdElision" => Ok(Box::new(mz_transform::threshold_elision::ThresholdElision)),
+            "UnionBranchCancellation" => Ok(Box::new(
+                mz_transform::union_cancel::UnionBranchCancellation,
+            )),
+            "UnionNegateFusion" => Ok(Box::new(mz_transform::compound::UnionNegateFusion)),
+            "UnionFusion" => Ok(Box::new(mz_transform::fusion::union::Union)),
             _ => Err(anyhow!(
                 "no transform named {} (you might have to add it to get_transform)",
                 name
@@ -274,7 +325,7 @@ mod tests {
         args: &HashMap<String, Vec<String>>,
         test_type: TestType,
     ) -> Result<String, String> {
-        let mut input_stream = tokenize(&s)?.into_iter();
+        let mut input_stream = tokenize(s)?.into_iter();
         let mut dataflow = Vec::new();
         while let Some(token) = input_stream.next() {
             match token {
@@ -289,7 +340,6 @@ mod tests {
                     let rel: MirRelationExpr = deserialize(
                         &mut inner_iter,
                         "MirRelationExpr",
-                        &RTI,
                         &mut MirRelationExprDeserializeContext::new(cat),
                     )?;
                     let id = cat.insert(&name, rel.typ(), true)?;
@@ -303,10 +353,25 @@ mod tests {
         }
         let mut out = String::new();
         if test_type == TestType::Opt {
-            let mut optimizer = Optimizer::logical_optimizer();
+            let features = OptimizerFeatures::default();
+            let typecheck_ctx = typecheck::empty_context();
+            let mut df_meta = DataflowMetainfo::default();
+            let mut transform_ctx =
+                TransformCtx::local(&features, &typecheck_ctx, &mut df_meta, None);
+
+            #[allow(deprecated)]
+            let optimizer = Optimizer::logical_optimizer(&mut transform_ctx);
             dataflow = dataflow
                 .into_iter()
-                .map(|(id, rel)| (id, optimizer.optimize(rel).unwrap().into_inner()))
+                .map(|(id, rel)| {
+                    (
+                        id,
+                        optimizer
+                            .optimize(rel, &mut transform_ctx)
+                            .unwrap()
+                            .into_inner(),
+                    )
+                })
                 .collect();
         }
         match test_type {
@@ -323,18 +388,26 @@ mod tests {
             _ => {}
         };
         if test_type == TestType::Opt {
-            let mut log_optimizer = Optimizer::logical_cleanup_pass();
-            let mut phys_optimizer = Optimizer::physical_optimizer();
+            let features = OptimizerFeatures::default();
+            let typecheck_ctx = typecheck::empty_context();
+            let mut df_meta = DataflowMetainfo::default();
+            let mut transform_ctx =
+                TransformCtx::local(&features, &typecheck_ctx, &mut df_meta, None);
+
+            let log_optimizer = Optimizer::logical_cleanup_pass(&mut transform_ctx, true);
+            let phys_optimizer = Optimizer::physical_optimizer(&mut transform_ctx);
             dataflow = dataflow
                 .into_iter()
                 .map(|(id, rel)| {
-                    (
-                        id,
-                        phys_optimizer
-                            .optimize(log_optimizer.optimize(rel).unwrap().into_inner())
-                            .unwrap()
-                            .into_inner(),
-                    )
+                    let local_mir_plan = log_optimizer
+                        .optimize(rel, &mut transform_ctx)
+                        .unwrap()
+                        .into_inner();
+                    let global_mir_plan = phys_optimizer
+                        .optimize(local_mir_plan, &mut transform_ctx)
+                        .unwrap()
+                        .into_inner();
+                    (id, global_mir_plan)
                 })
                 .collect();
         }
@@ -365,14 +438,14 @@ mod tests {
     ) -> Result<String, String> {
         match transform {
             "filter" => {
-                let mut predicates = HashMap::new();
+                let mut predicates = BTreeMap::new();
                 match optimize_dataflow_filters_inner(dataflow.iter_mut().map(|(id, rel)| (Id::Global(*id), rel)).rev(), &mut predicates) {
                     Ok(()) => Ok(format!("Pushed-down predicates:\n{}", log_pushed_outside_of_dataflow(predicates, cat))),
                     Err(e) => Err(e.to_string()),
                 }
             }
             "project" => {
-                let mut demand = HashMap::new();
+                let mut demand = BTreeMap::new();
                 if let Some((id, rel)) = dataflow.last() {
                     demand.insert(Id::Global(*id), (0..rel.arity()).collect());
                 }
@@ -381,7 +454,7 @@ mod tests {
                     Err(e) => Err(e.to_string()),
                 }
             }
-            _ => return Err(format!(
+            _ => Err(format!(
                 "no cross-view transform named {} (you might have to add it to apply_cross_view_transform)",
                 transform
             ))
@@ -389,7 +462,7 @@ mod tests {
     }
 
     /// Converts a map of (source) -> (information pushed to source) into a string.
-    fn log_pushed_outside_of_dataflow<D>(map: HashMap<Id, D>, cat: &TestCatalog) -> String
+    fn log_pushed_outside_of_dataflow<D>(map: BTreeMap<Id, D>, cat: &TestCatalog) -> String
     where
         D: std::fmt::Debug + Clone,
     {
@@ -409,19 +482,20 @@ mod tests {
         result
     }
 
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `rust_psm_stack_pointer` on OS `linux`
     fn run() {
         datadriven::walk("tests/testdata", |f| {
             let mut catalog = TestCatalog::default();
             f.run(move |s| -> String {
+                let args = s.args.clone().into();
                 match s.directive.as_str() {
                     "cat" => match catalog.handle_test_command(&s.input) {
                         Ok(()) => String::from("ok\n"),
                         Err(err) => format!("error: {}\n", err),
                     },
                     "build" => {
-                        match run_single_view_testcase(&s.input, &catalog, &s.args, TestType::Build)
-                        {
+                        match run_single_view_testcase(&s.input, &catalog, &args, TestType::Build) {
                             // Generally, explanations for fully optimized queries
                             // are not allowed to have whitespace at the end;
                             // however, a partially optimized query can.
@@ -437,25 +511,20 @@ mod tests {
                         }
                     }
                     "opt" => {
-                        match run_single_view_testcase(&s.input, &catalog, &s.args, TestType::Opt) {
+                        match run_single_view_testcase(&s.input, &catalog, &args, TestType::Opt) {
                             Ok(msg) => msg,
                             Err(err) => format!("error: {}\n", err),
                         }
                     }
                     "steps" => {
-                        match run_single_view_testcase(&s.input, &catalog, &s.args, TestType::Steps)
-                        {
+                        match run_single_view_testcase(&s.input, &catalog, &args, TestType::Steps) {
                             Ok(msg) => msg,
                             Err(err) => format!("error: {}\n", err),
                         }
                     }
                     "crossview" => {
-                        match run_multiview_testcase(
-                            &s.input,
-                            &mut catalog,
-                            &s.args,
-                            TestType::Build,
-                        ) {
+                        match run_multiview_testcase(&s.input, &mut catalog, &args, TestType::Build)
+                        {
                             Ok(msg) => format!(
                                 "{}",
                                 separated("\n", msg.split('\n').map(|s| s.trim_end()))
@@ -464,12 +533,8 @@ mod tests {
                         }
                     }
                     "crossviewopt" => {
-                        match run_multiview_testcase(
-                            &s.input,
-                            &mut catalog,
-                            &s.args,
-                            TestType::Build,
-                        ) {
+                        match run_multiview_testcase(&s.input, &mut catalog, &args, TestType::Build)
+                        {
                             Ok(msg) => msg,
                             Err(err) => format!("error: {}\n", err),
                         }
@@ -478,5 +543,62 @@ mod tests {
                 }
             })
         });
+    }
+}
+
+/// This duplicates code from `mz_adapter` as we don't want to move
+/// [`mz_transform::analysis`] and [`mz_transform::normalize_lets`] to
+/// [`mz_expr`].
+mod explain {
+    use mz_expr::explain::{enforce_linear_chains, ExplainContext, ExplainSinglePlan};
+    use mz_expr::MirRelationExpr;
+    use mz_repr::explain::{Explain, ExplainError, UnsupportedFormat};
+    use mz_transform::analysis::annotate_plan;
+    use mz_transform::normalize_lets::normalize_lets;
+
+    /// Newtype struct for wrapping types that should
+    /// implement the [`mz_repr::explain::Explain`] trait.
+    pub(crate) struct Explainable<'a, T>(pub &'a mut T);
+
+    impl<'a> Explain<'a> for Explainable<'a, MirRelationExpr> {
+        type Context = ExplainContext<'a>;
+
+        type Text = ExplainSinglePlan<'a, MirRelationExpr>;
+
+        type Json = UnsupportedFormat;
+
+        type Dot = UnsupportedFormat;
+
+        fn explain_text(
+            &'a mut self,
+            context: &'a Self::Context,
+        ) -> Result<Self::Text, ExplainError> {
+            self.as_explain_single_plan(context)
+        }
+    }
+
+    impl<'a> Explainable<'a, MirRelationExpr> {
+        fn as_explain_single_plan(
+            &'a mut self,
+            context: &'a ExplainContext<'a>,
+        ) -> Result<ExplainSinglePlan<'a, MirRelationExpr>, ExplainError> {
+            // normalize the representation as linear chains
+            // (this implies !context.config.raw_plans by construction)
+            if context.config.linear_chains {
+                enforce_linear_chains(self.0)?;
+            };
+            // unless raw plans are explicitly requested
+            // normalize the representation of nested Let bindings
+            // and enforce sequential Let binding IDs
+            if !context.config.raw_plans {
+                normalize_lets(self.0, context.features)
+                    .map_err(|e| ExplainError::UnknownError(e.to_string()))?;
+            }
+
+            Ok(ExplainSinglePlan {
+                context,
+                plan: annotate_plan(self.0, context)?,
+            })
+        }
     }
 }

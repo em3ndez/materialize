@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Make sure that schema incompatibility issues within arrays are detected and reported
 #
@@ -16,16 +18,29 @@ $ set array-int={"type": "record", "name": "schema_array", "fields": [ {"name": 
 
 $ kafka-create-topic topic=resolution-arrays
 
-$ kafka-ingest format=avro topic=resolution-arrays schema=${array-int} publish=true timestamp=1
+$ kafka-ingest format=avro topic=resolution-arrays schema=${array-int} timestamp=1
 {"f1": [ 123 ] }
 
-> CREATE MATERIALIZED SOURCE resolution_arrays
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-resolution-arrays-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE resolution_arrays
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-resolution-arrays-${testdrive.seed}')
+
+> CREATE TABLE resolution_arrays_tbl FROM SOURCE resolution_arrays (REFERENCE "testdrive-resolution-arrays-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE NONE
 
-$ kafka-ingest format=avro topic=resolution-arrays schema=${array-double} publish=true timestamp=2
+$ kafka-ingest format=avro topic=resolution-arrays schema=${array-double} timestamp=2
 {"f1": [ 234.345 ] }
 
-! SELECT f1[0] FROM resolution_arrays
-Schemas don't match: Double, Int
+! SELECT f1[0] FROM resolution_arrays_tbl
+contains:Writer schema has type `Double`, but reader schema has type `Int` for field `schema_array.f1`
+
+! SELECT f1[0] FROM resolution_arrays_tbl
+contains:failed to resolve Avro schema (id =

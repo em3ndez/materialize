@@ -7,17 +7,21 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! pgtest is a Postgres wire protocol tester using
-//! datadriven test files. It can be used to send [specific
+//! pgtest is a Postgres wire protocol tester using datadriven test files. It
+//! can be used to send [specific
 //! messages](https://www.postgresql.org/docs/current/protocol-message-formats.html)
 //! to any Postgres-compatible server and record received messages.
 //!
-//! The following datadriven directives are supported:
-//! - `send`: Sends input messages to the server. Arguments, if needed,
-//! are specified using JSON. Refer to the associated types to see
-//! supported arguments. Arguments can be omitted to use defaults.
-//! - `until`: Waits until input messages have been received from the
-//! server. Additional messages are accumulated and returned as well.
+//! The following datadriven directives are supported. They support a
+//! `conn=name` argument to specify a non-default connection.
+//! - `send`: Sends input messages to the server. Arguments, if needed, are
+//! specified using JSON. Refer to the associated types to see supported
+//! arguments. Arguments can be omitted to use defaults.
+//! - `until`: Waits until input messages have been received from the server.
+//! Additional messages are accumulated and returned as well.
+//!
+//! The first time a `conn=name` argument is specified, `cluster=name` can also
+//! be specified to set the sessions cluster on initial connection.
 //!
 //! During debugging, set the environment variable `PGTEST_VERBOSE=1` to see
 //! messages sent and received.
@@ -31,13 +35,14 @@
 //! - `Sync`
 //!
 //! Supported `until` arguments:
-//! - `no_error_fields` causes `ErrorResponse` messages to have empty
-//! contents. Useful when none of our fields match Postgres. For example `until
+//! - `no_error_fields` causes `ErrorResponse` messages to have empty contents.
+//! Useful when none of our fields match Postgres. For example `until
 //! no_error_fields`.
 //! - `err_field_typs` specifies the set of error message fields
 //! ([reference](https://www.postgresql.org/docs/current/protocol-error-fields.html)).
-//! For example: `until err_field_typs=VC` would return the severity and code
-//! fields in any ErrorResponse message.
+//! The default is `CMS` (code, message, severity). For example: `until
+//! err_field_typs=SC` would return the severity and code fields in any
+//! ErrorResponse message.
 //!
 //! For example, to execute a simple prepared statement:
 //! ```pgtest
@@ -57,21 +62,48 @@
 //! CommandComplete {"tag":"SELECT 1"}
 //! ReadyForQuery {"status":"I"}
 //! ```
+//!
+//! # Usage while writing tests
+//!
+//! The expected way to use this while writing tests is to generate output from
+//! a postgres server. Use the `pgtest-mz` directory if our output differs
+//! incompatibly from postgres. Write your test, excluding any lines after the
+//! `----` of the `until` directive. For example:
+//! ```pgtest
+//! send
+//! Query {"query": "SELECT 1"}
+//! ----
+//!
+//! until
+//! ReadyForQuery
+//! ----
+//! ```
+//! Then run the pgtest binary, enabling rewrites and pointing it at postgres:
+//! ```shell
+//! REWRITE=1 cargo run --bin mz-pgtest -- test/pgtest/test.pt --addr localhost:5432 --user postgres
+//! ```
+//! This will generate the expected output for the `until` directive. Now rerun
+//! against a running Materialize server:
+//! ```shell
+//! cargo run --bin mz-pgtest -- test/pgtest/test.pt
+//! ```
 
-use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
+use mz_ore::collections::CollectionExt;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use postgres_protocol::IsNull;
 use serde::{Deserialize, Serialize};
 
-pub struct PgTest {
+struct PgConn {
     stream: TcpStream,
     recv_buf: BytesMut,
     send_buf: BytesMut,
@@ -79,35 +111,45 @@ pub struct PgTest {
     verbose: bool,
 }
 
-impl PgTest {
-    pub fn new(addr: &str, user: &str, timeout: Duration) -> anyhow::Result<Self> {
-        let mut pgtest = PgTest {
+impl PgConn {
+    fn new<'a>(
+        addr: &str,
+        user: &'a str,
+        timeout: Duration,
+        verbose: bool,
+        mut options: Vec<(&'a str, &'a str)>,
+    ) -> anyhow::Result<Self> {
+        let mut conn = Self {
             stream: TcpStream::connect(addr)?,
             recv_buf: BytesMut::new(),
             send_buf: BytesMut::new(),
             timeout,
-            verbose: std::env::var_os("PGTEST_VERBOSE").is_some(),
+            verbose,
         };
-        pgtest.stream.set_read_timeout(Some(timeout))?;
-        pgtest.send(|buf| frontend::startup_message(vec![("user", user)], buf).unwrap())?;
-        match pgtest.recv()?.1 {
+
+        conn.stream.set_read_timeout(Some(timeout))?;
+        options.insert(0, ("user", user));
+        options.insert(0, ("welcome_message", "off"));
+        conn.send(|buf| frontend::startup_message(options, buf).unwrap())?;
+        match conn.recv()?.1 {
             Message::AuthenticationOk => {}
             _ => bail!("expected AuthenticationOk"),
         };
-        pgtest.until(vec!["ReadyForQuery"], vec![], HashSet::new())?;
-        Ok(pgtest)
+        conn.until(vec!["ReadyForQuery"], vec!['C', 'S', 'M'], BTreeSet::new())?;
+        Ok(conn)
     }
-    pub fn send<F: Fn(&mut BytesMut)>(&mut self, f: F) -> anyhow::Result<()> {
+
+    fn send<F: FnOnce(&mut BytesMut)>(&mut self, f: F) -> anyhow::Result<()> {
         self.send_buf.clear();
         f(&mut self.send_buf);
         self.stream.write_all(&self.send_buf)?;
         Ok(())
     }
-    pub fn until(
+    fn until(
         &mut self,
         until: Vec<&str>,
         err_field_typs: Vec<char>,
-        ignore: HashSet<String>,
+        ignore: BTreeSet<String>,
     ) -> anyhow::Result<Vec<String>> {
         let mut msgs = Vec::with_capacity(until.len());
         for expect in until {
@@ -120,7 +162,7 @@ impl PgTest {
                     Message::ReadyForQuery(body) => (
                         "ReadyForQuery",
                         serde_json::to_string(&ReadyForQuery {
-                            status: (body.status() as char).to_string(),
+                            status: char::from(body.status()).to_string(),
                         })?,
                     ),
                     Message::RowDescription(body) => (
@@ -181,11 +223,12 @@ impl PgTest {
                             fields: body
                                 .fields()
                                 .filter_map(|f| {
-                                    let typ = f.type_() as char;
+                                    let typ = char::from(f.type_());
                                     if err_field_typs.contains(&typ) {
                                         Ok(Some(ErrorField {
                                             typ,
-                                            value: f.value().to_string(),
+                                            value: String::from_utf8_lossy(f.value_bytes())
+                                                .into_owned(),
                                         }))
                                     } else {
                                         Ok(None)
@@ -201,11 +244,12 @@ impl PgTest {
                             fields: body
                                 .fields()
                                 .filter_map(|f| {
-                                    let typ = f.type_() as char;
+                                    let typ = char::from(f.type_());
                                     if err_field_typs.contains(&typ) {
                                         Ok(Some(ErrorField {
                                             typ,
-                                            value: f.value().to_string(),
+                                            value: String::from_utf8_lossy(f.value_bytes())
+                                                .into_owned(),
                                         }))
                                     } else {
                                         Ok(None)
@@ -221,7 +265,7 @@ impl PgTest {
                             format: format_name(body.format()),
                             column_formats: body
                                 .column_formats()
-                                .map(|format| Ok(format_name(format as u8)))
+                                .map(|format| Ok(format_name(format)))
                                 .collect()
                                 .unwrap(),
                         })?,
@@ -232,7 +276,7 @@ impl PgTest {
                             format: format_name(body.format()),
                             column_formats: body
                                 .column_formats()
-                                .map(|format| Ok(format_name(format as u8)))
+                                .map(|format| Ok(format_name(format)))
                                 .collect()
                                 .unwrap(),
                         })?,
@@ -288,15 +332,91 @@ impl PgTest {
             }
             let mut ch: char = '0';
             if self.recv_buf.len() > 0 {
-                ch = self.recv_buf[0] as char;
+                ch = char::from(self.recv_buf[0]);
             }
             if let Some(msg) = Message::parse(&mut self.recv_buf)? {
                 return Ok((ch, msg));
             };
             // If there was no message, read more bytes.
-            let sz = self.stream.read(&mut buf)?;
+            let sz = match self.stream.read(&mut buf) {
+                Ok(n) => n,
+                // According to the `read` docs, this is a non-fatal retryable error.
+                // https://doc.rust-lang.org/std/io/trait.Read.html#errors
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(anyhow!(e)),
+            };
             self.recv_buf.extend_from_slice(&buf[..sz]);
         }
+    }
+}
+
+const DEFAULT_CONN: &str = "";
+
+pub struct PgTest {
+    addr: String,
+    user: String,
+    timeout: Duration,
+    conns: BTreeMap<String, PgConn>,
+    verbose: bool,
+}
+
+impl PgTest {
+    pub fn new(addr: String, user: String, timeout: Duration) -> anyhow::Result<Self> {
+        let verbose = std::env::var_os("PGTEST_VERBOSE").is_some();
+        let conn = PgConn::new(&addr, &user, timeout.clone(), verbose, vec![])?;
+        let mut conns = BTreeMap::new();
+        conns.insert(DEFAULT_CONN.to_string(), conn);
+
+        Ok(PgTest {
+            addr,
+            user,
+            timeout,
+            conns,
+            verbose,
+        })
+    }
+
+    // Returns the named connection. If this is the first time that connection is
+    // seen, sends options.
+    fn get_conn(
+        &mut self,
+        name: Option<String>,
+        options: Vec<(&str, &str)>,
+    ) -> anyhow::Result<&mut PgConn> {
+        let name = name.unwrap_or_else(|| DEFAULT_CONN.to_string());
+        if !self.conns.contains_key(&name) {
+            let conn = PgConn::new(
+                &self.addr,
+                &self.user,
+                self.timeout.clone(),
+                self.verbose,
+                options,
+            )?;
+            self.conns.insert(name.clone(), conn);
+        }
+        Ok(self.conns.get_mut(&name).expect("must exist"))
+    }
+
+    pub fn send<F: Fn(&mut BytesMut)>(
+        &mut self,
+        conn: Option<String>,
+        options: Vec<(&str, &str)>,
+        f: F,
+    ) -> anyhow::Result<()> {
+        let conn = self.get_conn(conn, options)?;
+        conn.send(f)
+    }
+
+    pub fn until(
+        &mut self,
+        conn: Option<String>,
+        options: Vec<(&str, &str)>,
+        until: Vec<&str>,
+        err_field_typs: Vec<char>,
+        ignore: BTreeSet<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        let conn = self.get_conn(conn, options)?;
+        conn.until(until, err_field_typs, ignore)
     }
 }
 
@@ -351,26 +471,42 @@ pub struct ErrorField {
 
 impl Drop for PgTest {
     fn drop(&mut self) {
-        let _ = self.send(frontend::terminate);
+        for conn in self.conns.values_mut() {
+            let _ = conn.send(frontend::terminate);
+        }
     }
 }
 
-fn format_name(format: u8) -> String {
-    match format {
-        0 => "text".to_string(),
-        1 => "binary".to_string(),
+fn format_name<T>(format: T) -> String
+where
+    T: Copy + TryInto<u16> + fmt::Display,
+{
+    match format.try_into() {
+        Ok(0) => "text".to_string(),
+        Ok(1) => "binary".to_string(),
         _ => format!("unknown: {}", format),
     }
 }
 
-pub fn walk(addr: &str, user: &str, timeout: Duration, dir: &str) {
-    datadriven::walk(dir, |tf| run_test(tf, addr, user, timeout));
+pub fn walk(addr: String, user: String, timeout: Duration, dir: &str) {
+    datadriven::walk(dir, |tf| run_test(tf, addr.clone(), user.clone(), timeout));
 }
 
-pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: Duration) {
+pub fn run_test(tf: &mut datadriven::TestFile, addr: String, user: String, timeout: Duration) {
     let mut pgt = PgTest::new(addr, user, timeout).unwrap();
     tf.run(|tc| -> String {
         let lines = tc.input.lines();
+        let mut args = tc.args.clone();
+        let conn: Option<String> = args
+            .remove("conn")
+            .map(|args| Some(args.into_first()))
+            .unwrap_or(None);
+        let mut options: Vec<(&str, &str)> = Vec::new();
+        let cluster = args.remove("cluster");
+        if let Some(cluster) = &cluster {
+            let cluster = cluster.into_first();
+            options.push(("cluster", cluster.as_str()));
+        }
         match tc.directive.as_str() {
             "send" => {
                 for line in lines {
@@ -380,7 +516,7 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: 
                     let mut line = line.splitn(2, ' ');
                     let typ = line.next().unwrap_or("");
                     let args = line.next().unwrap_or("{}");
-                    pgt.send(|buf| match typ {
+                    pgt.send(conn.clone(), options.clone(), |buf| match typ {
                         "Query" => {
                             let v: Query = serde_json::from_str(args).unwrap();
                             frontend::query(&v.query, buf).unwrap();
@@ -452,7 +588,6 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: 
                 "".to_string()
             }
             "until" => {
-                let mut args = tc.args.clone();
                 // Our error field values don't always match postgres. Default to reporting
                 // the error code (C) and message (M), but allow the user to specify which ones
                 // they want.
@@ -461,10 +596,10 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: 
                 } else {
                     match args.remove("err_field_typs") {
                         Some(typs) => typs.join("").chars().collect(),
-                        None => vec!['C', 'M'],
+                        None => vec!['C', 'S', 'M'],
                     }
                 };
-                let mut ignore = HashSet::new();
+                let mut ignore = BTreeSet::new();
                 if let Some(values) = args.remove("ignore") {
                     for v in values {
                         ignore.insert(v);
@@ -475,7 +610,7 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: 
                 }
                 format!(
                     "{}\n",
-                    pgt.until(lines.collect(), err_field_typs, ignore)
+                    pgt.until(conn, options, lines.collect(), err_field_typs, ignore)
                         .unwrap()
                         .join("\n")
                 )

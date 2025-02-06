@@ -26,7 +26,7 @@ use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, NaiveDate};
 use flate2::read::MultiGzDecoder;
 
 use crate::error::{DecodeError, Error as AvroError};
@@ -34,11 +34,9 @@ use crate::schema::{
     RecordField, ResolvedDefaultValueField, ResolvedRecordField, SchemaNode, SchemaPiece,
     SchemaPieceOrNamed,
 };
-use crate::types::{AvroMap, Scalar, Value};
-use crate::{
-    util::{safe_len, zag_i32, zag_i64, TsUnit},
-    TrivialDecoder, ValueDecoder,
-};
+use crate::types::{Scalar, Value};
+use crate::util::{safe_len, zag_i32, zag_i64, TsUnit};
+use crate::{TrivialDecoder, ValueDecoder};
 
 pub trait StatefulAvroDecodable: Sized {
     type Decoder: AvroDecode<Out = Self>;
@@ -110,23 +108,64 @@ impl Display for TsUnit {
     }
 }
 
-fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, AvroError> {
-    let units_per_second = match unit {
-        TsUnit::Millis => 1_000,
-        TsUnit::Micros => 1_000_000,
+#[cfg(test)]
+mod tests {
+    use chrono::DateTime;
+
+    use crate::types::Value;
+    use crate::util::TsUnit;
+
+    use super::build_ts_value;
+
+    #[mz_ore::test]
+    fn test_negative_timestamps() {
+        assert_eq!(
+            build_ts_value(-1, TsUnit::Millis).unwrap(),
+            Value::Timestamp(
+                DateTime::from_timestamp(-1, 999_000_000)
+                    .unwrap()
+                    .naive_utc()
+            )
+        );
+        assert_eq!(
+            build_ts_value(-1000, TsUnit::Millis).unwrap(),
+            Value::Timestamp(DateTime::from_timestamp(-1, 0).unwrap().naive_utc())
+        );
+        assert_eq!(
+            build_ts_value(-1000, TsUnit::Micros).unwrap(),
+            Value::Timestamp(
+                DateTime::from_timestamp(-1, 999_000_000)
+                    .unwrap()
+                    .naive_utc()
+            )
+        );
+        assert_eq!(
+            build_ts_value(-1, TsUnit::Micros).unwrap(),
+            Value::Timestamp(
+                DateTime::from_timestamp(-1, 999_999_000)
+                    .unwrap()
+                    .naive_utc()
+            )
+        );
+        assert_eq!(
+            build_ts_value(-123_456_789_123, TsUnit::Micros).unwrap(),
+            Value::Timestamp(
+                DateTime::from_timestamp(-123_457, (1_000_000 - 789_123) * 1_000)
+                    .unwrap()
+                    .naive_utc()
+            )
+        );
+    }
+}
+
+/// A convenience function to build timestamp values from underlying longs.
+pub fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, AvroError> {
+    let result = match unit {
+        TsUnit::Millis => DateTime::from_timestamp_millis(value),
+        TsUnit::Micros => DateTime::from_timestamp_micros(value),
     };
-    let nanos_per_unit = 1_000_000_000 / units_per_second as u32;
-    let seconds = value / units_per_second;
-    let fraction = (value % units_per_second) as u32;
-    Ok(Value::Timestamp(
-        NaiveDateTime::from_timestamp_opt(seconds, fraction * nanos_per_unit).ok_or(
-            AvroError::Decode(DecodeError::BadTimestamp {
-                unit,
-                seconds,
-                fraction,
-            }),
-        )?,
-    ))
+    let ndt = result.ok_or(AvroError::Decode(DecodeError::BadTimestamp { unit, value }))?;
+    Ok(Value::Timestamp(ndt.naive_utc()))
 }
 
 /// A convenience trait for types that are both readable and skippable.
@@ -151,6 +190,10 @@ pub trait Skip: Read {
     /// # Errors
     ///
     /// Can return an error in all the same cases that [`Read::read`] can.
+    ///
+    /// TODO: Remove this clippy suppression when the issue is fixed.
+    /// See <https://github.com/rust-lang/rust-clippy/issues/12519>
+    #[allow(clippy::unused_io_amount)]
     fn skip(&mut self, mut len: usize) -> Result<(), io::Error> {
         const BUF_SIZE: usize = 512;
         let mut buf = [0; BUF_SIZE];
@@ -447,7 +490,7 @@ impl<'a, R: AvroRead> AvroMapAccess for SimpleMapAccess<'a, R> {
             // TODO -- we can use len_in_bytes to quickly skip non-demanded arrays
             let (len, _len_in_bytes) = match zag_i64(self.r)? {
                 len if len > 0 => (len as usize, None),
-                neglen if neglen < 0 => (neglen.abs() as usize, Some(decode_len(self.r)?)),
+                neglen if neglen < 0 => (neglen.unsigned_abs() as usize, Some(decode_len(self.r)?)),
                 0 => {
                     self.done = true;
                     return Ok(None);
@@ -526,7 +569,7 @@ impl<'a, R: AvroRead> AvroArrayAccess for SimpleArrayAccess<'a, R> {
             // TODO -- we can use len_in_bytes to quickly skip non-demanded arrays
             let (len, _len_in_bytes) = match zag_i64(self.r)? {
                 len if len > 0 => (len as usize, None),
-                neglen if neglen < 0 => (neglen.abs() as usize, Some(decode_len(self.r)?)),
+                neglen if neglen < 0 => (neglen.unsigned_abs() as usize, Some(decode_len(self.r)?)),
                 0 => {
                     self.done = true;
                     return Ok(None);
@@ -702,13 +745,15 @@ pub trait AvroDecode: Sized {
 
 pub mod public_decoders {
 
-    use super::{AvroDecodable, AvroMapAccess, StatefulAvroDecodable};
+    use std::collections::BTreeMap;
+
     use crate::error::{DecodeError, Error as AvroError};
-    use crate::types::{AvroMap, DecimalValue, Scalar, Value};
+    use crate::types::{DecimalValue, Scalar, Value};
     use crate::{
         AvroArrayAccess, AvroDecode, AvroDeserializer, AvroRead, AvroRecordAccess, ValueOrReader,
     };
-    use std::collections::HashMap;
+
+    use super::{AvroDecodable, AvroMapAccess, StatefulAvroDecodable};
 
     macro_rules! define_simple_decoder {
         ($name:ident, $out:ty, $($scalar_branch:ident);*) => {
@@ -780,7 +825,7 @@ pub mod public_decoders {
             mut self,
             a: &mut A,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.record(a)?)?)
+            (self.conv)(self.inner.record(a)?)
         }
 
         fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
@@ -791,29 +836,29 @@ pub mod public_decoders {
             deserializer: D,
             reader: &'a mut R,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.union_branch(
+            (self.conv)(self.inner.union_branch(
                 idx,
                 n_variants,
                 null_variant,
                 deserializer,
                 reader,
-            )?)?)
+            )?)
         }
 
         fn array<A: AvroArrayAccess>(mut self, a: &mut A) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.array(a)?)?)
+            (self.conv)(self.inner.array(a)?)
         }
 
         fn map<M: AvroMapAccess>(mut self, m: &mut M) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.map(m)?)?)
+            (self.conv)(self.inner.map(m)?)
         }
 
         fn enum_variant(mut self, symbol: &str, idx: usize) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.enum_variant(symbol, idx)?)?)
+            (self.conv)(self.inner.enum_variant(symbol, idx)?)
         }
 
         fn scalar(mut self, scalar: Scalar) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.scalar(scalar)?)?)
+            (self.conv)(self.inner.scalar(scalar)?)
         }
 
         fn decimal<'a, R: AvroRead>(
@@ -822,42 +867,42 @@ pub mod public_decoders {
             scale: usize,
             r: ValueOrReader<'a, &'a [u8], R>,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.decimal(precision, scale, r)?)?)
+            (self.conv)(self.inner.decimal(precision, scale, r)?)
         }
 
         fn bytes<'a, R: AvroRead>(
             mut self,
             r: ValueOrReader<'a, &'a [u8], R>,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.bytes(r)?)?)
+            (self.conv)(self.inner.bytes(r)?)
         }
 
         fn string<'a, R: AvroRead>(
             mut self,
             r: ValueOrReader<'a, &'a str, R>,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.string(r)?)?)
+            (self.conv)(self.inner.string(r)?)
         }
 
         fn json<'a, R: AvroRead>(
             mut self,
             r: ValueOrReader<'a, &'a serde_json::Value, R>,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.json(r)?)?)
+            (self.conv)(self.inner.json(r)?)
         }
 
         fn uuid<'a, R: AvroRead>(
             mut self,
             r: ValueOrReader<'a, &'a [u8], R>,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.uuid(r)?)?)
+            (self.conv)(self.inner.uuid(r)?)
         }
 
         fn fixed<'a, R: AvroRead>(
             mut self,
             r: ValueOrReader<'a, &'a [u8], R>,
         ) -> Result<Self::Out, AvroError> {
-            Ok((self.conv)(self.inner.fixed(r)?)?)
+            (self.conv)(self.inner.fixed(r)?)
         }
     }
     pub struct ArrayAsVecDecoder<
@@ -1129,8 +1174,12 @@ pub mod public_decoders {
                     let mut buf = vec![];
                     buf.resize_with(len, Default::default);
                     r.read_exact(&mut buf)?;
-                    serde_json::from_slice(&buf)
-                        .map_err(|e| AvroError::Decode(DecodeError::BadJson(e.classify())))?
+                    serde_json::from_slice(&buf).map_err(|e| {
+                        AvroError::Decode(DecodeError::BadJson {
+                            category: e.classify(),
+                            bytes: buf.to_owned(),
+                        })
+                    })?
                 }
             };
             Ok(Value::Json(val))
@@ -1170,13 +1219,13 @@ pub mod public_decoders {
             Ok(Value::Fixed(buf.len(), buf))
         }
         fn map<M: AvroMapAccess>(self, m: &mut M) -> Result<Value, AvroError> {
-            let mut entries = HashMap::new();
+            let mut entries = BTreeMap::new();
             while let Some((name, a)) = m.next_entry()? {
                 let d = ValueDecoder;
                 let val = a.decode_field(d)?;
                 entries.insert(name, val);
             }
-            Ok(Value::Map(AvroMap(entries)))
+            Ok(Value::Map(entries))
         }
     }
 }
@@ -1208,7 +1257,7 @@ pub fn give_value<D: AvroDecode>(d: D, v: &Value) -> Result<D::Out, AvroError> {
         Value::Bytes(val) => d.bytes::<&[u8]>(V(val)),
         Value::String(val) => d.string::<&[u8]>(V(val)),
         Value::Fixed(_len, val) => d.fixed::<&[u8]>(V(val)),
-        Value::Enum(idx, symbol) => d.enum_variant(symbol, *idx as usize),
+        Value::Enum(idx, symbol) => d.enum_variant(symbol, *idx),
         Value::Union {
             index,
             inner,
@@ -1228,7 +1277,7 @@ pub fn give_value<D: AvroDecode>(d: D, v: &Value) -> Result<D::Out, AvroError> {
             let mut a = ValueArrayAccess::new(val);
             d.array(&mut a)
         }
-        Value::Map(AvroMap(val)) => {
+        Value::Map(val) => {
             let vals: Vec<_> = val.clone().into_iter().collect();
             let mut m = ValueMapAccess::new(vals.as_slice());
             d.map(&mut m)
@@ -1284,10 +1333,7 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
             }
             SchemaPiece::Date => {
                 let days = zag_i32(r)?;
-                let val = NaiveDate::from_ymd(1970, 1, 1)
-                    .checked_add_signed(chrono::Duration::days(days.into()))
-                    .ok_or(AvroError::Decode(DecodeError::BadDate(days)))?;
-                d.scalar(Scalar::Date(val))
+                d.scalar(Scalar::Date(days))
             }
             SchemaPiece::TimestampMilli => {
                 let total_millis = zag_i64(r)?;
@@ -1515,10 +1561,14 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
             SchemaPiece::ResolveDateTimestamp => {
                 let days = zag_i32(r)?;
 
-                let date = NaiveDate::from_ymd(1970, 1, 1)
-                    .checked_add_signed(chrono::Duration::days(days.into()))
+                let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+                    .expect("naive date known valid")
+                    .checked_add_signed(
+                        chrono::Duration::try_days(days.into())
+                            .ok_or(AvroError::Decode(DecodeError::BadDate(days)))?,
+                    )
                     .ok_or(AvroError::Decode(DecodeError::BadDate(days)))?;
-                let dt = date.and_hms(0, 0, 0);
+                let dt = date.and_hms_opt(0, 0, 0).expect("HMS known valid");
                 d.scalar(Scalar::Timestamp(dt))
             }
         }

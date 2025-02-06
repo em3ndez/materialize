@@ -1,31 +1,153 @@
-[advisories]
-ignore = [
-    # chrono calls localtime_r, which can result in memory unsafety if another
-    # thread is simultaneously calling setenv. The likelihood of this happening
-    # in Materialize is exceptionally low (we don't call setenv directly
-    # anywhere, and it is unlikely that our dependencies do either). There is
-    # no easy fix for chrono (https://github.com/chronotope/chrono/issues/499),
-    # so we're just ignoring the advisory for now.
-    "RUSTSEC-2020-0159"
-]
-
 [bans]
 multiple-versions = "deny"
+# Try to avoid exemptions for duplicate dependencies! Duplicate dependencies
+# slow down compilation, bloat the binary, and tickle race conditions in `cargo
+# doc` (see rust-lang/cargo#3613).
+#
+# If possible, submit PRs upstream to remove duplicated transitive dependencies.
+# You can use patch directives in the root Cargo.toml to point at a
+# Materialize-maintained fork that avoids the duplicated transitive
+# dependencies.
 skip = [
-    # Do not add to this list without good reason! Duplicate dependencies slow
-    # down compilation and bloat the binary.
+    # arrayvec had a significant API change in 0.7
+    { name = "arrayvec", version = "0.5.2" },
+    # One-time exception for base64 due to its prevalence in the crate graph.
+    { name = "base64", version = "0.13.1" },
+    { name = "base64", version = "0.21.5" },
+    # `syn` is a core crate that a huge part of the ecosystem either directly, or
+    # transitively depends on. They just released v2.0 which not all crates have
+    # migrated to yet.
+    { name = "syn", version = "1.0.107" },
+    # `tokio` depends on a newer version of socket2, we are okay with _temporarily_
+    # allowing these duplicate dependencies until the rest of the ecosystem catches
+    # up.
+    { name = "socket2", version = "0.4.9" },
+    # held back by regex 1.7.0 depended on by arrow-string and bindgen
+    { name = "regex-syntax", version = "0.6.28" },
+    # held back by thrift 0.17.0 depended on by parquet 51.0.0
+    { name = "ordered-float", version = "2.10.1" },
+    # held back by 'ciborium' which is depended on by 'criterion'
+    { name = "half", version = "1.6.0" },
+    { name = "windows-sys", version = "0.42.0" },
+    { name = "windows_aarch64_gnullvm", version = "0.42.0" },
+    { name = "windows_aarch64_msvc", version = "0.42.0" },
+    { name = "windows_i686_gnu", version = "0.42.0" },
+    { name = "windows_i686_msvc", version = "0.42.0" },
+    { name = "windows_x86_64_gnullvm", version = "0.42.0" },
+    { name = "windows_x86_64_gnu", version = "0.42.0" },
+    { name = "windows_x86_64_msvc", version = "0.42.0" },
+    { name = "windows-targets", version = "0.48.0" },
+    { name = "windows-sys", version = "0.48.0" },
+    { name = "windows_aarch64_gnullvm", version = "0.48.0" },
+    { name = "windows_aarch64_msvc", version = "0.48.0" },
+    { name = "windows_i686_gnu", version = "0.48.0" },
+    { name = "windows_i686_msvc", version = "0.48.0" },
+    { name = "windows_x86_64_gnullvm", version = "0.48.0" },
+    { name = "windows_x86_64_gnu", version = "0.48.0" },
+    { name = "windows_x86_64_msvc", version = "0.48.0" },
+    { name = "windows-sys", version = "0.52.0" },
+    # Newer versions of crates like `tempfile` are held back by crates like `atty`.
+    # This is very Unfortunate as we don't actually use these platforms.
+    { name = "hermit-abi", version = "0.2.6" },
+    { name = "redox_syscall", version = "0.2.10" },
+    { name = "rustix", version = "0.38.21" },
 
-    # Waiting for csv, http, and aws_smithy_types to upgrade to v1.0.
-    { name = "itoa", version = "0.4.1" },
+    # Will require updating many crates
+    { name = "indexmap", version = "1.9.1" },
+    # Required by indexmap 1.9.1, which is depended on by many things
+    { name = "hashbrown", version = "0.12.3" },
+    { name = "hashbrown", version = "0.14.5" },
+
+    # Had to update `tower-http` to `0.4.3` to fix the `base64` duplicate version
+    # but this introduced a new dependency on `bitflags 2.3.3` but all the rest of
+    # our crates use `bitflags 1.3.2`
+    # TODO: fork `tower-http` and swap to use older bitflags
+    { name = "bitflags", version = "1.3.2" },
+
+    # TODO(parkmycar): In a followup/stacked PR, get rid of these duplicates.
+    { name = "bstr", version = "0.2.14" },
+    { name = "regex-automata", version = "0.1.9" },
+
+    # TODO: Required for Rust nightly upgrade
+    { name = "portable-atomic", version = "0.3.20" },
+
+    # TODO: Required for Rust nightly upgrade
+    { name = "http", version = "0.2.9" },
+
+    # TODO: Required for Rust nightly upgrade
+    { name = "http-body", version = "0.4.5" },
+
+    # The most recent version of `skeptic` depends on 0.14.2 and the latest
+    # version of `guppy` that uses `0.14` is very old.
+    { name = "cargo_metadata", version = "0.14.2" },
+
+    # There are many external crates that rely on 0.10.5. Upgrading them should
+    # be its own PR.
+    { name = "itertools", version = "0.10.5" },
+
+    # A few crates -> `num_enum_derive` -> `proc-macro-crate` -> `toml_edit v0.19.14`.
+    { name = "toml_edit", version = "0.19.14" },
+
+    # tabled_derive and enum-as-inner
+    { name = "heck", version = "0.4.0" },
+
+    # There are some crates in our dependency tree that have yet to upgrade to
+    # `hyper 1.*`. As of now these are:
+    #     * `aws-config`
+    #     * `aws-smithy-runtime`
+    #     * `eventsource-client`
+    #     * `launchdarkly-server-sdk`
+    # Until they upgrade we'll need to duplicate some related hyper deps.
+
+    { name = "hyper", version = "0.14.27" },
+
+    { name = "h2", version = "0.3.26" },
+
+    { name = "hyper-tls", version = "0.5.0" },
+
+    { name = "hyper-timeout", version = "0.4.1" },
+
+    { name = "tokio-tungstenite", version = "0.21.0" },
+
+    { name = "tungstenite", version = "0.21.0" },
+
+    # `axum 0.7.5` depends on both `sync_wrapper 1.*` and `axum-core 0.4.3`.
+    # The latter depends on `sync_wrapper 0.1.*`.
+    { name = "sync_wrapper", version = "0.1.2" },
+
+    { name = "memmap2", version = "0.5.4" },
+
+    { name = "wasi", version = "0.9.0+wasi-snapshot-preview1" },
+    { name = "async-channel", version = "1.9.0" },
+    { name = "event-listener", version = "2.5.3" },
+    { name = "fastrand", version = "1.9.0" },
+    { name = "futures-lite", version = "1.13.0" },
+    { name = "getrandom", version = "0.1.16" },
+    { name = "rand", version = "0.7.3" },
+    { name = "rand_chacha", version = "0.2.2" },
+    { name = "rand_core", version = "0.5.1" },
+    { name = "reqwest", version = "0.11.24" },
+    { name = "rustls-pemfile", version = "1.0.4" },
+    { name = "winreg", version = "0.50.0" },
 ]
 
-# The `md5` and `sha1` crates are not part of the RustCrypto project. Use
-# `md-5` and `sha-1` instead, despite their somewhat suspicious names.
+# Use `tracing` instead.
+[[bans.deny]]
+name = "env_logger"
+
+# Use `md-5` instead, which is part of the RustCrypto ecosystem.
 [[bans.deny]]
 name = "md5"
-wrappers = ["aws-sdk-s3"]
+
+# Use `sha1` instead, which the RustCrypto ecosystem recently took control of.
+# `sha-1` is the older and now deprecated name.
 [[bans.deny]]
-name = "sha1"
+name = "sha-1"
+
+# Use `prost` or `protobuf-native` instead.
+[[bans.deny]]
+name = "protobuf"
+wrappers = ["protobuf-parse"]
 
 # Strum has suspect code quality and includes many unneeded features. Use
 # more targeted enum macro crates, e.g. `enum-kinds`.
@@ -34,28 +156,35 @@ name = "strum"
 [[bans.deny]]
 name = "strum-macros"
 
-# `thiserror` requires everyone to learn a special DSL. Our current position is
-# that it is clearer to require manual implementations of the `Error` trait.
 [[bans.deny]]
-name = "thiserror"
+name = "log"
 wrappers = [
-    # Only list third-party crates here.
-    "async-native-tls",
-    "aws-http",
-    "aws-smithy-xml",
-    "aws-sig-auth",
+    "azure_svc_blobstorage",
+    "buildid",
+    "deadpool-postgres",
+    "eventsource-client",
+    "fail",
+    "globset",
+    "launchdarkly-server-sdk",
+    "launchdarkly-server-sdk-evaluation",
+    "mio",
+    "native-tls",
+    "os_info",
+    "postgres",
     "pprof",
-    "proc-macro-crate",
-    "prometheus",
-    "protoc",
-    "protobuf-codegen",
-    "protobuf-codegen-pure",
+    "prost-build",
     "protobuf-parse",
-    "pubnub-core",
-    "pubnub-hyper",
-    "sysctl",
-    "tiberius",
-    "zip",
+    # TODO(guswynn): switch to tracing in rdkafka
+    "rdkafka",
+    "reqwest",
+    "tokio-postgres",
+    "tokio-tungstenite",
+    "tracing-log",
+    "tracing",
+    "tungstenite",
+    "want",
+    "wasm-bindgen-backend",
+    "workspace-hack",
 ]
 
 # We prefer the system's native TLS or OpenSSL to Rustls, since they are more
@@ -63,15 +192,70 @@ wrappers = [
 [[bans.deny]]
 name = "rustls"
 
+# once_cell is going to be added to std, and doesn't use macros
+# Unfortunately, its heavily used, so we have lots of exceptions.
+[[bans.deny]]
+name = "lazy_static"
+wrappers = [
+  "bindgen",
+  "bstr",
+  "console",
+  "dynfmt",
+  "findshlibs",
+  "insta",
+  "jsonpath-rust",
+  "launchdarkly-server-sdk",
+  "launchdarkly-server-sdk-evaluation",
+  "mysql_async",
+  "mysql_common",
+  "native-tls",
+  "prometheus",
+  "proptest",
+  "rayon-core",
+  "schannel",
+  "sharded-slab",
+  "which",
+]
+
 # The `uncased` crate serves the same purpose as `unicase` and is more
 # actively maintained.
 [[bans.deny]]
 name = "unicase"
-wrappers = ["mime_guess"]
+wrappers = [
+    "mime_guess",
+    "pulldown-cmark",
+]
 
+# We shouldn't manually vendor `protoc`, instead rely on it through `mz-build-tools`.
+[[bans.deny]]
+name = "protobuf-src"
+wrappers = [
+    "mz-build-tools",
+    "protobuf-native",
+]
+
+[advisories]
+version = 2
+ignore = [
+    # Consider switching `yaml-rust` to the actively maintained `yaml-rust2` fork of the original project
+    "RUSTSEC-2024-0320",
+    # Consider `encoding_rs` instead of `encoding` (unmaintained)
+    "RUSTSEC-2021-0153",
+    # proc-macro-error is unmaintained, possible alternative: proc-macro-error2
+    "RUSTSEC-2024-0370",
+    # `derivative` is unmaintained; consider using an alternative (unmaintained)
+    "RUSTSEC-2024-0388",
+    # `instant` is unmaintained, and the author recommends using the maintained [`web-time`] crate instead.
+    "RUSTSEC-2024-0384",
+]
+
+# Must be manually kept in sync with about.toml.
+# See: https://github.com/EmbarkStudios/cargo-about/issues/201
 [licenses]
+version = 2
 allow = [
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "CC0-1.0",
     "0BSD",
     "BSD-2-Clause",
@@ -79,10 +263,13 @@ allow = [
     "ICU",
     "ISC",
     "MIT",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
 ]
-copyleft = "deny"
+# copyleft is denied by default
 private = { ignore = true }
-
 [[licenses.clarify]]
 name = "ring"
 expression = "ISC"
@@ -93,29 +280,10 @@ license-files = [
 [sources]
 unknown-git = "deny"
 unknown-registry = "deny"
-allow-git = [
-    # See the patch in Cargo.toml.
-    "https://github.com/MaterializeInc/headers.git",
-
-    # Waiting on several PRs to a mostly-abandoned upstream library.
-    "https://github.com/MaterializeInc/pubnub-headers.git",
-    "https://github.com/MaterializeInc/pubnub-rust.git",
-
-    # Waiting on https://github.com/sfackler/rust-postgres/pull/752.
-    "https://github.com/MaterializeInc/rust-postgres.git",
-    "https://github.com/MaterializeInc/rust-postgres-array.git",
-    "https://github.com/MaterializeInc/rust-prometheus.git",
-
-    # Waiting on https://github.com/stepancheg/rust-protobuf/pull/581.
-    "https://github.com/MaterializeInc/rust-protobuf.git",
-
-    # Waiting on https://github.com/bheisler/criterion.rs/pull/543.
-    "https://github.com/MaterializeInc/criterion.rs.git",
-
-    # Dependencies that we control upstream whose official releases we don't
-    # care about.
-    "https://github.com/MaterializeInc/cloud-sdks.git",
-    "https://github.com/TimelyDataflow/timely-dataflow",
-    "https://github.com/TimelyDataflow/differential-dataflow.git",
-    "https://github.com/fede1024/rust-rdkafka.git",
-]
+# Do not allow non-MaterializeInc Git repositories here! Git repositories must
+# be owned by the MaterializeInc organization so that maintainership is shared
+# amongst Materialize employees and so that historical versions of Materialize
+# remain buildable even if upstream Git repositories disappear. If you don't
+# have permissions to create a fork in the MaterializeInc organization, ask in
+# #eng-infra on Slack.
+allow-org = { github = ["MaterializeInc"] }

@@ -3,62 +3,76 @@ title: "CREATE ROLE"
 description: "`CREATE ROLE` creates a new role."
 menu:
   main:
-    parent: sql
+    parent: commands
 ---
 
-{{< version-added v0.7.0 />}}
+`CREATE ROLE` creates a new role, which is a user account in Materialize.
 
-`CREATE ROLE` creates a new role.
-
-## Conceptual framework
-
-A role is a user account in a Materialize instance.
-
-When you [connect to a Materialize instance](/connect/cli), you must specify
-the name of a valid role in the system.
-
-{{< warning >}}
-Roles in Materialize are currently limited in functionality. In the future they
-will be used for role-based access control. See GitHub issue {{% gh 677 %}}
-for details.
-{{< /warning >}}
+When you connect to Materialize, you must specify the name of a valid role in
+the system.
 
 ## Syntax
 
 {{< diagram "create-role.svg" >}}
 
-Field | Use
-------|-----
-**LOGIN** | Grants the user the ability to log in.
-**NOLOGIN** | Denies the user the ability to log in.
-**SUPERUSER** | Grants the user superuser permission, i.e., unrestricted access to the system.
-**NOSUPERUSER** | Denies the user superuser permission.
-_role_name_ | A name for the role.
+Field               | Use
+--------------------|-------------------------------------------------------------------------
+_role_name_         | A name for the role.
+**INHERIT**         | Grants the role the ability to inherit privileges of other roles.
 
 ## Details
 
-Materialize only permits creating user accounts with both the `LOGIN` and
-`SUPERUSER` options specified.
+Materialize's support for `CREATE ROLE` is similar to that of PostgreSQL, with
+the following options exceptions:
+
+| Option   | Description                                                                                                                                                                                            |
+|-------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `INHERIT`   | Materialize implicitly uses `INHERIT` for the `CREATE ROLE` command. That is, `CREATE ROLE <name>` and `CREATE ROLE <name> WITH INHERIT` are equivalent.                                                   |
+| `NOINHERIT` | Materialize does not support the `NOINHERIT` option for `CREATE ROLE`.                                                                                                                                  |
+| `LOGIN`     | Materialize does not support the `LOGIN` option for `CREATE ROLE`.<ul><li>Instead, Materialize derives the `LOGIN` option for a role during authentication every time that role tries to connect.</li><li>Materialize does not support the `CREATE USER` command as the command implies a `LOGIN` attribute for the role.</li></ul>|
+| `SUPERUSER` | Materialize does not support the `SUPERUSER` option for `CREATE ROLE`.<ul><li>Instead, Materialize derives the `SUPERUSER` option for a role during authentication every time that role tries to connect.</li></ul>|
+
+{{< note >}}
+
+Materialize does not use role attributes to determine a role's ability to create
+top level objects such as databases and other roles. Instead, Materialize uses
+system level privileges. See [GRANT PRIVILEGE](../grant-privilege) for more
+details.
+
+{{</ note >}}
+
+### Restrictions
 
 You may not specify redundant or conflicting sets of options. For example,
-Materialize will reject the statement `CREATE ROLE ... LOGIN NOLOGIN` because
-the `LOGIN` and `NOLOGIN` options conflict.
+Materialize will reject the statement `CREATE ROLE ... INHERIT INHERIT`.
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `CREATEROLE` privileges on the system.
 
 ## Examples
 
-```sql
-CREATE ROLE rj LOGIN SUPERUSER;
+```mzsql
+CREATE ROLE db_reader;
 ```
-```sql
+```mzsql
 SELECT name FROM mz_roles;
 ```
 ```nofmt
-materialize
-rj
+ db_reader
+ mz_system
+ mz_support
 ```
 
 ## Related pages
 
-- [CREATE USER](../create-user)
+- [ALTER ROLE](../alter-role)
 - [DROP ROLE](../drop-role)
 - [DROP USER](../drop-user)
+- [GRANT ROLE](../grant-role)
+- [REVOKE ROLE](../revoke-role)
+- [ALTER OWNER](../alter-owner)
+- [GRANT PRIVILEGE](../grant-privilege)
+- [REVOKE PRIVILEGE](../revoke-privilege)

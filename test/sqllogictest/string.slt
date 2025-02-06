@@ -31,12 +31,9 @@ column1
 statement ok
 CREATE TABLE asciitest (strcol CHAR(15), vccol VARCHAR(15))
 
-# TODO: materialize#589 Add two tests:
-# 1: empty string to each column
-# 2: single space in each column
 statement ok
 INSERT INTO asciitest VALUES ('hello world', 'goodbye moon'), (NULL, NULL),
-    ('你好', '再见'), ('😀', '👻')
+    ('你好', '再见'), ('😀', '👻'), ('',''), (' ', ' ');
 
 statement error
 SELECT ascii(98)
@@ -45,10 +42,12 @@ query II colnames
 SELECT ascii(strcol) AS strres, ascii(vccol) AS vcres FROM asciitest ORDER BY strres
 ----
 strres  vcres
-104     103
-20320   20877
+0  0
+0  32
+104  103
+20320  20877
 128512  128123
-NULL    NULL
+NULL  NULL
 
 query I
 SELECT ascii(NULL)
@@ -85,9 +84,52 @@ SELECT substr('for cannot be negative', 1, -3)
 query error negative substring length not allowed
 SELECT substr('for still cannot be negative', 30, -2)
 
+query B
+SELECT substr('hello', 2) IS NULL
+----
+false
+
+query B
+SELECT substr(NULL, 2) IS NULL
+----
+true
+
+query B
+SELECT substr('hello', NULL) IS NULL
+----
+true
+
+query B
+SELECT substr(NULL, 2, 3) IS NULL
+----
+true
+
+query B
+SELECT substr('hello', NULL, 3) IS NULL
+----
+true
+
+query B
+SELECT substr('hello', 2, NULL) IS NULL
+----
+true
+
+query error division by zero
+SELECT substr('hello', 0/0, 3)
+
 # standard tests
 
-# TODO: materialize#589 SELECT strcol FROM substrtest
+query T colnames
+SELECT to_jsonb(strcol) as strcol FROM substrtest
+----
+strcol
+NULL
+"               "
+"24.31          "
+"Mg             "
+"magnesium      "
+"长久不见           "
+
 query T colnames
 SELECT substr(vccol, 1, 3) AS vcres FROM substrtest ORDER BY vcres
 ----
@@ -355,17 +397,17 @@ su
 
 # testing large numbers
 query T
-SELECT substr('abcdef', 2, 2147483648);
+SELECT substr('abcdef', 2, 2147483647);
 ----
 bcdef
 
 query T
-SELECT substr('abcdef', 2147483648, 2);
+SELECT substr('abcdef', 2147483647, 2);
 ----
 (empty)
 
 query T
-SELECT substr('abcdef', 2147483648, 2147483648);
+SELECT substr('abcdef', 2147483647, 2147483647);
 ----
 (empty)
 
@@ -417,22 +459,22 @@ SELECT substring('abcdef' from -1);
 abcdef
 
 query T
-SELECT substring('abcdef' from 2 for 2147483648);
+SELECT substring('abcdef' from 2 for 2147483647);
 ----
 bcdef
 
 query T
-SELECT substring('abcdef' from 2147483648 for 2);
+SELECT substring('abcdef' from 2147483647 for 2);
 ----
 (empty)
 
 query T
-SELECT substring('abcdef' from 2147483648 for 2147483648);
+SELECT substring('abcdef' from 2147483647 for 2147483647);
 ----
 (empty)
 
 query T
-SELECT substring('abcdef' for 2147483648);
+SELECT substring('abcdef' for 2147483647);
 ----
 abcdef
 
@@ -689,8 +731,56 @@ SELECT '你' || '好'
 ----
 你好
 
-query error no overload for boolean \|\| boolean
+query error db error: ERROR: operator does not exist: boolean \|\| boolean
 SELECT true || false
+
+# concat_ws
+
+query error db error: ERROR: function concat_ws\(\) does not exist
+SELECT concat_ws();
+
+query error db error: ERROR: function concat_ws\(unknown\) does not exist
+SELECT concat_ws('a');
+
+query T
+SELECT concat_ws('', 'a', 'b') AS word;
+----
+ab
+
+query T
+SELECT concat_ws(E'\t', 'S', 'M', 'T');
+----
+S	M	T
+
+query T
+SELECT concat_ws(', ', interval '1d', 1.23::numeric, 4.56::float);
+----
+1 day, 1.23, 4.56
+
+query T
+SELECT concat_ws(', ', interval '1d', null, 1.23::numeric, null, 4.57::float);
+----
+1 day, 1.23, 4.57
+
+query T
+SELECT concat_ws(', ', interval '1d', null, 1.23::numeric, null, 4.57::float, null);
+----
+1 day, 1.23, 4.57
+
+query T
+SELECT concat_ws(null, interval '1d', null, 1.23::numeric, null, 4.57::float, null);
+----
+NULL
+
+query T
+SELECT concat_ws(null, null);
+----
+NULL
+
+query T
+SELECT concat_ws('x', null);
+----
+(empty)
 
 query T
 SELECT split_part('abc~@~def~@~ghi', '~@~', 2)
@@ -720,13 +810,13 @@ SELECT split_part('', 'not', 1)
 query error field position must be greater than zero
 SELECT split_part('abc~@~def~@~ghi', '~@~', 0)
 
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function split_part\(\) does not exist
 SELECT split_part()
 
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function split_part\(unknown, unknown\) does not exist
 SELECT split_part('one', 'two')
 
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function split_part\(integer, integer, integer\) does not exist
 SELECT split_part(1, 2, 3)
 
 ### lpad ###
@@ -822,6 +912,9 @@ query T
 SELECT lpad('str', 5, 'đẹp')
 ----
 đẹstr
+
+query error requested length too large
+SELECT lpad('', 2147483647)
 
 
 ### ilike ###
@@ -929,29 +1022,29 @@ true
 
 # Invalid type mods
 
-query error length for type character varying must be within \[1-10485760\], have 0
+query error length for type character varying must be between 1 and 10485760
 SELECT ''::VARCHAR(0)
 
-query error length for type character varying must be within \[1-10485760\], have 10485761
+query error length for type character varying must be between 1 and 10485760
 SELECT ''::VARCHAR(10485761)
 
-query error length for type character must be within \[1-10485760\], have 0
+query error length for type character must be between 1 and 10485760
 SELECT ''::CHAR(0)
 
-query error length for type character must be within \[1-10485760\], have 10485761
+query error length for type character must be between 1 and 10485760
 SELECT ''::CHAR(10485761)
 
-query error length for type character varying must be within \[1-10485760\], have 0
+query error length for type character varying must be between 1 and 10485760
 SELECT ''::pg_catalog.VARCHAR(0)
 
-query error length for type character varying must be within \[1-10485760\], have 10485761
+query error length for type character varying must be between 1 and 10485760
 SELECT ''::pg_catalog.VARCHAR(10485761)
 
-query error length for type character must be within \[1-10485760\], have 0
-SELECT ''::pg_catalog.CHAR(0)
+query error length for type character must be between 1 and 10485760
+SELECT ''::pg_catalog.bpchar(0)
 
-query error length for type character must be within \[1-10485760\], have 10485761
-SELECT ''::pg_catalog.CHAR(10485761)
+query error length for type character must be between 1 and 10485760
+SELECT ''::pg_catalog.bpchar(10485761)
 
 ### position ###
 statement ok
@@ -969,10 +1062,10 @@ SELECT position(42)
 statement error Expected IN, found right parenthesis
 SELECT position('str')
 
-statement error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+statement error db error: ERROR: function position\(integer, unknown\) does not exist
 SELECT position(42 IN 'str')
 
-statement error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+statement error db error: ERROR: function position\(unknown, integer\) does not exist
 SELECT position('str' IN 42)
 
 statement error Expected right parenthesis, found comma
@@ -980,7 +1073,16 @@ SELECT position('str' IN 42, 172)
 
 # standard tests
 
-#TODO: materialize#589 select position(strcol1 IN strcol2) from positiontest
+query I rowsort
+select position(strcol1 IN strcol2) from positiontest;
+----
+0
+0
+1
+3
+3
+NULL
+NULL
 
 query I rowsort
 SELECT position(vccol1 IN vccol2) FROM positiontest
@@ -1041,7 +1143,15 @@ SELECT left('str', 42, 17)
 
 # standard tests
 
-#TODO: materialize#589 select left(strcol, foo) from lefttest
+query T rowsort
+select left(strcol, 3) from lefttest
+----
+(empty)
+24.
+Mg
+NULL
+mag
+长久不
 
 # edge case
 query T rowsort
@@ -1136,7 +1246,7 @@ SELECT left('hello', -2147483647)
 (empty)
 
 # i64
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function left\(unknown, bigint\) does not exist
 SELECT left('hello', 2147483648)
 
 ### right ###
@@ -1163,7 +1273,15 @@ SELECT right('str', 42, 17)
 
 # standard tests
 
-#TODO: materialize#589 select right(strcol, foo) from righttest
+query T rowsort
+select right(strcol, 3) from righttest
+----
+(empty)
+.31
+Mg
+NULL
+ium
+久不见
 
 # edge case
 query T rowsort
@@ -1258,7 +1376,7 @@ SELECT right('hello', -2147483647)
 (empty)
 
 # i64
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function right\(unknown, bigint\) does not exist
 SELECT right('hello', 2147483648)
 
 query T
@@ -1275,6 +1393,9 @@ query T
 SELECT repeat('a', -1)
 ----
 (empty)
+
+query error requested length too large
+SELECT repeat('a', 2147483647)
 
 # Check for char cmp validity, which ignores white space
 # ...at datum level
@@ -1342,6 +1463,21 @@ SELECT 'abc'::char(3) ~~ 'abc'::char(4);
 ----
 true
 
+query B
+SELECT 'abc'::char(3) !~~* 'Abc'::char(4);
+----
+false
+
+query B
+SELECT 'abc'::char(3) NOT ILIKE 'Abc'::char(4);
+----
+false
+
+query B
+SELECT 'abc'::char(3) !~ 'Abc'::char(4);
+----
+true
+
 # Regression for https://github.com/MaterializeInc/materialize/pull/7522#issuecomment-893343138
 
 query T
@@ -1384,3 +1520,225 @@ query T
 SELECT CONCAT('a'::text, 'b'::char(3), 'c');
 ----
 ab  c
+
+# Regression for https://github.com/MaterializeInc/database-issues/issues/5304
+
+statement ok
+CREATE TABLE gh18095_0(c0 VARCHAR(55))
+
+statement ok
+CREATE TABLE gh18095_1(c0 CHAR(96));
+
+statement ok
+INSERT INTO gh18095_1 VALUES('''%ꆔA?')
+
+query T
+SELECT FROM gh18095_1 JOIN gh18095_0 ON (gh18095_1.c0)LIKE((gh18095_1.c0)::VARCHAR(4));
+----
+
+### translate ###
+
+# NULL inputs
+
+query I
+SELECT translate(NULL, 'one', 'two')
+----
+NULL
+
+query I
+SELECT translate('one', NULL, 'two')
+----
+NULL
+
+query I
+SELECT translate('one', 'two', NULL)
+----
+NULL
+
+query I
+SELECT translate('one', NULL, NULL)
+----
+NULL
+
+query I
+SELECT translate(NULL, 'one', NULL)
+----
+NULL
+
+query I
+SELECT translate(NULL, NULL, 'one')
+----
+NULL
+
+query I
+SELECT translate(NULL, NULL, NULL)
+----
+NULL
+
+# replace single occurrence of a single char
+
+query T
+SELECT translate('foe', 'f', 't')
+----
+toe
+
+# replace multiple occurrences of a single char
+
+query T
+SELECT translate('hello', 'l', 'x')
+----
+hexxo
+
+# remove extra occurrences when len(from) > len(to)
+
+query T
+SELECT translate('ffl', 'fl', 't')
+----
+tt
+
+query I
+SELECT translate('[1]', '[]', '')::numeric
+----
+1
+
+# ignore extra occurences when len(to) > len(from)
+
+query T
+SELECT translate('something', 'sth', 'xfvlg')
+----
+xomefving
+
+# ignore non-matching extra occurrences
+
+query T
+SELECT translate('ffl', 'fx', 't')
+----
+ttl
+
+query T
+SELECT translate('hello', 'fl', 'tx')
+----
+hexxo
+
+query T
+SELECT translate('12345', '143', 'ax')
+----
+a2x5
+
+query T
+SELECT translate('a', '👋a', E'xy')
+----
+y
+
+# constant_time_eq for string
+
+statement ok
+CREATE TABLE test_constant_time_eq (ord integer, str1 text, str2 text);
+
+statement ok
+INSERT INTO test_constant_time_eq VALUES
+    (1, NULL, NULL),
+    (2, NULL, ''),
+    (3, '', ''),
+    (4, '', ' '),
+    (5, NULL, 'abc'),
+    (6, 'abc', 'abc'),
+    (7, 'abc', 'abcd'),
+    (8, 'abcd', 'abc'),
+    (9, 'ABC', 'abc'),
+    (10, ' abc', 'abc'),
+    (11, '\t\n3@\u0930\u0930', '\t\n3@\u0930\u0930'),
+    (12, '.*', 'aa');
+
+query B
+SELECT constant_time_eq(str1, str2) FROM test_constant_time_eq ORDER BY ord;
+----
+NULL
+NULL
+true
+false
+NULL
+true
+false
+false
+false
+false
+true
+false
+
+query I
+SELECT count(*) FROM test_constant_time_eq WHERE constant_time_eq(str1, str2) <> (str1 = str2);
+----
+0
+
+## initcap
+
+query T
+SELECT initcap('hi THOMAS')
+----
+Hi Thomas
+
+query I
+SELECT length(initcap(''))
+----
+0
+
+query T
+SELECT initcap('a')
+----
+A
+
+query T
+SELECT initcap('a,b,c')
+----
+A,B,C
+
+query T
+SELECT initcap('a18z')
+----
+A18z
+
+query T
+SELECT initcap('ABC')
+----
+Abc
+
+query T
+SELECT initcap('Let''s go')
+----
+Let'S Go
+
+query T
+SELECT starts_with('abc', 'ab')
+----
+true
+
+query T
+SELECT starts_with('abc', 'ba')
+----
+false
+
+query T
+SELECT starts_with('abc', '')
+----
+true
+
+query T
+SELECT starts_with('abc', NULL)
+----
+NULL
+
+query T
+SELECT starts_with('abc', '%')
+----
+false
+
+query T
+SELECT starts_with(NULL, NULL)
+----
+NULL
+
+query T
+SELECT starts_with(NULL, 'ab')
+----
+NULL

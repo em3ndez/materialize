@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # Test that proto2 custom defaults are respected.
 
 $ file-append path=defaults.proto
@@ -28,18 +30,24 @@ message Defaults {
     optional Enum enum = 8 [default = ENUM1];
 }
 
-$ protobuf-compile-descriptors inputs=defaults.proto output=defaults.pb
+$ protobuf-compile-descriptors inputs=defaults.proto output=defaults.pb set-var=defaults-schema
 
 $ kafka-create-topic topic=defaults partitions=1
 
-$ kafka-ingest topic=defaults format=protobuf descriptor-file=defaults.pb message=.Defaults
+$ kafka-ingest topic=defaults format=protobuf descriptor-file=defaults.pb message=Defaults
 {}
 
-> CREATE MATERIALIZED SOURCE defaults FROM
-  KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-defaults-${testdrive.seed}'
-  FORMAT PROTOBUF MESSAGE '.Defaults' USING SCHEMA FILE '${testdrive.temp-dir}/defaults.pb'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
-> SELECT * FROM defaults
-bool  int32  int64  float  double  bytes  string enum  mz_offset
+> CREATE SOURCE defaults
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-defaults-${testdrive.seed}')
+
+> CREATE TABLE defaults_tbl FROM SOURCE defaults (REFERENCE "testdrive-defaults-${testdrive.seed}")
+  FORMAT PROTOBUF MESSAGE '.Defaults' USING SCHEMA '${defaults-schema}'
+
+> SELECT * FROM defaults_tbl
+bool  int32  int64  float  double  bytes  string enum
 ----
-true  42     42     42     42      aaa    bbb    ENUM1 1
+true  42     42     42     42      aaa    bbb    ENUM1

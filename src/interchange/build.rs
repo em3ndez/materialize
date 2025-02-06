@@ -7,9 +7,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::env;
+use std::path::PathBuf;
+
 fn main() {
-    mz_protoc::Protoc::new()
-        .include("testdata")
-        .input("testdata/benchmark.proto")
-        .build_script_exec();
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    prost_build::Config::new()
+        .protoc_executable(mz_build_tools::protoc())
+        .include_file("benchproto.rs")
+        .file_descriptor_set_path(out_dir.join("file_descriptor_set.pb"))
+        .btree_map(["."])
+        .compile_protos(&["interchange/testdata/benchmark.proto"], &[".."])
+        .unwrap_or_else(|e| panic!("{e}"))
 }

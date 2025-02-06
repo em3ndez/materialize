@@ -8,27 +8,30 @@
 // by the Apache License, Version 2.0.
 
 use std::env;
+use std::net::Ipv4Addr;
+use std::sync::LazyLock;
 
-use ccsr::SchemaReference;
-use hyper::server::conn::AddrIncoming;
-use hyper::service;
-use hyper::Server;
-use hyper::StatusCode;
-use hyper::{Body, Response};
-use lazy_static::lazy_static;
+use hyper::{service, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use mz_ccsr::tls::Identity;
+use mz_ccsr::{
+    Client, CompatibilityLevel, DeleteError, GetByIdError, GetBySubjectError,
+    GetSubjectConfigError, PublishError, SchemaReference, SchemaType,
+};
+use tokio::net::TcpListener;
 
-use ccsr::{Client, DeleteError, GetByIdError, GetBySubjectError, PublishError, SchemaType};
-
-lazy_static! {
-    pub static ref SCHEMA_REGISTRY_URL: reqwest::Url = match env::var("SCHEMA_REGISTRY_URL") {
+pub static SCHEMA_REGISTRY_URL: LazyLock<reqwest::Url> =
+    LazyLock::new(|| match env::var("SCHEMA_REGISTRY_URL") {
         Ok(addr) => addr.parse().expect("unable to parse SCHEMA_REGISTRY_URL"),
         _ => "http://localhost:8081".parse().unwrap(),
-    };
-}
+    });
 
-#[tokio::test]
+#[mz_ore::test(tokio::test)]
+#[cfg_attr(coverage, ignore)] // https://github.com/MaterializeInc/database-issues/issues/5588
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_method` on OS `linux`
+#[ignore] // TODO: Reenable when database-issues#8701 is fixed
 async fn test_client() -> Result<(), anyhow::Error> {
-    let client = ccsr::ClientConfig::new(SCHEMA_REGISTRY_URL.clone()).build()?;
+    let client = mz_ccsr::ClientConfig::new(SCHEMA_REGISTRY_URL.clone()).build()?;
 
     let existing_subjects = client.list_subjects().await?;
     for s in existing_subjects {
@@ -52,18 +55,15 @@ async fn test_client() -> Result<(), anyhow::Error> {
 
     assert_eq!(count_schemas(&client, "ccsr-test-").await?, 0);
 
+    let test_subject = "ccsr-test-schema";
+
     let schema_v1_id = client
-        .publish_schema("ccsr-test-schema", schema_v1, SchemaType::Avro, &[])
+        .publish_schema(test_subject, schema_v1, SchemaType::Avro, &[])
         .await?;
     assert!(schema_v1_id > 0);
 
     match client
-        .publish_schema(
-            "ccsr-test-schema",
-            schema_v2_incompat,
-            SchemaType::Avro,
-            &[],
-        )
+        .publish_schema(test_subject, schema_v2_incompat, SchemaType::Avro, &[])
         .await
     {
         Err(PublishError::IncompatibleSchema) => (),
@@ -71,13 +71,13 @@ async fn test_client() -> Result<(), anyhow::Error> {
     }
 
     {
-        let res = client.get_schema_by_subject("ccsr-test-schema").await?;
+        let res = client.get_schema_by_subject(test_subject).await?;
         assert_eq!(schema_v1_id, res.id);
         assert_raw_schemas_eq(schema_v1, &res.raw);
     }
 
     let schema_v2_id = client
-        .publish_schema("ccsr-test-schema", schema_v2, SchemaType::Avro, &[])
+        .publish_schema(test_subject, schema_v2, SchemaType::Avro, &[])
         .await?;
     assert!(schema_v2_id > 0);
     assert!(schema_v2_id > schema_v1_id);
@@ -85,7 +85,7 @@ async fn test_client() -> Result<(), anyhow::Error> {
     assert_eq!(
         schema_v1_id,
         client
-            .publish_schema("ccsr-test-schema", schema_v1, SchemaType::Avro, &[])
+            .publish_schema(test_subject, schema_v1, SchemaType::Avro, &[])
             .await?
     );
 
@@ -99,7 +99,7 @@ async fn test_client() -> Result<(), anyhow::Error> {
     }
 
     {
-        let res = client.get_schema_by_subject("ccsr-test-schema").await?;
+        let res = client.get_schema_by_subject(test_subject).await?;
         assert_eq!(schema_v2_id, res.id);
         assert_raw_schemas_eq(schema_v2, &res.raw);
     }
@@ -122,19 +122,35 @@ async fn test_client() -> Result<(), anyhow::Error> {
         assert_eq!(schema_test_id, res.id);
         assert_raw_schemas_eq(schema_v1, &res.raw);
 
-        let res = client.get_subject(subject_with_slashes).await?;
+        let res = client.get_subject_latest(subject_with_slashes).await?;
         assert_eq!(1, res.version);
         assert_eq!(subject_with_slashes, res.name);
         assert_eq!(schema_test_id, res.schema.id);
         assert_raw_schemas_eq(schema_v1, &res.schema.raw);
     }
 
+    // Validate that we can retrieve and change the compatibilty level for a subject
+    let initial_res = client.get_subject_config(test_subject).await;
+    assert!(matches!(
+        initial_res,
+        Err(GetSubjectConfigError::SubjectCompatibilityLevelNotSet)
+    ));
+    client
+        .set_subject_compatibility_level(test_subject, CompatibilityLevel::Full)
+        .await?;
+    let new_compatibility = client
+        .get_subject_config(test_subject)
+        .await?
+        .compatibility_level;
+    assert_eq!(new_compatibility, CompatibilityLevel::Full);
+
     Ok(())
 }
 
-#[tokio::test]
+#[mz_ore::test(tokio::test)]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_method` on OS `linux`
 async fn test_client_subject_and_references() -> Result<(), anyhow::Error> {
-    let client = ccsr::ClientConfig::new(SCHEMA_REGISTRY_URL.clone()).build()?;
+    let client = mz_ccsr::ClientConfig::new(SCHEMA_REGISTRY_URL.clone()).build()?;
 
     let existing_subjects = client.list_subjects().await?;
     for s in existing_subjects {
@@ -237,10 +253,12 @@ async fn test_client_subject_and_references() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[tokio::test]
+#[mz_ore::test(tokio::test)]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_method` on OS `linux`
+#[ignore] // TODO: Reenable when database-issues#6818 is fixed
 async fn test_client_errors() -> Result<(), anyhow::Error> {
     let invalid_schema_registry_url: reqwest::Url = "data::text/plain,Info".parse().unwrap();
-    match ccsr::ClientConfig::new(invalid_schema_registry_url).build() {
+    match mz_ccsr::ClientConfig::new(invalid_schema_registry_url).build() {
         Err(e) => assert_eq!(
             "cannot construct a CCSR client with a cannot-be-a-base URL",
             e.to_string(),
@@ -248,7 +266,7 @@ async fn test_client_errors() -> Result<(), anyhow::Error> {
         res => panic!("Expected error, got {:?}", res),
     }
 
-    let client = ccsr::ClientConfig::new(SCHEMA_REGISTRY_URL.clone()).build()?;
+    let client = mz_ccsr::ClientConfig::new(SCHEMA_REGISTRY_URL.clone()).build()?;
 
     // Get-by-id-specific errors.
     match client.get_schema_by_id(i32::max_value()).await {
@@ -280,7 +298,8 @@ async fn test_client_errors() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[tokio::test]
+#[mz_ore::test(tokio::test)]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_method` on OS `linux`
 async fn test_server_errors() -> Result<(), anyhow::Error> {
     // When the schema registry gracefully reports an error by including a
     // properly-formatted JSON document in the response, the specific error code
@@ -289,7 +308,8 @@ async fn test_server_errors() -> Result<(), anyhow::Error> {
     let client_graceful = start_server(
         StatusCode::INTERNAL_SERVER_ERROR,
         r#"{ "error_code": 50001, "message": "overloaded; try again later" }"#,
-    )?;
+    )
+    .await?;
 
     match client_graceful
         .publish_schema("foo", "bar", SchemaType::Avro, &[])
@@ -332,7 +352,8 @@ async fn test_server_errors() -> Result<(), anyhow::Error> {
     let client_crash = start_server(
         StatusCode::INTERNAL_SERVER_ERROR,
         r#"panic! an exception occured!"#,
-    )?;
+    )
+    .await?;
 
     match client_crash
         .publish_schema("foo", "bar", SchemaType::Avro, &[])
@@ -372,29 +393,35 @@ async fn test_server_errors() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn start_server(status_code: StatusCode, body: &'static str) -> Result<Client, anyhow::Error> {
-    let addr = {
-        let incoming = AddrIncoming::bind(&([127, 0, 0, 1], 0).into()).unwrap();
-        let addr = incoming.local_addr();
-        let server =
-            Server::builder(incoming).serve(service::make_service_fn(move |_conn| async move {
-                Ok::<_, hyper::Error>(service::service_fn(move |_req| async move {
+async fn start_server(
+    status_code: StatusCode,
+    body: &'static str,
+) -> Result<Client, anyhow::Error> {
+    let addr = (Ipv4Addr::LOCALHOST, 0);
+    let listener = TcpListener::bind(addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    mz_ore::task::spawn(|| "start_server", async move {
+        loop {
+            let (conn, remote_addr) = listener.accept().await.unwrap();
+            mz_ore::task::spawn(|| format!("start_server:{remote_addr}"), async move {
+                let service = service::service_fn(move |_req| async move {
                     Response::builder()
                         .status(status_code)
-                        .body(Body::from(body))
-                }))
-            }));
-        tokio::spawn(async {
-            match server.await {
-                Ok(()) => (),
-                Err(err) => eprintln!("server error: {}", err),
-            }
-        });
-        addr
-    };
+                        .body(body.to_string())
+                });
+                if let Err(error) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(conn), service)
+                    .await
+                {
+                    eprintln!("error handling client connection: {error}");
+                }
+            });
+        }
+    });
 
     let url: reqwest::Url = format!("http://{}", addr).parse().unwrap();
-    ccsr::ClientConfig::new(url).build()
+    mz_ccsr::ClientConfig::new(url).build()
 }
 
 fn assert_raw_schemas_eq(schema1: &str, schema2: &str) {
@@ -410,4 +437,42 @@ async fn count_schemas(client: &Client, subject_prefix: &str) -> Result<usize, a
         .iter()
         .filter(|s| s.starts_with(subject_prefix))
         .count())
+}
+
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_method` on OS `linux`
+fn test_stack_from_pem_error() {
+    // Note that this file has file has a malformed certificate after the end of
+    // the private key. This is also not a private key in use anywhere to our
+    // knowledge.
+    let certs = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDDC5MP3v1BHOgI
+5SsmrW8mjxzQGOz0IlC5jp1muW/kpEoE9TG317TEnO5Uye6zZudkFCP8YGEiN3Mc
+FbTM7eX6PjAPdnGU7khuUt/20ZM+NX5kWZPrmPTh4WQaDCL7ah1LqzBaUAMaSXq8
+iuy7LGJNF8wdx8L5BjDiGTTxZXOg0Haxknc7Mbiwc9z8eb7omvzQzsOwyqocrF2u
+z86TzX1jtHP48i5CxoRHKxE94De3tNxjT/Y3OZlS4QS7iekAOQ04DVV3GIHvRUXN
+2H8ayy4+yOdhHn6ER5Jn3lti1Q5XSrxkrYn7L1Vcj6IwZQhhF5vc+ovxOYb+8ert
+Eo97tIkLAgMBAAECggEAQteHHRPKz9Mzs8Sxvo4GPv0hnzFDl0DhUE4PJCKdtYoV
+8dADq2DJiu3LAZS4cJPt7Y63bGitMRg2oyPPM8G9pD5Goy3wq9zjRqexKDlXUCTt
+/T7zofRny7c94m1RWb7ablGq/vBXt90BqnajvVtvDsN+iKAqccQM4ZdI3QdrEmt1
+cHex924itzG/mqbFTAfAmVj1ZsRnJp55Txy2gqq7jX00xDM8+H49SRvUu49N64LQ
+6BUWCgWCJePRtgjSHjboAzPqSkMdaTE/WDY2zgGF3Qfq4f6JCHKfm4QylCH4gYUU
+1Kf7ttmhu9NoZO+hczobKkxP9RtXfyTRH2bsJXy2HQKBgQDhHgavxk/ln5mdMGGw
+rQud2vF9n7UwFiysYxocIC5/CWD0GAhnawchjPypbW/7vKM5Z9zhW3eH1U9P13sa
+2xHfrU5BZ16rxoBbKNpcr7VeEbUBAsDoGV24xjoecp7rB2hZ+mGik5/5Ig1Rk1KH
+dcvYy2KSi1h4Sm+mXwimmA4VDQKBgQDdzW+5FPbdM2sUB2gLMQtn3ICjDSu6IQ+k
+d0p3WlTIT51RUsPXXKkk96O5anUbeB3syY8tSKPGggsaXaeL3o09yIamtERgCnn3
+d9IS+4VKPWQlFUICU1KrD+TO7IYIX04iXBuVE5ihv0q3mslhDotmX4kS38NtKEFF
+jLjA2RvAdwKBgAFkIxxw+Ett+hALnX7vAtRd5wIku4TpjisejanA1Si50RyRDXQ+
+KBQf/+u4HmoK12Nibe4Cl7GCMvRGW59l3S1pr8MdtWsQVfi6Puc1usQzDdBMyQ5m
+IbsjlnZbtPm02QM9Vd8gVGvAtx5a77aglrrnPtuy+r/7jccUbURCSkv9AoGAH9m3
+WGmVRZBzqO2jWDATxjdY1ZE3nUPQHjrvG5KCKD2ehqYO72cj9uYEwcRyyp4GFhGf
+mM4cjo3wEDowrBoqSBv6kgfC5dO7TfkL1qP9sPp93gFeeD0E2wGuRrSaTqt46eA2
+KcMloNx6W0FD98cB55KCeY5eXtdwAA/EHBVRMeMCgYAd3n6PcL6rVXyE3+wRTKK4
++zvx5sjTAnljr5ttbEnpZafzrYIfDpB8NNjexy83AeC0O13LvSHIFoTwP8sywJRO
+RxbPMjhEBdVZ5NxlxYer7yKN+h5OBJfrLswPku7y4vdFYK3x/lMuNQO61hb1VFHc
+T2BDTbF0QSlPxFsv18B9zg==
+-----END PRIVATE KEY-----
+x"#;
+    Identity::from_pem(certs.as_bytes(), &[]).unwrap_err();
 }

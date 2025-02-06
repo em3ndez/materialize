@@ -9,7 +9,7 @@
 
 """Package `materialize` is the top-level Python package for Materialize, Inc.
 
-While the primary product, [materialized], is written in Rust, various demos and
+While the primary product, [materialized][], is written in Rust, various demos and
 build tools are written in Python. This package enables the sharing of code
 between those scripts.
 
@@ -30,5 +30,5 @@ Consider writing additional Python code when:
 import os
 from pathlib import Path
 
-ROOT = Path(os.environ["MZ_ROOT"])
+MZ_ROOT = Path(os.environ["MZ_ROOT"])
 """The absolute path to the root of the Materialize repository."""

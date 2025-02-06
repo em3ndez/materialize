@@ -52,7 +52,7 @@ When an ordered list has `<p>` tags (in markdown, multiple linebreaks between it
 
 ### `diagram` shortcode
 
-Diagrams from [bottlecaps.de/rr/ui](https://www.bottlecaps.de/rr/ui):
+Diagrams from [rr.red-dove.com/ui](https://rr.red-dove.com/ui):
 
 {{< diagram "join-type.svg" >}}
 
@@ -62,30 +62,39 @@ Diagrams from [bottlecaps.de/rr/ui](https://www.bottlecaps.de/rr/ui):
 This is a note.
 {{</ note >}}
 
+### `tip` shortcode
+
+{{< tip >}}
+This is a tip.
+{{</ tip >}}
+
+
 ### `warning` shortcode
 
 {{< warning >}}
 This is a warning.
 {{</ warning >}}
 
-### `beta` shortcode
+### `private-preview` shortcode
 
-{{< beta >}}
-This is a beta notice.
-{{</ beta >}}
+{{< private-preview >}}
+This is a private preview notice.
+{{</ private-preview >}}
 
-### `cloud_notice` shortcode
+### `public-preview` shortcode
 
-{{< cloud-notice >}}
+{{< public-preview >}}
+This is a public preview notice.
+{{</ public-preview >}}
 
 
 ### `cta` shortcode
 
-{{< cta href="/install" >}}
+{{< cta href="/get-started" >}}
 This is a CTA button
 {{</ cta >}}
 
-{{< cta href="/install" full_width="true" >}}
+{{< cta href="/get-started" full_width="true" >}}
 This is a "full_width" CTA button
 {{</ cta >}}
 
@@ -94,7 +103,7 @@ This is a "full_width" CTA button
 Used for prominent messages. Optionally can include a primary and secondary CTA button using `primary_url`, `primary_text`, `secondary_url`, `secondary_text` in shortcode params.
 
 **Primary Only:**
-{{< callout primary_url="https://materialize.com/docs/get-started/" primary_text="Get Started" >}}
+{{< callout primary_url="/get-started/" primary_text="Get Started" >}}
   # Header
 
   Some text and the closing button is specified in the shortcode top.
@@ -143,3 +152,23 @@ Group multiple linkboxes together to form a grid:
 - [Link number three](/)
 {{</ linkbox >}}
 {{</ multilinkbox >}}
+
+### `tabs` shortcode
+
+{{< tabs >}}
+{{< tab "Tab 1">}}
+block1 Tab1
+{{< /tab >}}
+{{< tab "Tab 2">}}
+block1 Tab2
+{{< /tab >}}
+{{< /tabs >}}
+
+{{< tabs >}}
+{{< tab "Tab 1">}}
+block2 Tab1
+{{< /tab >}}
+{{< tab "Tab 2">}}
+Block2 Tab2
+{{< /tab >}}
+{{< /tabs >}}

@@ -3,39 +3,46 @@ title: "SHOW CREATE INDEX"
 description: "`SHOW CREATE INDEX` returns the statement used to create the index."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-{{< version-added v0.4.0 />}}
-
-`SHOW CREATE INDEX` returns the [`CREATE INDEX`](../create-index) statement used to create the index.
+`SHOW CREATE INDEX` returns the DDL statement used to create the index.
 
 ## Syntax
 
-{{< diagram "show-create-index.svg" >}}
+```sql
+SHOW CREATE INDEX <index_name>
+```
 
-Field | Use
-------|-----
-_index&lowbar;name_ | The index you want use. You can find available index names through [`SHOW INDEXES`](../show-indexes).
+For available index names, see [`SHOW INDEXES`](/sql/show-indexes).
 
 ## Examples
 
-```sql
-SHOW INDEXES FROM my_view
+```mzsql
+SHOW INDEXES FROM my_view;
 ```
+
 ```nofmt
-     name
--------------
- my_view_idx
+     name    | on  | cluster    | key
+-------------+-----+------------+--------------------------------------------
+ my_view_idx | t   | quickstart | {a, b}
 ```
-```sql
-SHOW CREATE INDEX my_view_index;
+
+```mzsql
+SHOW CREATE INDEX my_view_idx;
 ```
+
 ```nofmt
-             Index             |                                Create Index
--------------------------------|---------------------------------------------------------------------------
-materialize.public.my_view_idx | CREATE INDEX "my_view_idx" ON "materialize"."public"."my_view" ("a", "b");
+              name              |                                           create_sql
+--------------------------------+------------------------------------------------------------------------------------------------
+ materialize.public.my_view_idx | CREATE INDEX "my_view_idx" IN CLUSTER "default" ON "materialize"."public"."my_view" ("a", "b")
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `USAGE` privileges on the schema containing the index.
 
 ## Related pages
 

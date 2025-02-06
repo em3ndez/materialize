@@ -42,7 +42,7 @@ Testdrive is the preferred system test framework when testing:
 
 `testdrive` is currently sub-optimal for the situations listed below and `sqllogictest` is the better driver in those cases:
 - test cases containing many `EXPLAIN` statements and a lot of recorded query plans;
-- test cases where substantial changes of the ouput over time are expected, which is often the case if many query plans have been recorded in the test.
+- test cases where substantial changes of the output over time are expected, which is often the case if many query plans have been recorded in the test.
 
 Unlike the `sqllogictest` driver, `testdrive` will fail the test at the first difference, and there is no ability to automatically produce a new version of the test file that includes all the required updates to make the test pass.
 
@@ -52,44 +52,44 @@ Unlike the `sqllogictest` driver, `testdrive` will fail the test at the first di
 
 ## As a fully containerized, self-sufficient test via mzcompose
 
-The easiest way to run testdrive tests is via mzcompose.
+The easiest way to run testdrive tests is via [mzcompose](mzcompose.md).
 
-The mzcompose configuration will automatically set up all of testdrive's dependencies, including
-Zookeeper, Kafka, the Confluent Schema Registry, and mock versions of AWS S3 and Kinesis.
+The mzcompose configuration will automatically set up all of testdrive's
+dependencies, including Zookeeper, Kafka, and the Confluent Schema Registry.
+
+**WARNING:** On ARM-based machines (like M1 Macs), running the Confluent
+Platform in Docker is nearly unusably slow because it runs under QEMU emulation.
+(Confluent [refuses to announce a timeline][confluent-arm] for when they will
+provide ARM images.) As a workaround, run tests using Redpanda instead of the
+Confluent Platform, or run tests locally without mzcompose.
+
+For full reference documentation on the available mzcompose options, consult the
+help text:
 
 ```
-TD_TEST=*.td ./mzcompose --dev run testdrive
+./mzcompose run default --help
 ```
 
-Supported **environment variables**:
+### Common invocations
 
-* `TD_TEST` (default `*.td`) is a glob of tests to run from the test/testdrive directory. The
-  default is to not run any of the "esoteric" tests.
+Run testdrive against all files in `test/testdrive` using Confluent Platform and
+Localstack:
 
-  ```
-  TD_TEST=joins.td ./mzcompose --dev run testdrive
-  ```
+```
+./mzcompose --dev run default
+```
 
-* `AWS_REGION`/`AWS_ENDPOINT`: will be supplied to the testdrive `--aws-region`/`--aws-endpoint`
-  command line options, respectively.
+Run using Redpanda instead of the Confluent Platform:
 
-Supported **workflows** (target of `mzcompose run <workflow>`):
+```
+./mzcompose --dev run default --redpanda
+```
 
-* `testdrive`: Run tests with [LocalStack][] stubbing out AWS services. This allows you to run all
-  tests without needing to configure AWS credentials:
+Run testdrive against a single file:
 
-  ```console
-  $ TD_TEST=*.td ./mzcompose run testdrive
-  ```
-
-* `ci`: Expect actual AWS credentials to be available (q.v. [our documentation][aws-creds-docs]),
-  either in the process environment or via AWS EC2 Profiles:
-
-  ```console
-  $ aws-vault exec scratch -- env TD_TEST=**/*.td ./mzcompose run local-aws
-  ```
-
-[aws-creds-docs]: https://handbook.dev.i.mtrlz.dev/setup/#configure-aws-vault
+```
+./mzcompose --dev run default FILE.td
+```
 
 ## Running tests locally without mzcompose
 
@@ -98,13 +98,27 @@ testdrive script, you'll need two terminal windows open. In the first terminal,
 run Materialize:
 
 ```shell
-$ cargo run --bin materialized --release
+$ ./bin/environmentd --release
 ```
 
 In the second terminal, run testdrive:
 
 ```shell
 $ cargo run --bin testdrive --release -- test/testdrive/TESTFILE.td
+```
+
+Note that mzcompose has a different default of system parameters in order to
+test more risky features of Materialize, see `get_default_system_parameters` in
+[https://github.com/MaterializeInc/materialize/blob/main/misc/python/materialize/mzcompose/__init__.py](mzcompose/__init__.py).
+On the command line specific system parameters can be set using the
+`MZSYSTEM_PARAMETER_DEFAULT` environment variable (`;`-separated).
+Alternatively `MZ_ALL_FEATURES=true` enables all available Materialize features.
+For example to run the `mz-arrangement-sharing.td` locally with a Debug build
+for fast turnaround times:
+
+```shell
+$ MZ_ALL_FEATURES=true bin/environmentd
+$ cargo run --bin testdrive -- test/testdrive/mz-arrangement-sharing.td
 ```
 
 Many testdrive tests require Zookeeper, Kafka, and
@@ -115,7 +129,7 @@ running [LocalStack][]. To install and run LocalStack:
 
 ```shell
 $ pip install localstack
-$ START_WEB=false SERVICES=iam,sts,kinesis,s3 localstack start
+$ START_WEB=false SERVICES=iam,sts localstack start
 ```
 
 If you've previously installed LocalStack, be sure it is v0.11 or later.
@@ -131,16 +145,6 @@ cargo run --bin testdrive -- --help
 
 [LocalStack]: https://github.com/localstack/localstack
 
-## Running against  AWS S3
-
-To run a test against the actual S3/SQS service at AWS:
-
-```
-export AWS_ACCESS_KEY_ID=XXX
-export AWS_SECRET_ACCESS_KEY=YYY
-target/release/testdrive --aws-region=eu-central-1 --default-timeout=600s test/testdrive/disabled/s3-sqs-notifications.td
-```
-
 # Creating tests
 
 ## Test format
@@ -150,8 +154,6 @@ A `testdrive` `.td` test starts with a copyright header and must not contain tra
 ## Test naming
 
 Tests related to Kafka are named `kafka-*.td`. This allows various CI jobs that deal with Kafka to pick them up, e.g. to run them against different Kafka versions, against Redpanda, etc.
-
-Tests related to S3/SQS are named `s3*.td`. This allows those tests to be skipped in certain specialized CI jobs and environments where AWS or localstack is not available.
 
 ## Test location
 
@@ -179,19 +181,9 @@ Specifies the backoff factor that will be applied to increase the backoff interv
 
 ## Interfacing with services
 
-#### `--materialized-url <materialized-url>`
+#### `--materialize-url <materialize-url>`
 
 materialized connection string [default: postgres://materialize@localhost:6875]
-
-#### `--aws-endpoint <aws-endpoint>`
-
-Custom AWS endpoint. Default: "http://localhost:4566"
-
-#### `--aws-region <aws-region>`
-
-Named AWS region to target for AWS API requests [default: localstack]
-
-If an actual AWS region is specified, such as `eu-central-1`, all S3/SQS requests will be sent to it.
 
 #### `--cert <PATH>`
 
@@ -223,7 +215,7 @@ By default, `testdrive` will clean up the environment and Mz prior to running ea
 
 #### `--no-reset`
 
-By default, `testdrive` will clean up its environment as much as it can before the start of the test, which includes Mz databases, S3 buckets, etc. If two consequtive invocations of `testdrive` need to be able to operate on the same objects, e.g. database tables, the second invocation needs to run with `--no-reset`
+By default, `testdrive` will clean up its environment as much as it can before the start of the test, which includes Mz databases, etc. If two consequtive invocations of `testdrive` need to be able to operate on the same objects, e.g. database tables, the second invocation needs to run with `--no-reset`
 
 #### `--seed <seed>`
 
@@ -249,11 +241,22 @@ Max number of tests to run before terminating. This is useful in conjunction wit
 
 Shuffle the list of tests before running them (using the value from --seed, if any). This is useful when attempting to use `testdrive` in randomized scenarios or when applying background workload to the database.
 
+#### `--rewrite-results`
+
+Automatically rewrite the testdrive file with the correct results when they are not as expected. Consider setting a lower `--default-max-tries` value too to get a result faster.
+
 ## Other options
 
-#### `--validate-catalog /path/to/catalog`
+#### `--consistency-checks=<file, statement, disable>`
 
-After executing a DDL statement, validate that the on-disk representation of the catalog is identical to the in-memory one.
+There are internal invariants that we want to make sure are upheld within Materialize. By default
+we check these invariants after an entire test run. You can also optionally disable them, or when
+debugging, run them after every statement.
+
+#### `--validate-catalog-store`
+
+After executing a DDL statement, validate that representation of the catalog is identical to the in-memory one.
+Must also set the `--persist-consensus-url` and `--persist-blob-url` options.
 
 # Executing statements
 
@@ -318,14 +321,59 @@ The syntax is identical, however the statement will not be retried on error:
 
 ## Executing a statement that is expected to return an error
 
+Specify a statement that is expected to return an error with the `!` sigil. For
+example:
+
 ```
 ! SELECT * FROM no_such_table
-unknown catalog item
+contains:unknown catalog item
 ```
 
-The expected error string is provided after the statement and `testdrive` will retry the statement until the expected error is returned or a timeout occurs.
+The expected error is specified after the statement. `testdrive` will retry the
+statement until the expected error is returned or a timeout occurs.
 
-Note that you can provide a string that is a substring of the expected error. The full error above would have been `ERROR:  unknown catalog item 'no_such_table'` but the substring `unknown catalog item` will match and the test will pass. This allows for any variable portions of the error message to be omitted from the test file.
+In the example above, the full error returned by Materialize is:
+
+```
+ERROR:  unknown catalog item 'no_such_table'
+```
+
+The `contains:` prefix in the expected error means that the presence of the
+substring `unknown catalog item` in the error message is considered a pass.
+
+There are four types of error expectations:
+
+  * `contains:STRING` expects any error message containing `STRING`.
+  * `exact:STRING` expects an error message that is exactly `STRING`.
+  * `regex:REGEX` expects an error message that matches the regex `REGEX`.
+  * `timeout` expects the query to time out.
+
+
+You can include include variables in `contains`, `exact`, and `regex`
+expectations:
+
+```
+$ set table_name=no_table
+
+$ SELECT * FROM ${table_name}
+exact:ERROR:  unknown catalog item '${table_name}'
+```
+
+With regex matches, the values of any interpolated variables are matched
+literally, i.e.,  their values are *not* treated as regular expression patterns.
+For example, a variable with value `my.+name` will match the string `my.+name`,
+not `my friend's name`.
+
+Additionally, you can add one or both of the following, after the error
+expectation field:
+```
+detail:expected detail
+hint:expected hint
+```
+
+These assert that the `DETAIL` or `HINT` fields _contains_ the expected message.
+These fields in the postgres error response are otherwise ignored. If both
+are specified, `detail` must come before `hint`.
 
 ## Executing statements in multiple sessions
 
@@ -372,6 +420,36 @@ $ set schema={
     }
 ```
 
+#### `$ set-arg-default name=value`
+
+Sets the default value for an argument variable passed on the command line. If
+`--var=name=cli-value` is specified on the command line, it will take precedence
+over the argument default.
+
+Note that the variable name should not include the `arg.` prefix. Testdrive will
+add that prefix automatically.
+
+```
+$ set cluster-size=small
+
+> CREATE CLUSTER (SIZE ${arg.size})
+```
+
+
+#### `$ set-from-file var=PATH`
+
+Sets the variable to the contents of the file at `PATH`.
+
+#### `$ set-from-sql var=NAME`
+
+Sets the variable to the result of a SQL query that returns one row containing
+one string column:
+
+```
+$ set-from-sql var=environment-id
+SELECT mz_environment_id()
+```
+
 ## Referencing variables
 
 #### `${variable_name}`
@@ -379,7 +457,7 @@ $ set schema={
 A variable can be referenced in both the arguments and the body of a command.
 
 ```
-$ kafka-ingest format=avro topic=kafka-ingest-repeat schema=${schema} publish=true repeat=2
+$ kafka-ingest format=avro topic=kafka-ingest-repeat schema=${schema} repeat=2
 {"f1": "${schema}"}
 ```
 
@@ -430,11 +508,17 @@ The temporary directory to use. If no ```--temp-dir``` option is specified, it w
 
 #### `testdrive.aws-token`
 
-#### `"stdrive.aws-endpoint`
+#### `testdrive.aws-endpoint`
 
-#### `testdrive.materialized-addr`
+#### `testdrive.materialize-internal-http-addr`
 
-#### `testdrive.materialized-user`
+#### `testdrive.materialize-http-addr`
+
+#### `testdrive.materialize-sql-addr`
+
+#### `testdrive.materialize-internal-sql-addr`
+
+#### `testdrive.materialize-user`
 
 ## Accessing the environment variables
 
@@ -447,15 +531,11 @@ The environment variables are available uppercase, with an the `env.` prefix:
 
 # Dealing with variable output
 
-Certain tests produce variable output and testdrive provides a way to mask that via regular expression substitution
+Certain tests produce variable output and testdrive provides a way to mask that via regular expression substitution.
 
 #### `$ set-regex match=regular_expression replacement=replacement_str`
 
-All matches of the regular expression in the entire test will be converted to ```replacement_str```.
-
-> :warning: **only one regular expression and replacement string can be used for the entire test**
->
-> The place where the regular expression is declared within the script does not matter, it will be applied to all lines of the test.
+All matches of the regular expression in the rest of the test will be converted to ```replacement_str```.
 
 For example, this will convert all UNIX-like timestamps to the fixed string `<TIMESTAMP>`and this test will pass:
 
@@ -464,6 +544,8 @@ $ set-regex match=\d{10} replacement=<TIMESTAMP>
 > SELECT round(extract(epoch FROM now()));
 <TIMESTAMP>
 ```
+
+Note that only one regex can be active at a time: additional calls to `set-regex` will unset the previous regex. If you want to unset the regex without setting a new one, `unset-regex` will do that for you.
 
 ## Useful regular expressions
 
@@ -485,7 +567,7 @@ In addition to the default connection that is used for the `>` and `!` statement
 Executes a list of statements over the specified connection. The `connection` can be specified as either an URL or as a named connection created by `$ postgres-connect`:
 
 ```
-$ postgres-execute connection=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-execute connection=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 CREATE TABLE postgres_execute (f1 INTEGER);
 ```
 
@@ -496,7 +578,7 @@ If any of the statements fail, the entire test will fail. Any result sets return
 Creates a named psql connection that can be used by multiple `$ postgres-execute` statements
 
 ```
-$ postgres-connect name=conn1 url=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-connect name=conn1 url=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 
 $ postgres-execute connection=conn1
 BEGIN;
@@ -515,8 +597,26 @@ single-threaded context, so will be serialized in the order they appear in the
 
 #### `$ postgres-verify-slot connection=... slot=... active=(true|false)`
 
-Pauses the test until the desired Postgres replication slot has become active or inactive on the Postgres side of the direct Postgres replication. This is used to prevent flakiness in Postgres-related tests.
+Pauses the test until the desired Postgres replication slot (identified by
+`LIKE` pattern) has become active or inactive on the Postgres side of the direct
+Postgres replication. This is used to prevent flakiness in Postgres-related
+tests.
 
+
+## Connecting to MySQL
+
+#### `$ mysql-connect name=... url=... password=...`
+
+Creates a named connection to MySQL. For example:
+
+```
+$ mysql-connect name=mysql_connection url=mysql://mysql_user@mysql_host password=1234
+
+```
+
+##### `$ mysql-execute name=...`
+
+Executes SQL queries over the specified named connection to MySQL. The ouput of the queries is not validated, but an error will cause the test to fail.
 
 ## Connecting to Microsoft SQL Server
 
@@ -526,7 +626,7 @@ Creates a named connection to SQL Server. The parameters of the connection are s
 
 ```
 $ sql-server-connect name=sql-server
-server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID=sa;Password=${env.SA_PASSWORD}
+server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID=sa;Password=${arg.sa-password}
 ```
 
 #### `$ sql-server-execute name=...`
@@ -543,7 +643,7 @@ The output of the queries is not validated in any way. An error during execution
 
 ## Sleeping in the test
 
-#### `$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=N`
+#### `$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration="Ns"`
 
 Sleeps for `N` seconds
 
@@ -551,56 +651,51 @@ Sleeps for `N` seconds
 
 Sleeps a random interval between 0 and N seconds
 
-#### `> select mz_internal.mz_sleep(N)`
+#### `> select mz_unsafe.mz_sleep(N)`
 
 Instructs Mz to sleep for the specified number of seconds. `mz_sleep()` returns `<null>`, so the test needs to be coded accordingly:
 
 ```
-> SELECT mz_internal.mz_sleep(1)
+> SELECT mz_unsafe.mz_sleep(1)
 <null>
 ```
 
 ## Controlling timeouts and retries
 
-#### `$ set-sql-timeout duration=N(ms|s|m)`
+#### `$ set-sql-timeout duration=N(ms|s|m) [force=true]`
 
 Adjusts the SQL timeout for tests that contain queries that may take a long time to run. Alternatively, the `--default-timeout` setting can be passed to `testdrive`.
 
-#### "$ set-execution-count count=N"
+The command will be ignored if it sets a timeout that is smaller than the
+default timeout, unless you specify `force=true`. Use this override with
+caution! It may cause the test to fail in test environments that introduce
+overhead and need a larger `--default-timeout` to succeed.
 
-Will run the test N times.
+#### `$ set-max-tries max-tries=N`
 
-## Actions on Avro OCF files
+Adjust the number of tries testdrive will perform while waiting for a SQL statement to arrive to the desired result.
 
-#### `$ avro-ocf-write path=... schema=... codec=(snapy|null)`
-
-Writes the data following the action into the specified file using the specified schema. The schema is traditionally provided using a variable that is defined elsewhere in the test.
-
-#### `$ avro-ocf-append path=...`
-
-Appends the data provided to an already-existing file
-
-#### `$ avro-ocf-verify sink=...`
-
-Validates that the data emitted from an AVRO OCF file sink matches the expected output.
-```
-> CREATE SINK basic_sink_${testdrive.seed} FROM basic
-  INTO AVRO OCF '${testdrive.temp-dir}/basic-sink.ocf'
-
-$ avro-ocf-verify sink=materialize.public.basic_sink_${testdrive.seed}
-{"before": null, "after": {"row": {"a": 1, "b": 2, "mz_obj_no": 1}}}
-{"before": null, "after": {"row": {"a": 3, "b": 4, "mz_obj_no": 2}}}
-```
+Set `max-tries` to `1` in order to ensure that statements are executed only once. If the desired result is not achieved on the first try, the test will fail. This is
+useful when testing operations that should return the right result immediately rather than eventually.
 
 ## Actions on local files
 
-#### `$ file-append path=file.name [compression=gzip]`
+#### `$ file-append path=file.name [compression=gzip] [repeat=N]`
 
 Writes the data provided to a file on disk. The file will be created inside the temporary directory of the test.
+
+If the `repeat` parameter is provided, the data provided will be appended to the
+file the specified number of times, rather than just once.
 
 #### `$ file-delete path=file.name`
 
 Deletes the specified file from within the temporary directory.
+
+## Actions on S3
+
+#### `$ s3-verify-data address=s3://...`
+
+Verify the data at a specific S3 address.
 
 ## Actions on Kafka topics
 
@@ -611,6 +706,19 @@ Add partitions to an existing topic
 #### `$ kafka-create-topic`
 
 Create a Kafka topic
+
+#### `$ kafka-delete-topic-flaky`
+
+Delete a Kafka topic
+
+Even though `kafka-delete-topic-flaky` ensures that the topic no longer exists
+in the broker metadata there is still work to be done asychnronously before
+it's truly gone that must complete before we attempt to recreate it. There is
+no way to observe this work completing so the only option left is sleeping for
+a while after executing this command.
+
+For this reason this command must be used with great care or not at all,
+otherwise there is a risk of introducing flakiness in CI.
 
 #### `$ kafka-ingest topic=... schema=... ...`
 
@@ -636,10 +744,6 @@ The schema to use
 
 For data that contains a key, the schema of the key
 
-##### `publish=true`
-
-Publish the schema and key schema provided to the schema registry.
-
 ##### `key-terminator=str`
 
 For data provided as `format=bytes key-format=bytes`, the separator between the key and the data in the test
@@ -658,52 +762,119 @@ Set the starting value of the `${kafka-ingest.iteration}` variable.
 
 Send the data to the specified partition.
 
-#### `kafka-verify format=avro sink=... [sort-messages=true] [consistency=debezium]`
+### set-schema-id-var=VAR
 
-Obtains the data from the specified `sink` and compares it to the expected data recorded in the test. The comparison algorithm is sensitive to the order in which data arrives, so `sort-messages=true` can be used along with manually pre-sorting the expected data in the test.
+Sets the variable named VAR to the ID of the schema with which data was written.
+The variable is only set if the format of the key was Confluent Avro or
+Protobuf.
 
-## Actions on Kinesis
+### set-key-schema-id-var=VAR
 
-#### `$ kinesis-create-stream`
+Sets the variable named VAR to the ID of the key schema with which data was
+written. The variable is only set if the format of the key was Confluent Avro
+or Protobuf.
 
-#### `$ kinesis-update-shards`
+#### `kafka-verify-data format=avro [sink=... | topic=...] [sort-messages=true] [partial-search=usize]`
 
-#### `$ kinesis-ingest`
+Obtains the data from the specified `sink` or `topic` and compares it to the expected data recorded in the test.
 
-#### `$ kinesis-verify`
+The comparison algorithm is sensitive to the order in which data arrives, so `sort-messages=true` can be used
+along with manually pre-sorting the expected data in the test. The rows in the expected data section need to
+be ordered according to the following rules:
+ - earlier timestamps sort first
+ - deletes sort before inserts
+ - as all items are sorted as strings, "10" sorts before "2"
 
-## Actions on S3/SQS
-
-#### `$ s3-create-bucket bucket=...`
-
-Creates the specified S3 bucket
-
-#### `$ s3-put-object bucket=... key=...`
-
-Uploads the data provided under the key specified in the bucket specified.
-
-#### `$ s3-delete-objects`
-
-Delete the S3 keys provided below the action from the bucket.
+It is possible to call `$ kafka-verify-data` multiple times on the same topic in case the test needs to check
+that the data arrives in some partial order. For example, to make sure that all of timestamp `1` arrived
+before all of timestamp `2`:
 
 ```
-$ s3-delete-objects bucket=foo
-1.csv
-2.csv
-3.csv
+$ kafka-verify-data ... sort-messages=true
+1 {"a":"1"}
+1 {"b":"1"}
+
+$ kafka-verify-data ... sort-messages=true
+2 {"c":"1"}
+2 {"d":"1"}
 ```
 
-#### `$ s3-add-notifications bucket=... queue=... sqs-validation-timeout=Nm`
+If `partial-search=usize` is specified, up to `partial-search` records will be read from the given topic and
+compared to the provided records. The records do not have to match starting at the beginning of the sink but
+once one record matches, the following must all match.  There are permitted to be records remaining in the
+topic after the matching is complete.  Note that if the topic is not required to have `partial-search`
+elements in it but there will be an attempt to read up to this number with a blocking read.
 
-Add an SQS notification to the specified bucket and then validates that SQS works by uploading a key and listening for the SQS notification.
+#### `kafka-verify-topic [sink=... | topic=...] [await-value-schema=false] [await-key-schema=false]`
 
-> :warning: `$ s3-add-notifications` uploads a single key in your bucket that remains there , so it will show up in your S3 sources unless you use a `DISCOVER OBJECTS MATCHING` clause to filter it out.
+Verifies that the broker contains the appropriate topic.
+
+`await-value-schema` and `await-key-schema` optionally check that the Confluent
+Schema Registry also contains the appropriate subjects before continuing.
+
+#### `kafka-verify-commit consumer-group-id=... topic=... partition=...
+
+Verifies that the provided offset (the input data) matches the committed offset
+for the specified consumer group, topic, and partition.
+
+#### `headers=<list or object>`
+
+`headers` is a parameter that takes a json map (or list of maps) with string key-value pairs
+sent as headers for every message for the given action. To represent a value of bytes (instead of string) an int array with each value representing a byte can be passed.
+
+## Actions on Confluent Schema Registry
+
+#### `$ schema-registry-publish subject=... schema-type=<avro|json|protobuf> [references=subject[,subject...]]`
+
+Publish a schema to the schema registry.
+
+The command's input is used as the body of the schema.
+
+The required `subject` argument specifies the name under which to register the
+schema. If registering a schema for a Kafka topic using the topic name strategy
+(the usual case), use the subject `$TOPIC-key` or `$TOPIC-value`, depending on
+whether the schema is for the key type or the value type.
+
+The required `schema-type` argument indicates the type of the schema.
+
+The optional `references` argument specifies a comma-separated list of existing
+schema subjects upon which the schema depends. The action always declares the
+reference on the *latest* version of the referenced subject. If this is
+limiting, feel free to adjust the action to permit specifying the desired
+version, instead of assuming the latest version.
+
+#### `$ schema-registry-verify subject=... schema-type=avro`
+
+Verify the contents of the latest version of a schema in the schema registry.
+
+The command's input is used as the expected schema.
+
+The required `subject` argument specifies the name of the schema in the registry
+to validate. The latest version of the subject is always used. If this is
+limiting, feel free to adjust the action to specify the desired version. If
+verifying a schema for a Kafka topic using the topic name strategy (the usual
+case), use the subject `$TOPIC-key` or `$TOPIC-value`, depending on whether
+you wish to verify the key or the value schema.
+
+The required `schema-type` argument indicates the type of the schema. At
+present, only Avro schemas are supported. Feel free to adjust the action to
+support additional schema types.
+
+#### `$ schema-registry-wait topic=...`
+
+Block the test until schema with the specified subject (both value and key) has been
+defined at the schema registry. Also waits for the kafka topic to exist.
+
+This action is useful to fortify tests that expect an external party, e.g.
+Debezium, to upload a particular schema.
 
 ## Actions on REST services
 
-#### `$ http-request method=(GET|POST|PUT) url=... content-type=...`
+#### `$ http-request method=(GET|POST|PUT) url=... content-type=... [accept-additional-status-codes=404,409]`
 
-Issue a HTTP request against a third-party server. The body of the command is used as a body of the request. This is generally used when communicating with REST services such as Debezium and Toxiproxy. See `test/debezium-avro/debezium-postgres.td.initialize` and `test/pg-cdc-resumption/configure-toxiproxy.td`
+Issue an HTTP request against a third-party server. The body of the command is used as a body of the request. This is
+generally used when communicating with REST services such as Debezium and Toxiproxy. See
+`test/debezium-avro/debezium-postgres.td.initialize` and `test/pg-cdc-resumption/configure-toxiproxy.td`
 
 ```
 $ http-request method=POST url=http://example/com content-type=application/json
@@ -712,11 +883,26 @@ $ http-request method=POST url=http://example/com content-type=application/json
 }
 ```
 
-The test will fail unless the HTTP status code of the response is in the 200 range.
+The test will fail unless the HTTP status code of the response is in the 200 range. If further status codes shall be
+accepted, use the parameter `accept-additional-status-codes`, which takes a comma-separated list.
 
-#### `$ schema-registry-wait-schema schema=...`
+## Actions on Webhook Sources
 
-Block the test until the specified schema has been defined at the schema registry. This is used to fortify tests that expect an external party, e.g. Debezium to  upload a particular schema.
+#### `$ webhook-append name=... [database=...] [schema=...] [status=404] [header_name=header_value, ...]`
+
+Issues an HTTP POST request to a webhook source at `<database>.<schema>.<name>`, by default
+`database` is `materialize` and `schema` is `public`. The body of the command is used as the body
+of the request. You can optionally specify an expected response status code, by default we expect a
+status of 200. Any remaining arguments are appended to the request as headers.
+
+See `webhook.td` for more examples.
+
+```
+$ webhook-append database=materialize schema=public name=webhook_json app_name=test_drive
+{
+  "hello": "world"
+}
+```
 
 ## Actions with `psql`
 
@@ -724,3 +910,38 @@ Block the test until the specified schema has been defined at the schema registr
 
 Executes a command against Materialize via `psql`. This is intended for testing
 `psql`-specific commands like `\dn`.
+
+## Conditionally skipping the rest of a `.td` file
+
+```
+$ skip-if
+SELECT true
+```
+
+`skip-if` followed by a SQL statement will skip the following statements until
+the next `skip-end` statement (or until the end of the `.td` file) if
+the statement returns one row containing one column with the value `true`. If
+the statement returns `false`, then execution of the script proceeds normally.
+If the query returns anything but a single row with a single column containing a
+`boolean` value, testdrive will mark the script as failed and proceed with
+execution of the next script.
+
+This action can be useful to conditionally test if a script is running against
+a version of Materialize that is able to execute the SQL constructs contained therein.
+
+```
+$ skip-if
+SELECT mz_version_num() < 2601;
+```
+
+## Run an action/query conditionally on version
+
+```
+>[version>=13000] SELECT 1;
+1
+```
+
+The `[version>=13000]` property allows running the action or query only when we are connected to a Materialize instance with a compatible version. The supported comparison operators are `>`, `>=`, `=`, `<=` and `<`. The version number is the same as returned from [`mz_version_num()`](https://materialize.com/docs/sql/functions/#system-information-func) and has the same format `XXXYYYZZ`, where `XX` is the major version, `YYY` is the minor version and `ZZ` is the patch version. So in the example we are only running the `SELECT 1` query if the Materialize instance is of version `v0.130.0` or higher. For lower versions no query is run and no comparison of results is performed subsequently.
+
+[confluent-arm]: https://github.com/confluentinc/common-docker/issues/117#issuecomment-948789717
+[aws-creds]: https://github.com/MaterializeInc/i2/blob/main/doc/aws-access.md

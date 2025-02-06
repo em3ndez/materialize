@@ -7,16 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use lazy_static::lazy_static;
+use std::borrow::ToOwned;
+use std::collections::{btree_map, BTreeMap};
+use std::error::Error;
+use std::fmt::Write;
+use std::str::FromStr;
+use std::sync::LazyLock;
+
+use anyhow::{anyhow, bail, Context};
 use regex::Regex;
 
-use std::borrow::ToOwned;
-use std::collections::hash_map;
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use std::str::FromStr;
-
-use super::error::{InputError, Positioner};
+use crate::error::PosError;
 
 #[derive(Debug, Clone)]
 pub struct PosCommand {
@@ -24,11 +25,18 @@ pub struct PosCommand {
     pub command: Command,
 }
 
+// min and max versions, both inclusive
+#[derive(Debug, Clone)]
+pub struct VersionConstraint {
+    pub min: i32,
+    pub max: i32,
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
-    Builtin(BuiltinCommand),
-    Sql(SqlCommand),
-    FailSql(FailSqlCommand),
+    Builtin(BuiltinCommand, Option<VersionConstraint>),
+    Sql(SqlCommand, Option<VersionConstraint>),
+    FailSql(FailSqlCommand, Option<VersionConstraint>),
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +44,15 @@ pub struct BuiltinCommand {
     pub name: String,
     pub args: ArgMap,
     pub input: Vec<String>,
+}
+
+impl BuiltinCommand {
+    pub fn assert_no_input(&self) -> Result<(), anyhow::Error> {
+        if !self.input.is_empty() {
+            bail!("{} action does not take input", self.name);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,32 +70,62 @@ pub enum SqlOutput {
 pub struct SqlCommand {
     pub query: String,
     pub expected_output: SqlOutput,
+    pub expected_start: usize,
+    pub expected_end: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct FailSqlCommand {
     pub query: String,
-    pub expected_error: String,
+    pub expected_error: SqlExpectedError,
+    pub expected_detail: Option<String>,
+    pub expected_hint: Option<String>,
 }
 
-pub fn parse(line_reader: &mut LineReader) -> Result<Vec<PosCommand>, InputError> {
+#[derive(Debug, Clone)]
+pub enum SqlExpectedError {
+    Contains(String),
+    Exact(String),
+    Regex(String),
+    Timeout,
+}
+
+pub(crate) fn parse(line_reader: &mut LineReader) -> Result<Vec<PosCommand>, PosError> {
     let mut out = Vec::new();
     while let Some((pos, line)) = line_reader.peek() {
         let pos = *pos;
         let command = match line.chars().next() {
-            Some('$') => Command::Builtin(parse_builtin(line_reader)?),
-            Some('>') => Command::Sql(parse_sql(line_reader)?),
-            Some('?') => Command::Sql(parse_explain_sql(line_reader)?),
-            Some('!') => Command::FailSql(parse_fail_sql(line_reader)?),
+            Some('$') => {
+                let version = parse_version_constraint(line_reader)?;
+                Command::Builtin(parse_builtin(line_reader)?, version)
+            }
+            Some('>') => {
+                let version = parse_version_constraint(line_reader)?;
+                Command::Sql(parse_sql(line_reader)?, version)
+            }
+            Some('?') => {
+                let version = parse_version_constraint(line_reader)?;
+                Command::Sql(parse_explain_sql(line_reader)?, version)
+            }
+            Some('!') => {
+                let version = parse_version_constraint(line_reader)?;
+                Command::FailSql(parse_fail_sql(line_reader)?, version)
+            }
             Some('#') => {
                 // Comment line.
                 line_reader.next();
                 continue;
             }
-            _ => {
-                return Err(InputError {
-                    msg: "unexpected input line at beginning of file".into(),
-                    pos,
+            Some(x) => {
+                return Err(PosError {
+                    source: anyhow!(format!("unexpected input line at beginning of file: {}", x)),
+                    pos: Some(pos),
+                });
+            }
+            None => {
+                return Err(PosError {
+                    source: anyhow!("unexpected input line at beginning of file"),
+                    pos: Some(pos),
                 });
             }
         };
@@ -87,20 +134,20 @@ pub fn parse(line_reader: &mut LineReader) -> Result<Vec<PosCommand>, InputError
     Ok(out)
 }
 
-fn parse_builtin(line_reader: &mut LineReader) -> Result<BuiltinCommand, InputError> {
+fn parse_builtin(line_reader: &mut LineReader) -> Result<BuiltinCommand, PosError> {
     let (pos, line) = line_reader.next().unwrap();
     let mut builtin_reader = BuiltinReader::new(&line, pos);
     let name = match builtin_reader.next() {
         Some(Ok((_, s))) => s,
         Some(Err(e)) => return Err(e),
         None => {
-            return Err(InputError {
-                msg: "command line is missing command name".into(),
-                pos,
+            return Err(PosError {
+                source: anyhow!("command line is missing command name"),
+                pos: Some(pos),
             });
         }
     };
-    let mut args = HashMap::new();
+    let mut args = BTreeMap::new();
     for el in builtin_reader {
         let (pos, token) = el?;
         let pieces: Vec<_> = token.splitn(2, '=').collect();
@@ -108,29 +155,18 @@ fn parse_builtin(line_reader: &mut LineReader) -> Result<BuiltinCommand, InputEr
             [key, value] => vec![*key, *value],
             [key] => vec![*key, ""],
             _ => {
-                return Err(InputError {
-                    msg: "command argument is not in required key=value format".into(),
-                    pos,
+                return Err(PosError {
+                    source: anyhow!("command argument is not in required key=value format"),
+                    pos: Some(pos),
                 });
             }
         };
-        lazy_static! {
-            static ref VALID_KEY_REGEX: Regex = Regex::new("^[a-z0-9\\-]*$").unwrap();
-        }
-        if !VALID_KEY_REGEX.is_match(pieces[0]) {
-            return Err(InputError {
-                msg: format!(
-                    "invalid builtin argument name '{}': \
-                     only lowercase letters, numbers, and hyphens allowed",
-                    pieces[0]
-                ),
-                pos,
-            });
-        }
+        validate_ident(pieces[0]).map_err(|e| PosError::new(e, pos))?;
+
         if let Some(original) = args.insert(pieces[0].to_owned(), pieces[1].to_owned()) {
-            return Err(InputError {
-                msg: format!("argument '{}' specified twice", original),
-                pos,
+            return Err(PosError {
+                source: anyhow!("argument '{}' specified twice", original),
+                pos: Some(pos),
             });
         };
     }
@@ -141,16 +177,109 @@ fn parse_builtin(line_reader: &mut LineReader) -> Result<BuiltinCommand, InputEr
     })
 }
 
-fn parse_sql(line_reader: &mut LineReader) -> Result<SqlCommand, InputError> {
+/// Validate that the string is an allowed variable name (lowercase letters, numbers and dashes)
+pub fn validate_ident(name: &str) -> Result<(), anyhow::Error> {
+    static VALID_KEY_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("^[a-z0-9\\-]*$").unwrap());
+    if !VALID_KEY_REGEX.is_match(name) {
+        bail!(
+            "invalid builtin argument name '{}': \
+             only lowercase letters, numbers, and hyphens allowed",
+            name
+        );
+    }
+    Ok(())
+}
+
+fn parse_version_constraint(
+    line_reader: &mut LineReader,
+) -> Result<Option<VersionConstraint>, PosError> {
+    let (pos, line) = line_reader.next().unwrap();
+    if line[1..2].to_string() != "[" {
+        line_reader.push(&line);
+        return Ok(None);
+    }
+    let closed_brace_pos = match line.find(']') {
+        Some(x) => x,
+        None => {
+            return Err(PosError {
+                source: anyhow!("version-constraint: found no closing brace"),
+                pos: Some(pos),
+            });
+        }
+    };
+    if line[2..9].to_string() != "version" {
+        return Err(PosError {
+            source: anyhow!(
+                "version-constraint: invalid property {}",
+                line[2..closed_brace_pos].to_string()
+            ),
+            pos: Some(pos),
+        });
+    }
+    let remainder = line[closed_brace_pos + 1..].to_string();
+    line_reader.push(&remainder);
+    const MIN_VERSION: i32 = 0;
+    const MAX_VERSION: i32 = 9999999;
+    let version_pos = if line.as_bytes()[10].is_ascii_digit() {
+        10
+    } else {
+        11
+    };
+    let version = match line[version_pos..closed_brace_pos].parse::<i32>() {
+        Ok(x) => x,
+        Err(_) => {
+            return Err(PosError {
+                source: anyhow!(
+                    "version-constraint: invalid version number {}",
+                    line[version_pos..closed_brace_pos].to_string()
+                ),
+                pos: Some(pos),
+            });
+        }
+    };
+
+    match &line[9..version_pos] {
+        "=" => Ok(Some(VersionConstraint {
+            min: version,
+            max: version,
+        })),
+        "<=" => Ok(Some(VersionConstraint {
+            min: MIN_VERSION,
+            max: version,
+        })),
+        "<" => Ok(Some(VersionConstraint {
+            min: MIN_VERSION,
+            max: version - 1,
+        })),
+        ">=" => Ok(Some(VersionConstraint {
+            min: version,
+            max: MAX_VERSION,
+        })),
+        ">" => Ok(Some(VersionConstraint {
+            min: version + 1,
+            max: MAX_VERSION,
+        })),
+        _ => Err(PosError {
+            source: anyhow!(
+                "version-constraint: unknown comparison operator {}",
+                line[9..version_pos].to_string()
+            ),
+            pos: Some(pos),
+        }),
+    }
+}
+
+fn parse_sql(line_reader: &mut LineReader) -> Result<SqlCommand, PosError> {
     let (_, line1) = line_reader.next().unwrap();
     let query = line1[1..].trim().to_owned();
+    let expected_start = line_reader.raw_pos;
     let line2 = slurp_one(line_reader);
     let line3 = slurp_one(line_reader);
     let mut column_names = None;
     let mut expected_rows = Vec::new();
-    lazy_static! {
-        static ref HASH_REGEX: Regex = Regex::new(r"^(\S+) values hashing to (\S+)$").unwrap();
-    }
+    static HASH_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(\S+) values hashing to (\S+)$").unwrap());
     match (line2, line3) {
         (Some((pos2, line2)), Some((pos3, line3))) => {
             if line3.len() >= 3 && line3.chars().all(|c| c == '-') {
@@ -169,12 +298,14 @@ fn parse_sql(line_reader: &mut LineReader) -> Result<SqlCommand, InputError> {
                             num_values,
                             md5: captures[2].to_owned(),
                         },
+                        expected_start: 0,
+                        expected_end: 0,
                     })
                 }
                 Err(err) => {
-                    return Err(InputError {
-                        pos: pos2,
-                        msg: format!("Error parsing number of expected rows: {}", err),
+                    return Err(PosError {
+                        source: anyhow!("Error parsing number of expected rows: {}", err),
+                        pos: Some(pos2),
                     });
                 }
             },
@@ -185,58 +316,114 @@ fn parse_sql(line_reader: &mut LineReader) -> Result<SqlCommand, InputError> {
     while let Some((pos, line)) = slurp_one(line_reader) {
         expected_rows.push(split_line(pos, &line)?)
     }
+    let expected_end = line_reader.raw_pos;
     Ok(SqlCommand {
         query,
         expected_output: SqlOutput::Full {
             column_names,
             expected_rows,
         },
+        expected_start,
+        expected_end,
     })
 }
 
-fn parse_explain_sql(line_reader: &mut LineReader) -> Result<SqlCommand, InputError> {
+fn parse_explain_sql(line_reader: &mut LineReader) -> Result<SqlCommand, PosError> {
     let (_, line1) = line_reader.next().unwrap();
+    let expected_start = line_reader.raw_pos;
     // This is a bit of a hack to extract the next chunk of the file with
     // blank lines intact. Ideally the `LineReader` would expose the API we
     // need directly, but that would require a large refactor.
     let mut expected_output: String = line_reader
         .inner
         .lines()
+        .filter(|l| !matches!(l.chars().next(), Some('#')))
         .take_while(|l| !is_sigil(l.chars().next()))
-        .map(|l| format!("{}\n", l))
-        .collect();
-    slurp_all(line_reader);
+        .fold(String::new(), |mut output, l| {
+            let _ = write!(output, "{}\n", l);
+            output
+        });
     while expected_output.ends_with("\n\n") {
         expected_output.pop();
     }
+    // We parsed the multiline expected_output directly using line_reader.inner
+    // above.
+    slurp_all(line_reader);
+    let expected_end = line_reader.raw_pos;
+
     Ok(SqlCommand {
         query: line1[1..].trim().to_owned(),
         expected_output: SqlOutput::Full {
             column_names: None,
             expected_rows: vec![vec![expected_output]],
         },
+        expected_start,
+        expected_end,
     })
 }
 
-fn parse_fail_sql(line_reader: &mut LineReader) -> Result<FailSqlCommand, InputError> {
+fn parse_fail_sql(line_reader: &mut LineReader) -> Result<FailSqlCommand, PosError> {
     let (pos, line1) = line_reader.next().unwrap();
     let line2 = slurp_one(line_reader);
-    let expected_error = match line2 {
-        Some((_, line2)) => line2,
+    let (err_pos, expected_error) = match line2 {
+        Some((err_pos, line2)) => (err_pos, line2),
         None => {
-            return Err(InputError {
-                pos,
-                msg: "failing SQL command is missing expected error message".into(),
+            return Err(PosError {
+                pos: Some(pos),
+                source: anyhow!("failing SQL command is missing expected error message"),
             });
         }
     };
+    let query = line1[1..].trim().to_string();
+
+    let expected_error = if let Some(e) = expected_error.strip_prefix("regex:") {
+        SqlExpectedError::Regex(e.trim().into())
+    } else if let Some(e) = expected_error.strip_prefix("contains:") {
+        SqlExpectedError::Contains(e.trim().into())
+    } else if let Some(e) = expected_error.strip_prefix("exact:") {
+        SqlExpectedError::Exact(e.trim().into())
+    } else if expected_error == "timeout" {
+        SqlExpectedError::Timeout
+    } else {
+        return Err(PosError {
+                pos: Some(err_pos),
+                source: anyhow!(
+                    "Query error must start with match specifier (`regex:`|`contains:`|`exact:`|`timeout`)"
+                ),
+            });
+    };
+
+    let extra_error = |line_reader: &mut LineReader, prefix| {
+        if let Some((_pos, line)) = line_reader.peek() {
+            if let Some(_) = line.strip_prefix(prefix) {
+                let line = line_reader
+                    .next()
+                    .map(|(_, line)| line)
+                    .unwrap()
+                    .strip_prefix(prefix)
+                    .map(|line| line.to_string())
+                    .unwrap();
+                Some(line.trim().to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    // Expect `hint` to always follow `detail` if they are both present, for now.
+    let expected_detail = extra_error(line_reader, "detail:");
+    let expected_hint = extra_error(line_reader, "hint:");
+
     Ok(FailSqlCommand {
-        query: line1[1..].trim().to_owned(),
+        query: query.trim().to_string(),
         expected_error,
+        expected_detail,
+        expected_hint,
     })
 }
 
-fn split_line(pos: usize, line: &str) -> Result<Vec<String>, InputError> {
+fn split_line(pos: usize, line: &str) -> Result<Vec<String>, PosError> {
     let mut out = Vec::new();
     let mut field = String::new();
     let mut in_quotes = None;
@@ -271,9 +458,9 @@ fn split_line(pos: usize, line: &str) -> Result<Vec<String>, InputError> {
         }
     }
     if let Some(i) = in_quotes {
-        return Err(InputError {
-            msg: "unterminated quote".into(),
-            pos: pos + i,
+        return Err(PosError {
+            source: anyhow!("unterminated quote"),
+            pos: Some(pos + i),
         });
     }
     if !field.is_empty() {
@@ -318,10 +505,11 @@ pub struct LineReader<'a> {
     src_line: usize,
     pos: usize,
     pos_map: BTreeMap<usize, (usize, usize)>,
+    raw_pos: usize,
 }
 
 impl<'a> LineReader<'a> {
-    pub fn new(inner: &str) -> LineReader {
+    pub fn new(inner: &'a str) -> LineReader<'a> {
         let mut pos_map = BTreeMap::new();
         pos_map.insert(0, (1, 1));
         LineReader {
@@ -330,6 +518,7 @@ impl<'a> LineReader<'a> {
             next: None,
             pos: 0,
             pos_map,
+            raw_pos: 0,
         }
     }
 
@@ -339,12 +528,14 @@ impl<'a> LineReader<'a> {
         }
         self.next.as_ref().unwrap().as_ref()
     }
-}
 
-impl<'a> Positioner for LineReader<'a> {
-    fn line_col(&self, pos: usize) -> (usize, usize) {
+    pub fn line_col(&self, pos: usize) -> (usize, usize) {
         let (base_pos, (line, col)) = self.pos_map.range(..=pos).next_back().unwrap();
         (*line, col + (pos - base_pos))
+    }
+
+    fn push(&mut self, text: &String) {
+        self.next = Some(Some((0usize, text.to_string())));
     }
 }
 
@@ -358,31 +549,40 @@ impl<'a> Iterator for LineReader<'a> {
         if self.inner.is_empty() {
             return None;
         }
-        let mut fold_newlines = is_sigil(self.inner.chars().next());
+        let mut fold_newlines = is_non_sql_sigil(self.inner.chars().next());
+        let mut handle_newlines = is_sql_sigil(self.inner.chars().next());
         let mut line = String::new();
         let mut chars = self.inner.char_indices().fuse().peekable();
         while let Some((i, c)) = chars.next() {
             if c == '\n' {
                 self.src_line += 1;
-                if fold_newlines
-                    && i + 3 < self.inner.len()
-                    && self.inner.is_char_boundary(i + 1)
-                    && self.inner.is_char_boundary(i + 3)
-                    && &self.inner[i + 1..i + 3] == "  "
-                {
+                if fold_newlines && self.inner.get(i + 1..i + 3) == Some("  ") {
                     // Chomp the newline and one space. This ensures a SQL query
-                    // that is split over two lines does not become invalid.
+                    // that is split over two lines does not become invalid. For $ commands the
+                    // newline should not be removed so that the argument parser can handle the
+                    // arguments correctly.
                     chars.next();
                     self.pos_map.insert(self.pos + i, (self.src_line, 2));
                     continue;
+                } else if handle_newlines && self.inner.get(i + 1..i + 3) == Some("  ") {
+                    // Chomp the two spaces after newline. This ensures a SQL query
+                    // that is split over two lines does not become invalid, and keeping the
+                    // newline ensures that comments don't remove the following lines.
+                    line.push(c);
+                    chars.next();
+                    chars.next();
+                    self.pos_map.insert(self.pos + i + 1, (self.src_line, 2));
+                    continue;
                 } else if line.chars().all(char::is_whitespace) {
                     line.clear();
-                    fold_newlines = is_sigil(chars.peek().map(|c| c.1));
+                    fold_newlines = is_non_sql_sigil(chars.peek().map(|c| c.1));
+                    handle_newlines = is_sql_sigil(chars.peek().map(|c| c.1));
                     self.pos_map.insert(self.pos, (self.src_line, 1));
                     continue;
                 }
                 let pos = self.pos;
                 self.pos += i;
+                self.raw_pos += i + 1; // Include \n character in count
                 self.pos_map.insert(self.pos, (self.src_line, 1));
                 self.inner = &self.inner[i + 1..];
                 return Some((pos, line));
@@ -399,7 +599,15 @@ impl<'a> Iterator for LineReader<'a> {
 }
 
 fn is_sigil(c: Option<char>) -> bool {
-    matches!(c, Some('$') | Some('>') | Some('!') | Some('?'))
+    is_sql_sigil(c) || is_non_sql_sigil(c)
+}
+
+fn is_sql_sigil(c: Option<char>) -> bool {
+    matches!(c, Some('>') | Some('!') | Some('?'))
+}
+
+fn is_non_sql_sigil(c: Option<char>) -> bool {
+    matches!(c, Some('$'))
 }
 
 struct BuiltinReader<'a> {
@@ -417,7 +625,7 @@ impl<'a> BuiltinReader<'a> {
 }
 
 impl<'a> Iterator for BuiltinReader<'a> {
-    type Item = Result<(usize, String), InputError>;
+    type Item = Result<(usize, String), PosError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.inner.is_empty() {
@@ -445,9 +653,9 @@ impl<'a> Iterator for BuiltinReader<'a> {
                 continue;
             } else if done {
                 if let Some(nested) = nesting.last() {
-                    return Some(Err(InputError {
-                        pos: self.pos + i,
-                        msg: format!(
+                    return Some(Err(PosError {
+                        pos: Some(self.pos + i),
+                        source: anyhow!(
                             "command argument has unterminated open {}",
                             if nested == &'{' { "brace" } else { "bracket" }
                         ),
@@ -464,18 +672,18 @@ impl<'a> Iterator for BuiltinReader<'a> {
                     if (nested == &'{' && c == '}') || (nested == &'[' && c == ']') {
                         nesting.pop();
                     } else {
-                        return Some(Err(InputError {
-                            pos: self.pos + i,
-                            msg: format!(
+                        return Some(Err(PosError {
+                            pos: Some(self.pos + i),
+                            source: anyhow!(
                                 "command argument has unterminated open {}",
                                 if nested == &'{' { "brace" } else { "bracket" }
                             ),
                         }));
                     }
                 } else {
-                    return Some(Err(InputError {
-                        pos: self.pos + i,
-                        msg: format!(
+                    return Some(Err(PosError {
+                        pos: Some(self.pos + i),
+                        source: anyhow!(
                             "command argument has unbalanced close {}",
                             if c == '}' { "brace" } else { "bracket" }
                         ),
@@ -491,9 +699,9 @@ impl<'a> Iterator for BuiltinReader<'a> {
         }
 
         if let Some(nested) = nesting.last() {
-            return Some(Err(InputError {
-                pos: self.pos + self.inner.len() - 1,
-                msg: format!(
+            return Some(Err(PosError {
+                pos: Some(self.pos + self.inner.len() - 1),
+                source: anyhow!(
                     "command argument has unterminated open {}",
                     if nested == &'{' { "brace" } else { "bracket" }
                 ),
@@ -501,9 +709,9 @@ impl<'a> Iterator for BuiltinReader<'a> {
         }
 
         if quoted {
-            return Some(Err(InputError {
-                pos: self.pos,
-                msg: format!("command argument has unterminated open double quote",),
+            return Some(Err(PosError {
+                pos: Some(self.pos),
+                source: anyhow!("command argument has unterminated open double quote",),
             }));
         }
 
@@ -517,10 +725,10 @@ impl<'a> Iterator for BuiltinReader<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ArgMap(HashMap<String, String>);
+pub struct ArgMap(BTreeMap<String, String>);
 
 impl ArgMap {
-    pub fn values_mut(&mut self) -> hash_map::ValuesMut<String, String> {
+    pub fn values_mut(&mut self) -> btree_map::ValuesMut<String, String> {
         self.0.values_mut()
     }
 
@@ -528,41 +736,40 @@ impl ArgMap {
         self.0.remove(name)
     }
 
-    pub fn string(&mut self, name: &str) -> Result<String, String> {
+    pub fn string(&mut self, name: &str) -> Result<String, anyhow::Error> {
         self.opt_string(name)
-            .ok_or_else(|| format!("missing {} parameter", name))
+            .ok_or_else(|| anyhow!("missing {} parameter", name))
     }
 
-    pub fn opt_parse<T>(&mut self, name: &str) -> Result<Option<T>, String>
+    pub fn opt_parse<T>(&mut self, name: &str) -> Result<Option<T>, anyhow::Error>
     where
         T: FromStr,
-        T::Err: fmt::Display,
+        T::Err: Error + Send + Sync + 'static,
     {
         match self.opt_string(name) {
             Some(val) => {
                 let t = val
                     .parse()
-                    .map_err(|e| format!("parsing {} parameter: {}", name, e))?;
+                    .with_context(|| format!("parsing {} parameter", name))?;
                 Ok(Some(t))
             }
             None => Ok(None),
         }
     }
 
-    #[allow(dead_code)]
-    pub fn parse<T>(&mut self, name: &str) -> Result<T, String>
+    pub fn parse<T>(&mut self, name: &str) -> Result<T, anyhow::Error>
     where
         T: FromStr,
-        T::Err: fmt::Display,
+        T::Err: Error + Send + Sync + 'static,
     {
         match self.opt_parse(name) {
-            Ok(None) => Err(format!("missing {} parameter", name)),
+            Ok(None) => bail!("missing {} parameter", name),
             Ok(Some(t)) => Ok(t),
             Err(err) => Err(err),
         }
     }
 
-    pub fn opt_bool(&mut self, name: &str) -> Result<Option<bool>, String> {
+    pub fn opt_bool(&mut self, name: &str) -> Result<Option<bool>, anyhow::Error> {
         self.opt_string(name)
             .map(|val| {
                 if val == "true" {
@@ -570,15 +777,15 @@ impl ArgMap {
                 } else if val == "false" {
                     Ok(false)
                 } else {
-                    Err(format!("bad value for boolean parameter {}: {}", name, val))
+                    bail!("bad value for boolean parameter {}: {}", name, val);
                 }
             })
             .transpose()
     }
 
-    pub fn done(&self) -> Result<(), String> {
+    pub fn done(&self) -> Result<(), anyhow::Error> {
         if let Some(name) = self.0.keys().next() {
-            return Err(format!("unknown parameter {}", name));
+            bail!("unknown parameter {}", name);
         }
         Ok(())
     }
@@ -586,7 +793,7 @@ impl ArgMap {
 
 impl IntoIterator for ArgMap {
     type Item = (String, String);
-    type IntoIter = hash_map::IntoIter<String, String>;
+    type IntoIter = btree_map::IntoIter<String, String>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()

@@ -1,0 +1,601 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+mode cockroach
+
+# Start from a pristine server
+reset-server
+
+statement ok
+SET CLUSTER TO mz_catalog_server
+
+query T multiline
+EXPLAIN SHOW DATABASES
+----
+Explained Query (fast path):
+  ReadIndex on=mz_internal.mz_show_databases mz_show_databases_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_show_databases_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW SCHEMAS
+----
+Explained Query (fast path):
+  Project (#1, #2)
+    Filter ((#0) IS NULL OR (#0 = "u1"))
+      ReadIndex on=mz_internal.mz_show_schemas mz_show_schemas_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_show_schemas_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW CONNECTIONS
+----
+Explained Query (fast path):
+  Project (#1..=#3)
+    ReadIndex on=mz_internal.mz_show_connections mz_show_connections_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_connections_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW TABLES
+----
+Explained Query (fast path):
+  Project (#1, #2)
+    ReadIndex on=mz_internal.mz_show_tables mz_show_tables_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_tables_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW SOURCES
+----
+Explained Query (fast path):
+  Project (#2..=#4, #6)
+    ReadIndex on=mz_internal.mz_show_sources mz_show_sources_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_sources_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW VIEWS
+----
+Explained Query (fast path):
+  Project (#1, #2)
+    ReadIndex on=mz_internal.mz_show_views mz_show_views_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_views_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW MATERIALIZED VIEWS
+----
+Explained Query (fast path):
+  Project (#2, #3, #5)
+    ReadIndex on=mz_internal.mz_show_materialized_views mz_show_materialized_views_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_materialized_views_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW MATERIALIZED VIEWS IN CLUSTER quickstart
+----
+Explained Query (fast path):
+  Project (#2, #3, #5)
+    Filter (#4 = "u1")
+      ReadIndex on=mz_internal.mz_show_materialized_views mz_show_materialized_views_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_materialized_views_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW INDEXES
+----
+Explained Query (fast path):
+  Project (#2..=#5, #8)
+    Filter NOT(like["s%"](#6))
+      ReadIndex on=mz_internal.mz_show_indexes mz_show_indexes_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_indexes_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW INDEXES IN CLUSTER quickstart
+----
+Explained Query (fast path):
+  Project (#2..=#5, #8)
+    Filter (#7 = "u1")
+      ReadIndex on=mz_internal.mz_show_indexes mz_show_indexes_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_show_indexes_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW SINKS
+----
+Explained Query (fast path):
+  Project (#2..=#4, #6)
+    ReadIndex on=mz_internal.mz_show_sinks mz_show_sinks_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_sinks_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW TYPES
+----
+Explained Query (fast path):
+  Project (#1, #2)
+    ReadIndex on=mz_internal.mz_show_types mz_show_types_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_types_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW OBJECTS
+----
+Explained Query (fast path):
+  Project (#1..=#3)
+    ReadIndex on=mz_internal.mz_show_all_objects mz_show_all_objects_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_all_objects_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+statement ok
+CREATE TABLE t (a INT)
+
+query T multiline
+EXPLAIN SHOW COLUMNS IN t
+----
+Explained Query (fast path):
+  Project (#1..=#3, #5)
+    ReadIndex on=mz_internal.mz_show_columns mz_show_columns_ind=[lookup value=("u1")]
+
+Used Indexes:
+  - mz_internal.mz_show_columns_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+# TODO[btv] - We should probably someday
+# optimize `SELECT name FROM (SHOW CLUSTERS)`
+# to do the same thing as `SELECT name FROM mz_clusters`;
+# i.e., just read out of the index we have on the latter table.
+# However, today we cannot do that. It's probably fine in practice
+# as there won't be more than a few dozen clusters/replicas in any
+# real world deployment, so spinning up a dataflow with joins
+# etc. is only mildly bad.
+#
+# See discussion here: https://materializeinc.slack.com/archives/C02PPB50ZHS/p1691531471306959
+#
+# query T multiline
+# EXPLAIN SELECT name FROM (SHOW CLUSTERS)
+# ----
+# Explained Query (fast path):
+#   Project (#0)
+#     ReadIndex mz_internal.mz_show_clusters_ind
+#
+# Used Indexes:
+#   - mz_internal.mz_show_clusters_ind
+#
+# EOF
+
+query T multiline
+EXPLAIN SHOW CLUSTER REPLICAS
+----
+Explained Query (fast path):
+  Project (#0, #1, #3..=#5)
+    ReadIndex on=mz_internal.mz_show_cluster_replicas mz_show_cluster_replicas_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_show_cluster_replicas_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW CLUSTER REPLICAS WHERE cluster IN ('compute_qck', 'ingest_qck');
+----
+Explained Query (fast path):
+  Project (#0, #1, #3..=#5)
+    ReadIndex on=mz_internal.mz_show_cluster_replicas mz_show_cluster_replicas_ind=[lookup values=[("ingest_qck"); ("compute_qck")]]
+
+Used Indexes:
+  - mz_internal.mz_show_cluster_replicas_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SHOW SECRETS
+----
+Explained Query (fast path):
+  Project (#1, #2)
+    ReadIndex on=mz_internal.mz_show_secrets mz_show_secrets_ind=[lookup value=("u3")]
+
+Used Indexes:
+  - mz_internal.mz_show_secrets_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT id FROM mz_catalog.mz_indexes
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_catalog.mz_indexes mz_indexes_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_catalog.mz_indexes_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT id FROM mz_catalog.mz_roles
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_catalog.mz_roles mz_roles_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_catalog.mz_roles_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT id FROM mz_catalog.mz_sources
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_catalog.mz_sources mz_sources_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_catalog.mz_sources_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT id FROM mz_catalog.mz_sinks
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_catalog.mz_sinks mz_sinks_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_catalog.mz_sinks_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT id FROM mz_catalog.mz_materialized_views
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_catalog.mz_materialized_views mz_materialized_views_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_catalog.mz_materialized_views_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT object_id FROM mz_internal.mz_object_dependencies
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_internal.mz_object_dependencies mz_object_dependencies_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_object_dependencies_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT dependency_id FROM mz_internal.mz_compute_dependencies
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_internal.mz_compute_dependencies mz_compute_dependencies_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_compute_dependencies_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT dropped_at FROM mz_internal.mz_cluster_replica_history
+----
+Explained Query (fast path):
+  Project (#0)
+    ReadIndex on=mz_internal.mz_cluster_replica_history mz_cluster_replica_history_ind=[*** full scan ***]
+
+Used Indexes:
+  - mz_internal.mz_cluster_replica_history_ind (*** full scan ***)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+# Following are used in the UI
+
+query T multiline
+EXPLAIN SELECT r.id,
+  r.name as replica_name,
+  r.cluster_id,
+  r.size,
+  c.name as cluster_name,
+  u.memory_percent
+FROM mz_cluster_replicas r
+JOIN mz_clusters c ON c.id = r.cluster_id
+JOIN mz_internal.mz_cluster_replica_utilization u ON u.replica_id = r.id
+ORDER BY r.id;
+----
+Explained Query:
+  Finish order_by=[#0 asc nulls_last] output=[#0..=#5]
+    Project (#0..=#3, #5, #29)
+      Map (((uint8_to_double(#27) / uint8_to_double(#21)) * 100))
+        Join on=(#0 = #15 = #24 AND #2 = #4 AND #16 = #17) type=delta
+          ArrangeBy keys=[[#0], [#2]]
+            Project (#0..=#3)
+              ReadIndex on=mz_cluster_replicas mz_cluster_replicas_ind=[*** full scan ***]
+          ArrangeBy keys=[[#0]]
+            ReadIndex on=mz_clusters mz_clusters_ind=[delta join lookup]
+          ArrangeBy keys=[[#0], [#1]]
+            Project (#0, #3)
+              Filter (#3) IS NOT NULL
+                ReadIndex on=mz_cluster_replicas mz_cluster_replicas_ind=[*** full scan ***]
+          ArrangeBy keys=[[#0]]
+            ReadIndex on=mz_cluster_replica_sizes mz_cluster_replica_sizes_ind=[delta join lookup]
+          ArrangeBy keys=[[#0]]
+            ReadIndex on=mz_cluster_replica_metrics mz_cluster_replica_metrics_ind=[delta join lookup]
+
+Used Indexes:
+  - mz_catalog.mz_clusters_ind (delta join lookup)
+  - mz_catalog.mz_cluster_replicas_ind (*** full scan ***)
+  - mz_catalog.mz_cluster_replica_sizes_ind (delta join lookup)
+  - mz_internal.mz_cluster_replica_metrics_ind (delta join lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT s.id, s.oid, s.name, s.type, s.size, st.status, st.error
+FROM mz_sources s
+LEFT OUTER JOIN mz_internal.mz_source_statuses st
+ON st.id = s.id
+WHERE s.id LIKE 'u%';
+----
+Explained Query:
+  With
+    cte l0 =
+      ArrangeBy keys=[[#0]]
+        ReadIndex on=mz_sources mz_sources_ind=[differential join]
+    cte l1 =
+      Project (#0, #1, #3, #4, #6, #19, #20)
+        Filter like["u%"](#0)
+          Join on=(#0 = #15) type=differential
+            Get l0
+            ArrangeBy keys=[[#0]]
+              ReadIndex on=mz_source_statuses mz_source_statuses_ind=[differential join]
+  Return
+    Union
+      Map (null, null)
+        Union
+          Negate
+            Project (#0, #1, #3, #4, #6)
+              Filter like["u%"](#0)
+                Join on=(#0 = #15) type=differential
+                  Get l0
+                  ArrangeBy keys=[[#0]]
+                    Distinct project=[#0]
+                      Project (#0)
+                        Get l1
+          Project (#0, #1, #3, #4, #6)
+            Filter like["u%"](#0)
+              ReadIndex on=mz_sources mz_sources_ind=[*** full scan ***]
+      Get l1
+
+Used Indexes:
+  - mz_catalog.mz_sources_ind (*** full scan ***, differential join)
+  - mz_internal.mz_source_statuses_ind (differential join)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+query T multiline
+EXPLAIN SELECT MAX(extract(epoch from h.occurred_at) * 1000) as last_occurred, h.error, COUNT(h.occurred_at)
+FROM mz_internal.mz_source_status_history h
+WHERE source_id = 'u6'
+AND error IS NOT NULL
+AND h.occurred_at BETWEEN 0 AND 100
+GROUP BY h.error
+ORDER BY last_occurred DESC
+LIMIT 10;
+----
+Explained Query:
+  Finish order_by=[#0 desc nulls_first] limit=10 output=[#0..=#2]
+    With
+      cte l0 =
+        Filter (#6 <= 100) AND (#6 >= 0) AND (#3) IS NOT NULL
+          Map (timestamp_tz_to_mz_timestamp(#0))
+            ReadIndex on=mz_internal.mz_source_status_history mz_source_status_history_ind=[lookup value=("u6")]
+    Return
+      Project (#1, #0, #3)
+        Join on=(#0 = #2) type=differential
+          ArrangeBy keys=[[#0]]
+            Reduce group_by=[#1] aggregates=[max((extract_epoch_tstz(#0) * 1000))]
+              Project (#0, #3)
+                Get l0
+          ArrangeBy keys=[[#0]]
+            Reduce group_by=[#0] aggregates=[count(*)]
+              Project (#3)
+                Get l0
+
+Used Indexes:
+  - mz_internal.mz_source_status_history_ind (lookup)
+
+Target cluster: mz_catalog_server
+
+EOF
+
+# Querying user objects should not be allowed from the catalog server cluster.
+
+statement ok
+CREATE CLUSTER foo REPLICAS (r1 (SIZE '1'));
+
+statement ok
+SET CLUSTER TO foo;
+
+statement ok
+CREATE TABLE bar ( key text, val bigint );
+
+statement ok
+SET CLUSTER TO mz_catalog_server;
+
+statement error db error: ERROR: querying the following items "materialize\.public\.bar" is not allowed from the "mz_catalog_server" cluster
+SELECT key FROM bar;
+
+# But inspecting those objects, e.g. checking what indexes exist, should be allowed.
+statement ok
+SHOW INDEXES on bar;
+
+statement ok
+SET CLUSTER TO mz_catalog_server;
+
+statement ok
+DROP CLUSTER foo CASCADE;
+
+# Creating views with the mz_catalog_server cluster active should be allowed though.
+statement ok
+CREATE VIEW keys AS ( SELECT key FROM bar );
+
+# But creating objects that install resources, should not be allowed.
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET enable_rbac_checks TO false;
+----
+COMPLETE 0
+
+statement error permission denied for CLUSTER "mz_catalog_server"
+CREATE MATERIALIZED VIEW live_keys AS ( SELECT key FROM bar );
+
+statement error must be owner of CLUSTER mz_catalog_server
+ALTER CLUSTER mz_catalog_server SET (REPLICATION FACTOR 2);
+
+statement error permission denied for CLUSTER "mz_catalog_server"
+CREATE INDEX i_keys ON bar (key);
+
+statement error must be owner of CLUSTER mz_system
+ALTER CLUSTER mz_system SET (MANAGED = false)
+
+simple conn=mz_system,user=mz_system
+ALTER CLUSTER mz_system SET (REPLICATION FACTOR 0)
+----
+COMPLETE 0
+
+statement error must be owner of CLUSTER mz_system
+ALTER CLUSTER mz_system SET (REPLICATION FACTOR 1)
+
+simple conn=mz_system,user=mz_system
+ALTER CLUSTER mz_system SET (REPLICATION FACTOR 1)
+----
+COMPLETE 0
+
+# Replicas in system clusters should system IDs.
+
+simple conn=mz_system,user=mz_system
+ALTER CLUSTER mz_system SET (SIZE = '2')
+----
+COMPLETE 0
+
+query I
+SELECT COUNT(*) FROM mz_cluster_replicas WHERE cluster_id = (SELECT id FROM mz_clusters WHERE name = 'mz_system') AND id LIKE 's%';
+----
+1
+
+query I
+SELECT COUNT(*) FROM mz_cluster_replicas WHERE cluster_id = (SELECT id FROM mz_clusters WHERE name = 'mz_system') AND id LIKE 'u%';
+----
+0
+
+reset-server

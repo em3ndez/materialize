@@ -3,10 +3,8 @@ title: "DROP TYPE"
 description: "`DROP TYPE` removes a user-defined data type."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
-
-{{< version-added v0.7.1 />}}
 
 `DROP TYPE` removes a [custom data type](../create-type). You cannot use it on default data types.
 
@@ -24,8 +22,8 @@ _data_type_name_ | The name of the type to remove.
 ## Examples
 
 ### Remove a type with no dependent objects
-```sql
-CREATE TYPE int4_map AS MAP (key_type=text, value_type=int4);
+```mzsql
+CREATE TYPE int4_map AS MAP (KEY TYPE = text, VALUE TYPE = int4);
 
 SHOW TYPES;
 ```
@@ -36,7 +34,7 @@ SHOW TYPES;
 (1 row)
 ```
 
-```sql
+```mzsql
 DROP TYPE int4_map;
 
 SHOW TYPES;
@@ -53,10 +51,10 @@ By default, `DROP TYPE` will not remove a type with dependent objects. The **CAS
 
 In the example below, the **CASCADE** switch removes `int4_list`, `int4_list_list` (which depends on `int4_list`), and the table *t*, which has a column of data type `int4_list`.
 
-```sql
-CREATE TYPE int4_list AS LIST (element_type = int4);
+```mzsql
+CREATE TYPE int4_list AS LIST (ELEMENT TYPE = int4);
 
-CREATE TYPE int4_list_list AS LIST (element_type = int4_list);
+CREATE TYPE int4_list_list AS LIST (ELEMENT TYPE = int4_list);
 
 CREATE TABLE t (a int4_list);
 
@@ -70,7 +68,7 @@ SHOW TYPES;
 (2 rows)
 ```
 
-```sql
+```mzsql
 DROP TYPE int4_list CASCADE;
 
 SHOW TYPES;
@@ -88,20 +86,28 @@ ERROR:  unknown catalog item 't'
 
 You can use either of the following commands:
 
-- ```sql
+- ```mzsql
   DROP TYPE int4_list;
   ```
-- ```sql
+- ```mzsql
   DROP TYPE int4_list RESTRICT;
   ```
 
 ### Do not issue an error if attempting to remove a nonexistent type
 
-```sql
+```mzsql
 DROP TYPE IF EXISTS int4_list;
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of the dropped type.
+- `USAGE` privileges on the containing schema.
 
 ## Related pages
 
 * [`CREATE TYPE`](../create-type)
 * [`SHOW TYPES`](../show-types)
+* [DROP OWNED](../drop-owned)

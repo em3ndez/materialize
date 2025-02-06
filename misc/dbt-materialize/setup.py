@@ -14,23 +14,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from distutils.core import setup
 from pathlib import Path
 
 from setuptools import find_packages
 
+README = Path(__file__).parent / "README.md"
+
+extras_require = {}
+if not os.environ.get("RELEASE_BUILD"):
+    extras_require["dev"] = [
+        "dbt-tests-adapter @ git+https://github.com/dbt-labs/dbt-adapters.git#egg=dbt-tests-adapter&subdirectory=dbt-tests-adapter"
+    ]
+
 setup(
     name="dbt-materialize",
-    # This adapter's version should match the required dbt-postgres version. If
-    # you need to release a new version of this adapter without bumping the
-    # dbt-postgres version, change version_suffix to ".post1", ".post2", etc.
-    version="1.0.1",
-    description="The Materialize adapter plugin for dbt (data build tool).",
+    # This adapter's minor version should match the required dbt-postgres version,
+    # but patch versions may differ.
+    # If you bump this version, bump it in __version__.py too.
+    version="1.9.3",
+    description="The Materialize adapter plugin for dbt.",
     long_description=(Path(__file__).parent / "README.md").open().read(),
     long_description_content_type="text/markdown",
     author="Materialize, Inc.",
     author_email="support@materialize.com",
-    url="https://github.com/MaterializeInc/dbt-materialize",
+    url="https://github.com/MaterializeInc/materialize/blob/main/misc/dbt-materialize",
     packages=find_packages(),
     package_data={
         "dbt": [
@@ -39,8 +48,12 @@ setup(
             "include/materialize/macros/**/*.sql",
         ]
     },
-    install_requires=["dbt-postgres==1.0.1"],
-    extras_require={
-        "dev": ["pytest-dbt-adapter==0.6.0"],
-    },
+    install_requires=[
+        "dbt-common>=1.10,<2.0",
+        "dbt-adapters>=1.7,<2.0",
+        # add dbt-core to ensure backwards compatibility of installation, this is not a functional dependency
+        "dbt-core>=1.8.0",
+        "dbt-postgres>=1.8,<1.10",
+    ],
+    extras_require=extras_require,
 )

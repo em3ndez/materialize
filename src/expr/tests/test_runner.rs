@@ -8,29 +8,40 @@
 // by the Apache License, Version 2.0.
 
 mod test {
-    use expr::canonicalize::{canonicalize_equivalences, canonicalize_predicates};
-    use expr::{MapFilterProject, MirScalarExpr};
-    use expr_test_util::*;
-    use lowertest::{deserialize, tokenize};
-    use ore::str::separated;
-    use repr::RelationType;
+    use itertools::Itertools;
+    use mz_expr::canonicalize::{canonicalize_equivalences, canonicalize_predicates};
+    use mz_expr::{ColumnSpecs, Interpreter, MapFilterProject, MirScalarExpr};
+    use mz_expr_test_util::*;
+    use mz_lowertest::{deserialize, deserialize_optional, tokenize, MzReflect};
+    use mz_ore::result::ResultExt;
+    use mz_ore::str::separated;
+    use mz_repr::{ColumnType, RelationType, RowArena};
+    use serde::{Deserialize, Serialize};
 
     fn reduce(s: &str) -> Result<MirScalarExpr, String> {
-        let mut input_stream = tokenize(&s)?.into_iter();
+        let mut input_stream = tokenize(s)?.into_iter();
         let mut ctx = MirScalarExprDeserializeContext::default();
-        let mut scalar: MirScalarExpr =
-            deserialize(&mut input_stream, "MirScalarExpr", &RTI, &mut ctx)?;
-        let typ: RelationType = deserialize(&mut input_stream, "RelationType", &RTI, &mut ctx)?;
+        let mut scalar: MirScalarExpr = deserialize(&mut input_stream, "MirScalarExpr", &mut ctx)?;
+        let typ: Vec<ColumnType> = deserialize(&mut input_stream, "Vec<ColumnType> ", &mut ctx)?;
+        let before = scalar.typ(&typ);
         scalar.reduce(&typ);
+        let after = scalar.typ(&typ);
+        // Verify that `reduce` did not change the type of the scalar.
+        if before.scalar_type != after.scalar_type {
+            return Err(format!(
+                "FAIL: Type of scalar has changed:\nbefore: {:?}\nafter: {:?}\n",
+                before, after
+            ));
+        }
         Ok(scalar)
     }
 
     fn test_canonicalize_pred(s: &str) -> Result<Vec<MirScalarExpr>, String> {
-        let mut input_stream = tokenize(&s)?.into_iter();
+        let mut input_stream = tokenize(s)?.into_iter();
         let mut ctx = MirScalarExprDeserializeContext::default();
         let input_predicates: Vec<MirScalarExpr> =
-            deserialize(&mut input_stream, "Vec<MirScalarExpr>", &RTI, &mut ctx)?;
-        let typ: RelationType = deserialize(&mut input_stream, "RelationType", &RTI, &mut ctx)?;
+            deserialize(&mut input_stream, "Vec<MirScalarExpr>", &mut ctx)?;
+        let typ: Vec<ColumnType> = deserialize(&mut input_stream, "Vec<ColumnType>", &mut ctx)?;
         // predicate canonicalization is meant to produce the same output regardless of the
         // order of the input predicates.
         let mut predicates1 = input_predicates.clone();
@@ -54,52 +65,99 @@ mod test {
         }
     }
 
+    #[derive(Deserialize, Serialize, MzReflect)]
+    enum MFPTestCommand {
+        Map(Vec<MirScalarExpr>),
+        Filter(Vec<MirScalarExpr>),
+        Project(Vec<usize>),
+        Optimize,
+    }
+
     /// Builds a [MapFilterProject] of a certain arity, then modifies it.
     /// The test syntax is `<input_arity> [<commands>]`
     /// The syntax for a command is `<name_of_command> [<args>]`
     fn test_mfp(s: &str) -> Result<MapFilterProject, String> {
-        let mut input_stream = tokenize(&s)?.into_iter();
+        let mut input_stream = tokenize(s)?.into_iter();
         let mut ctx = MirScalarExprDeserializeContext::default();
-        let input_arity: usize = deserialize(&mut input_stream, "usize", &RTI, &mut ctx)?;
+        let input_arity = input_stream
+            .next()
+            .unwrap()
+            .to_string()
+            .parse::<usize>()
+            .map_err_to_string_with_causes()?;
         let mut mfp = MapFilterProject::new(input_arity);
-        while let Some(proc_macro2::TokenTree::Ident(ident)) = input_stream.next() {
-            match &ident.to_string()[..] {
-                "map" => {
-                    let map: Vec<MirScalarExpr> =
-                        deserialize(&mut input_stream, "Vec<MirScalarExpr>", &RTI, &mut ctx)?;
-                    mfp = mfp.map(map);
-                }
-                "filter" => {
-                    let filter: Vec<MirScalarExpr> =
-                        deserialize(&mut input_stream, "Vec<MirScalarExpr>", &RTI, &mut ctx)?;
-                    mfp = mfp.filter(filter);
-                }
-                "project" => {
-                    let project: Vec<usize> =
-                        deserialize(&mut input_stream, "Vec<usize>", &RTI, &mut ctx)?;
-                    mfp = mfp.project(project);
-                }
-                "optimize" => mfp.optimize(),
-                unsupported => {
-                    return Err(format!("Unsupport MFP command {}", unsupported));
-                }
+        while let Some(command) = deserialize_optional::<MFPTestCommand, _, _>(
+            &mut input_stream,
+            "MFPTestCommand",
+            &mut ctx,
+        )? {
+            match command {
+                MFPTestCommand::Map(map) => mfp = mfp.map(map),
+                MFPTestCommand::Filter(filter) => mfp = mfp.filter(filter),
+                MFPTestCommand::Project(project) => mfp = mfp.project(project),
+                MFPTestCommand::Optimize => mfp.optimize(),
             }
         }
         Ok(mfp)
     }
 
     fn test_canonicalize_equiv(s: &str) -> Result<Vec<Vec<MirScalarExpr>>, String> {
-        let mut input_stream = tokenize(&s)?.into_iter();
+        let mut input_stream = tokenize(s)?.into_iter();
         let mut ctx = MirScalarExprDeserializeContext::default();
         let mut equivalences: Vec<Vec<MirScalarExpr>> =
-            deserialize(&mut input_stream, "Vec<Vec<MirScalarExpr>>", &RTI, &mut ctx)?;
-        let input_type: RelationType =
-            deserialize(&mut input_stream, "RelationType", &RTI, &mut ctx)?;
-        canonicalize_equivalences(&mut equivalences, &[input_type]);
+            deserialize(&mut input_stream, "Vec<Vec<MirScalarExpr>>", &mut ctx)?;
+        let input_type: Vec<ColumnType> =
+            deserialize(&mut input_stream, "Vec<ColumnType>", &mut ctx)?;
+        canonicalize_equivalences(&mut equivalences, std::iter::once(&input_type));
         Ok(equivalences)
     }
 
-    #[test]
+    fn test_interpret(s: &str) -> Result<Vec<String>, String> {
+        let mut input_stream = tokenize(s)?.into_iter();
+        let mut ctx = MirScalarExprDeserializeContext::default();
+        let types: Vec<ColumnType> = deserialize(&mut input_stream, "Vec<ColumnType>", &mut ctx)?;
+        let values: Vec<Vec<MirScalarExpr>> =
+            deserialize(&mut input_stream, "Vec<Vec<MirScalarExpr>>", &mut ctx)?;
+        let expr: MirScalarExpr = deserialize(&mut input_stream, "MirScalarExpr", &mut ctx)?;
+        let tests: Vec<MirScalarExpr> =
+            deserialize(&mut input_stream, "Vec<MirScalarExpr>", &mut ctx)?;
+
+        let arena = RowArena::new();
+        let relation = RelationType::new(types);
+        let mut interpreter = ColumnSpecs::new(&relation, &arena);
+
+        let specs: Vec<_> = values
+            .into_iter()
+            .map(|col_exprs| {
+                col_exprs
+                    .into_iter()
+                    .map(|expr| interpreter.expr(&expr).range)
+                    .reduce(|a, b| a.union(b))
+                    .expect("at least one literal")
+            })
+            .collect();
+
+        for (id, spec) in specs.into_iter().enumerate() {
+            interpreter.push_column(id, spec);
+        }
+        let output = interpreter.expr(&expr);
+
+        let mut may_contain: Vec<_> = tests
+            .iter()
+            .map(|t| t.eval(&[], &arena).expect("literal datum"))
+            .filter(|d| output.range.may_contain(*d))
+            .map(|d| d.to_string())
+            .collect();
+
+        if output.range.may_fail() {
+            may_contain.push("<err>".into())
+        }
+
+        Ok(may_contain)
+    }
+
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // error: unsupported operation: can't call foreign function `decContextDefault` on OS `linux`
     fn run() {
         datadriven::walk("tests/testdata", |f| {
             f.run(move |s| -> String {
@@ -107,7 +165,7 @@ mod test {
                     // tests simplification of scalars
                     "reduce" => match reduce(&s.input) {
                         Ok(scalar) => {
-                            format!("{}\n", scalar.to_string())
+                            format!("{}\n", scalar)
                         }
                         Err(err) => format!("error: {}\n", err),
                     },
@@ -126,6 +184,12 @@ mod test {
                                 separated(" ", filter.iter()),
                                 separated(" ", project.iter())
                             )
+                        }
+                        Err(err) => format!("error: {}\n", err),
+                    },
+                    "interpret" => match test_interpret(&s.input) {
+                        Ok(contains) => {
+                            format!("may contain: [{}]\n", contains.into_iter().join(" "))
                         }
                         Err(err) => format!("error: {}\n", err),
                     },

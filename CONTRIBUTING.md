@@ -2,7 +2,7 @@
 
 Thank you for your interest in Materialize! Contributions of many kinds are encouraged and most welcome.
 
-If you have questions, please [create a Github issue](https://github.com/MaterializeInc/materialize/issues/new/choose).
+If you have questions, please [create a Github discussion](https://github.com/MaterializeInc/materialize/discussions/new/choose).
 
 ## Getting started
 
@@ -16,13 +16,21 @@ our development process is available in the [doc/developer](doc/developer) folde
 Materialize is written entirely in Rust. Rust API documentation is hosted at
 <https://dev.materialize.com/api/rust/>.
 
-Prospective code contributors might find the [good first issue tag](https://github.com/MaterializeInc/materialize/issues?q=is%3Aopen+is%3Aissue+label%3A%22D-good+first+issue%22) useful.
+If you're interested in contributing to Materialize, please [create a Github
+discussion](https://github.com/MaterializeInc/materialize/discussions/new?category=contribute-to-materialize)
+describing the work you're planning to pick up. Prospective code contributors might
+find the [`D-good for external contributors` tag](https://github.com/MaterializeInc/materialize/discussions/categories/contribute-to-materialize?discussions_q=is%3Aopen+category%3A%22Contribute+to+Materialize%22+label%3A%22D-good+for+external+contributors%22) useful.
+
+If you start working on a contribution before hearing back from a Materialize
+engineer, there is a risk that we may not be able to accept your changes. The
+team may not have bandwidth to review your changes, or the code in question may
+require specialized knowledge to modify without introducing bugs. When in
+doubt, wait for a Materialize engineer to respond before starting work!
 
 Bug reports are welcome, and the most effective way to report a bug is to [file
-an issue](https://github.com/MaterializeInc/materialize/issues/new/choose). As
+a discussion](https://github.com/MaterializeInc/materialize/discussions/new?category=bug-reports). As
 Materialize is under rapid development, it is helpful if you report the version
-of Materialize that you are using, and if it a crash report, the stack trace
-printed from the `materialized` binary.
+of Materialize that you are using, and if it a crash report, the stack trace.
 
 ### Landing PRs + communicating changes
 
@@ -36,3 +44,13 @@ When landing large or substantial changes, we want to make sure users are aware 
 - All new features
 - All API changes
 - Large bug fixes
+
+### Where to contribute
+Some areas that are well suited for external contributions are:
+- Adding SQL functions
+- Adding pg_catalog tables to support more [tools and integrations](https://materialize.com/docs/integrations/)
+
+Areas that are not well suited for external contributions:
+- The [coordinator](https://github.com/MaterializeInc/materialize/tree/main/src/adapter/src/coord)
+- [Persist](https://github.com/MaterializeInc/materialize/tree/main/src/persist)
+- [Compute](https://github.com/MaterializeInc/materialize/tree/main/src/compute)

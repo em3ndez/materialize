@@ -29,36 +29,44 @@ $ set schema={
 
 $ kafka-create-topic topic=exactly-once
 
-$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=2
+$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} repeat=2
 {"f1": ${kafka-ingest.iteration}} {"f2": ${kafka-ingest.iteration}}
 
-> CREATE MATERIALIZED SOURCE exactly_once
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-exactly-once-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE CONNECTION IF NOT EXISTS kafka_conn TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE exactly_once
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-exactly-once-${testdrive.seed}')
+
+> CREATE TABLE exactly_once_tbl FROM SOURCE exactly_once (REFERENCE "testdrive-exactly-once-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE UPSERT
 
-> CREATE SINK exactly_once_sink FROM exactly_once
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-exactly-once-sink-${testdrive.seed}'
-  WITH (reuse_topic=true)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}';
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
 
-$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=2 start-iteration=10
+> CREATE SINK exactly_once_sink FROM exactly_once_tbl
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-exactly-once-sink-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM;
+
+$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} repeat=2 start-iteration=10
 {"f1": ${kafka-ingest.iteration}} {"f2": ${kafka-ingest.iteration}}
 
-> SELECT COUNT(*) FROM exactly_once;
+> SELECT COUNT(*) FROM exactly_once_tbl;
 4
 
-$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=2 start-iteration=20
+$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} repeat=2 start-iteration=20
 {"f1": ${kafka-ingest.iteration}} {"f2": ${kafka-ingest.iteration}}
 
-$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=2 start-iteration=30
+$ kafka-ingest format=avro topic=exactly-once key-format=avro key-schema=${keyschema} schema=${schema} repeat=2 start-iteration=30
 {"f1": ${kafka-ingest.iteration}} {"f2": ${kafka-ingest.iteration}}
 
 # Make sure that we have produced stuff to the sink before we restart
-$ set-regex match=\d{13} replacement=<TIMESTAMP>
 
-$ kafka-verify format=avro sink=materialize.public.exactly_once_sink sort-messages=true
-{"before":null,"after":{"row":{"f1":0,"f2":0}},"transaction":{"id":"<TIMESTAMP>"}}
-{"before":null,"after":{"row":{"f1":1,"f2":1}},"transaction":{"id":"<TIMESTAMP>"}}
-{"before":null,"after":{"row":{"f1":10,"f2":10}},"transaction":{"id":"<TIMESTAMP>"}}
-{"before":null,"after":{"row":{"f1":11,"f2":11}},"transaction":{"id":"<TIMESTAMP>"}}
+
+$ kafka-verify-data format=avro sink=materialize.public.exactly_once_sink sort-messages=true
+{"before":null,"after":{"row":{"f1":0,"f2":0}}}
+{"before":null,"after":{"row":{"f1":1,"f2":1}}}
+{"before":null,"after":{"row":{"f1":10,"f2":10}}}
+{"before":null,"after":{"row":{"f1":11,"f2":11}}}

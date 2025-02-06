@@ -1,5 +1,5 @@
 ---
-title: "COALESCE Function"
+title: "COALESCE function"
 description: "Returns the first non-NULL element provided."
 menu:
   main:
@@ -20,7 +20,7 @@ All elements of the parameters for `coalesce` must be of the same type; `coalesc
 
 ## Examples
 
-```sql
+```mzsql
 SELECT coalesce(NULL, 3, 2, 1) AS coalesce_res;
 ```
 ```nofmt

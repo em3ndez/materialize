@@ -1,19 +1,17 @@
 ---
-title: "Array Data Types"
+title: "Array types"
 description: "Express sequences of other types"
 menu:
   main:
     parent: sql-types
 ---
 
-{{< version-added v0.5.0 />}}
-
 Arrays are a multidimensional sequence of any non-array type.
 
 {{< warning >}}
 We do not recommend using arrays, which exist in Materialize primarily to
 facilitate compatibility with PostgreSQL. Specifically, many of the PostgreSQL
-compatibility views in the [system catalog](/sql/system-tables/) must expose
+compatibility views in the [system catalog](/sql/system-catalog/) must expose
 array types. Unfortunately, PostgreSQL arrays have odd semantics and do not
 interoperate well with modern data formats like JSON and Avro.
 
@@ -39,13 +37,9 @@ whenever possible.
 
 ### Construction
 
-{{< version-added v0.7.4 >}}
-The `ARRAY` expression syntax.
-{{< /version-added >}}
-
 You can construct arrays using the special `ARRAY` expression:
 
-```sql
+```mzsql
 SELECT ARRAY[1, 2, 3]
 ```
 ```nofmt
@@ -56,7 +50,7 @@ SELECT ARRAY[1, 2, 3]
 
 You can nest `ARRAY` constructors to create multidimensional arrays:
 
-```sql
+```mzsql
 SELECT ARRAY[ARRAY['a', 'b'], ARRAY['c', 'd']]
 ```
 ```nofmt
@@ -65,11 +59,23 @@ SELECT ARRAY[ARRAY['a', 'b'], ARRAY['c', 'd']]
  {{a,b},{c,d}}
 ```
 
+Alternatively, you can construct an array from the results subquery.  These subqueries must return a single column. Note
+that, in this form of the `ARRAY` expression, parentheses are used rather than square brackets.
+
+```mzsql
+SELECT ARRAY(SELECT x FROM test0 WHERE x > 0 ORDER BY x DESC LIMIT 3);
+```
+```nofmt
+    x
+---------
+ {4,3,2}
+```
+
 Arrays cannot be "ragged." The length of each array expression must equal the
 length of all other array constructors in the same dimension. For example, the
 following ragged array is rejected:
 
-```sql
+```mzsql
 SELECT ARRAY[ARRAY[1, 2], ARRAY[3]]
 ```
 ```nofmt
@@ -96,7 +102,7 @@ quotes, backslashes and double quotes are backslash-escaped.
 The following example demonstrates the output format and includes many of the
 aforementioned special cases.
 
-```sql
+```mzsql
 SELECT ARRAY[ARRAY['a', 'white space'], ARRAY[NULL, ''], ARRAY['escape"m\e', 'nUlL']]
 ```
 ```nofmt
@@ -132,19 +138,30 @@ Array element | Catalog name | OID
 
 ### Valid casts
 
-You can [cast](/sql/functions/cast) all array types to
-[`text`](/sql/types/text) by assignment.
+You can [cast](/sql/functions/cast) all array types to:
+- [`text`](../text) (by assignment)
+- [`list`](../list) (explicit)
 
-
-{{< version-added v0.7.4 >}}
 You can cast `text` to any array type. The input must conform to the [textual
 format](#textual-format) described above, with the additional restriction that
 you cannot yet use a cast to construct a multidimensional array.
-{{< /version-added >}}
+
+### Array to `list` casts
+
+You can cast any type of array to a list of the same element type, as long as
+the array has only 0 or 1 dimensions, i.e. you can cast `integer[]` to `integer
+list`, as long as the array is empty or does not contain any arrays itself.
+
+```mzsql
+SELECT pg_typeof('{1,2,3}`::integer[]::integer list);
+```
+```
+integer list
+```
 
 ## Examples
 
-```sql
+```mzsql
 SELECT '{1,2,3}'::int[]
 ```
 ```nofmt
@@ -153,7 +170,7 @@ SELECT '{1,2,3}'::int[]
  {1,2,3}
 ```
 
-```sql
+```mzsql
 SELECT ARRAY[ARRAY[1, 2], ARRAY[NULL, 4]]::text
 ```
 ```nofmt

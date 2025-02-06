@@ -13,576 +13,873 @@
 //! `SHOW CREATE TABLE` and `SHOW VIEWS`. Note that `SHOW <var>` is considered
 //! an SCL statement.
 
-use anyhow::bail;
+use std::collections::BTreeMap;
+use std::fmt::Write;
 
-use expr::Id;
-use ore::collections::CollectionExt;
-use repr::{Datum, RelationDesc, Row, ScalarType};
-use sql_parser::ast::display::AstDisplay;
+use mz_ore::assert_none;
+use mz_ore::collections::CollectionExt;
+use mz_repr::{CatalogItemId, Datum, RelationDesc, Row, ScalarType};
+use mz_sql_parser::ast::display::AstDisplay;
+use mz_sql_parser::ast::{
+    CreateSubsourceOptionName, ExternalReferenceExport, ExternalReferences, ObjectType,
+    ShowCreateClusterStatement, ShowCreateConnectionStatement, ShowCreateMaterializedViewStatement,
+    ShowObjectType, SystemObjectType, UnresolvedItemName, WithOptionValue,
+};
+use query::QueryContext;
 
 use crate::ast::visit_mut::VisitMut;
 use crate::ast::{
-    ObjectType, Raw, SelectStatement, ShowColumnsStatement, ShowCreateIndexStatement,
-    ShowCreateSinkStatement, ShowCreateSourceStatement, ShowCreateTableStatement,
-    ShowCreateViewStatement, ShowDatabasesStatement, ShowIndexesStatement, ShowObjectsStatement,
-    ShowStatementFilter, Statement, UnresolvedObjectName, Value,
+    SelectStatement, ShowColumnsStatement, ShowCreateIndexStatement, ShowCreateSinkStatement,
+    ShowCreateSourceStatement, ShowCreateTableStatement, ShowCreateViewStatement,
+    ShowObjectsStatement, ShowStatementFilter, Statement, Value,
 };
 use crate::catalog::{CatalogItemType, SessionCatalog};
-use crate::names::PartialName;
+use crate::names::{
+    self, Aug, NameSimplifier, ObjectId, ResolvedClusterName, ResolvedDatabaseName, ResolvedIds,
+    ResolvedItemName, ResolvedRoleName, ResolvedSchemaName,
+};
 use crate::parse;
-use crate::plan::query::{resolve_names_stmt, ResolvedObjectName};
+use crate::plan::scope::Scope;
+use crate::plan::statement::ddl::unplan_create_cluster;
 use crate::plan::statement::{dml, StatementContext, StatementDesc};
-use crate::plan::{Aug, Params, Plan, SendRowsPlan};
+use crate::plan::{
+    query, transform_ast, HirRelationExpr, Params, Plan, PlanError, ShowColumnsPlan, ShowCreatePlan,
+};
 
 pub fn describe_show_create_view(
     _: &StatementContext,
-    _: ShowCreateViewStatement,
-) -> Result<StatementDesc, anyhow::Error> {
+    _: ShowCreateViewStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
     Ok(StatementDesc::new(Some(
-        RelationDesc::empty()
-            .with_column("View", ScalarType::String.nullable(false))
-            .with_column("Create View", ScalarType::String.nullable(false)),
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
     )))
-}
-
-// Used when displaying a view's source for human creation. If the name
-// specified is the same as the name in the catalog, we don't use the ID format.
-#[derive(Debug)]
-struct NameSimplifier<'a> {
-    catalog: &'a dyn SessionCatalog,
-}
-
-impl<'ast, 'a> VisitMut<'ast, Aug> for NameSimplifier<'a> {
-    fn visit_object_name_mut(&mut self, name: &mut ResolvedObjectName) {
-        if let Id::Global(id) = name.id {
-            let item = self.catalog.get_item_by_id(&id);
-            if PartialName::from(item.name().clone()) == name.raw_name() {
-                name.print_id = false;
-            }
-        }
-    }
 }
 
 pub fn plan_show_create_view(
     scx: &StatementContext,
-    ShowCreateViewStatement { view_name }: ShowCreateViewStatement,
-) -> Result<Plan, anyhow::Error> {
-    let view = scx.resolve_item(view_name)?;
-    let view_sql = view.create_sql();
+    ShowCreateViewStatement { view_name }: ShowCreateViewStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    plan_show_create_item(scx, &view_name, CatalogItemType::View)
+}
 
-    let parsed = parse::parse(view_sql)?;
-    let parsed = parsed[0].clone();
-    let mut resolved = resolve_names_stmt(scx.catalog, parsed)?;
-    let mut s = NameSimplifier {
-        catalog: scx.catalog,
-    };
-    s.visit_statement_mut(&mut resolved);
+pub fn describe_show_create_materialized_view(
+    _: &StatementContext,
+    _: ShowCreateMaterializedViewStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
+    Ok(StatementDesc::new(Some(
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
+    )))
+}
 
-    if let CatalogItemType::View = view.item_type() {
-        Ok(Plan::SendRows(SendRowsPlan {
-            rows: vec![Row::pack_slice(&[
-                Datum::String(&view.name().to_string()),
-                Datum::String(&resolved.to_ast_string_stable()),
-            ])],
-        }))
-    } else {
-        bail!("{} is not a view", view.name());
-    }
+pub fn plan_show_create_materialized_view(
+    scx: &StatementContext,
+    ShowCreateMaterializedViewStatement {
+        materialized_view_name,
+    }: ShowCreateMaterializedViewStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    plan_show_create_item(
+        scx,
+        &materialized_view_name,
+        CatalogItemType::MaterializedView,
+    )
 }
 
 pub fn describe_show_create_table(
     _: &StatementContext,
-    _: ShowCreateTableStatement,
-) -> Result<StatementDesc, anyhow::Error> {
+    _: ShowCreateTableStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
     Ok(StatementDesc::new(Some(
-        RelationDesc::empty()
-            .with_column("Table", ScalarType::String.nullable(false))
-            .with_column("Create Table", ScalarType::String.nullable(false)),
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
     )))
+}
+
+fn plan_show_create_item(
+    scx: &StatementContext,
+    name: &ResolvedItemName,
+    expect_type: CatalogItemType,
+) -> Result<ShowCreatePlan, PlanError> {
+    let item = scx.get_item_by_resolved_name(name)?;
+    let name = name.full_name_str();
+    if item.id().is_system()
+        && matches!(
+            expect_type,
+            CatalogItemType::Table | CatalogItemType::Source
+        )
+    {
+        sql_bail!("cannot show create for system object {name}");
+    }
+    if item.item_type() == CatalogItemType::MaterializedView && expect_type == CatalogItemType::View
+    {
+        return Err(PlanError::ShowCreateViewOnMaterializedView(name));
+    }
+    if item.item_type() != expect_type {
+        sql_bail!("{name} is not a {expect_type}");
+    }
+    let create_sql = humanize_sql_for_show_create(scx.catalog, item.id(), item.create_sql())?;
+    Ok(ShowCreatePlan {
+        id: ObjectId::Item(item.id()),
+        row: Row::pack_slice(&[Datum::String(&name), Datum::String(&create_sql)]),
+    })
 }
 
 pub fn plan_show_create_table(
     scx: &StatementContext,
-    ShowCreateTableStatement { table_name }: ShowCreateTableStatement,
-) -> Result<Plan, anyhow::Error> {
-    let table = scx.resolve_item(table_name)?;
-    if let CatalogItemType::Table = table.item_type() {
-        Ok(Plan::SendRows(SendRowsPlan {
-            rows: vec![Row::pack_slice(&[
-                Datum::String(&table.name().to_string()),
-                Datum::String(table.create_sql()),
-            ])],
-        }))
-    } else {
-        bail!("{} is not a table", table.name());
-    }
+    ShowCreateTableStatement { table_name }: ShowCreateTableStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    plan_show_create_item(scx, &table_name, CatalogItemType::Table)
 }
 
 pub fn describe_show_create_source(
     _: &StatementContext,
-    _: ShowCreateSourceStatement,
-) -> Result<StatementDesc, anyhow::Error> {
+    _: ShowCreateSourceStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
     Ok(StatementDesc::new(Some(
-        RelationDesc::empty()
-            .with_column("Source", ScalarType::String.nullable(false))
-            .with_column("Create Source", ScalarType::String.nullable(false)),
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
     )))
 }
 
 pub fn plan_show_create_source(
     scx: &StatementContext,
-    ShowCreateSourceStatement { source_name }: ShowCreateSourceStatement,
-) -> Result<Plan, anyhow::Error> {
-    let source = scx.resolve_item(source_name)?;
-    if let CatalogItemType::Source = source.item_type() {
-        Ok(Plan::SendRows(SendRowsPlan {
-            rows: vec![Row::pack_slice(&[
-                Datum::String(&source.name().to_string()),
-                Datum::String(source.create_sql()),
-            ])],
-        }))
-    } else {
-        bail!("{} is not a source", source.name());
-    }
+    ShowCreateSourceStatement { source_name }: ShowCreateSourceStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    plan_show_create_item(scx, &source_name, CatalogItemType::Source)
 }
 
 pub fn describe_show_create_sink(
     _: &StatementContext,
-    _: ShowCreateSinkStatement,
-) -> Result<StatementDesc, anyhow::Error> {
+    _: ShowCreateSinkStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
     Ok(StatementDesc::new(Some(
-        RelationDesc::empty()
-            .with_column("Sink", ScalarType::String.nullable(false))
-            .with_column("Create Sink", ScalarType::String.nullable(false)),
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
     )))
 }
 
 pub fn plan_show_create_sink(
     scx: &StatementContext,
-    ShowCreateSinkStatement { sink_name }: ShowCreateSinkStatement,
-) -> Result<Plan, anyhow::Error> {
-    let sink = scx.resolve_item(sink_name)?;
-    if let CatalogItemType::Sink = sink.item_type() {
-        Ok(Plan::SendRows(SendRowsPlan {
-            rows: vec![Row::pack_slice(&[
-                Datum::String(&sink.name().to_string()),
-                Datum::String(sink.create_sql()),
-            ])],
-        }))
-    } else {
-        bail!("'{}' is not a sink", sink.name());
-    }
+    ShowCreateSinkStatement { sink_name }: ShowCreateSinkStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    plan_show_create_item(scx, &sink_name, CatalogItemType::Sink)
 }
 
 pub fn describe_show_create_index(
     _: &StatementContext,
-    _: ShowCreateIndexStatement,
-) -> Result<StatementDesc, anyhow::Error> {
+    _: ShowCreateIndexStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
     Ok(StatementDesc::new(Some(
-        RelationDesc::empty()
-            .with_column("Index", ScalarType::String.nullable(false))
-            .with_column("Create Index", ScalarType::String.nullable(false)),
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
     )))
 }
 
 pub fn plan_show_create_index(
     scx: &StatementContext,
-    ShowCreateIndexStatement { index_name }: ShowCreateIndexStatement,
-) -> Result<Plan, anyhow::Error> {
-    let index = scx.resolve_item(index_name)?;
-    if let CatalogItemType::Index = index.item_type() {
-        Ok(Plan::SendRows(SendRowsPlan {
-            rows: vec![Row::pack_slice(&[
-                Datum::String(&index.name().to_string()),
-                Datum::String(index.create_sql()),
-            ])],
-        }))
-    } else {
-        bail!("'{}' is not an index", index.name());
-    }
+    ShowCreateIndexStatement { index_name }: ShowCreateIndexStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    plan_show_create_item(scx, &index_name, CatalogItemType::Index)
+}
+
+pub fn describe_show_create_connection(
+    _: &StatementContext,
+    _: ShowCreateConnectionStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
+    Ok(StatementDesc::new(Some(
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
+    )))
+}
+
+pub fn plan_show_create_cluster(
+    scx: &StatementContext,
+    ShowCreateClusterStatement { cluster_name }: ShowCreateClusterStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    let cluster = scx.get_cluster(&cluster_name.id);
+    let name = cluster.name().to_string();
+    let plan = cluster.try_to_plan()?;
+    let stmt = unplan_create_cluster(scx, plan)?;
+    let create_sql = stmt.to_ast_string_stable();
+    Ok(ShowCreatePlan {
+        id: ObjectId::Cluster(cluster_name.id),
+        row: Row::pack_slice(&[Datum::String(&name), Datum::String(&create_sql)]),
+    })
+}
+
+pub fn describe_show_create_cluster(
+    _: &StatementContext,
+    _: ShowCreateClusterStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
+    Ok(StatementDesc::new(Some(
+        RelationDesc::builder()
+            .with_column("name", ScalarType::String.nullable(false))
+            .with_column("create_sql", ScalarType::String.nullable(false))
+            .finish(),
+    )))
+}
+
+pub fn plan_show_create_connection(
+    scx: &StatementContext,
+    ShowCreateConnectionStatement { connection_name }: ShowCreateConnectionStatement<Aug>,
+) -> Result<ShowCreatePlan, PlanError> {
+    plan_show_create_item(scx, &connection_name, CatalogItemType::Connection)
 }
 
 pub fn show_databases<'a>(
     scx: &'a StatementContext<'a>,
-    ShowDatabasesStatement { filter }: ShowDatabasesStatement<Raw>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let query = "SELECT name FROM mz_catalog.mz_databases".to_string();
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let query = "SELECT name, comment FROM mz_internal.mz_show_databases".to_string();
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "comment"]))
+}
+
+pub fn show_schemas<'a>(
+    scx: &'a StatementContext<'a>,
+    from: Option<ResolvedDatabaseName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let database_id = match from {
+        Some(ResolvedDatabaseName::Database { id, .. }) => id.to_string(),
+        None => match scx.active_database() {
+            Some(id) => id.to_string(),
+            None => sql_bail!("no database specified and no active database"),
+        },
+        Some(ResolvedDatabaseName::Error) => {
+            unreachable!("should have been handled in name resolution")
+        }
+    };
+    let query = format!(
+        "SELECT name, comment
+        FROM mz_internal.mz_show_schemas
+        WHERE database_id IS NULL OR database_id = '{database_id}'",
+    );
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "comment"]))
+}
+
+pub fn show_roles<'a>(
+    scx: &'a StatementContext<'a>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let query = "SELECT name, comment FROM mz_internal.mz_show_roles".to_string();
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "comment"]))
+}
+
+pub fn show_network_policies<'a>(
+    scx: &'a StatementContext<'a>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let query = "SELECT name, rules, comment FROM mz_internal.mz_show_network_policies".to_string();
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["name", "rules", "comment"]),
+    )
 }
 
 pub fn show_objects<'a>(
     scx: &'a StatementContext<'a>,
     ShowObjectsStatement {
-        extended,
-        full,
-        materialized,
         object_type,
         from,
         filter,
-    }: ShowObjectsStatement<Raw>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
+    }: ShowObjectsStatement<Aug>,
+) -> Result<ShowSelect<'a>, PlanError> {
     match object_type {
-        ObjectType::Schema => show_schemas(scx, extended, full, from, filter),
-        ObjectType::Table => show_tables(scx, extended, full, from, filter),
-        ObjectType::Source => show_sources(scx, full, materialized, from, filter),
-        ObjectType::View => show_views(scx, full, materialized, from, filter),
-        ObjectType::Sink => show_sinks(scx, full, from, filter),
-        ObjectType::Type => show_types(scx, extended, full, from, filter),
-        ObjectType::Object => show_all_objects(scx, extended, full, from, filter),
-        ObjectType::Role => bail_unsupported!("SHOW ROLES"),
-        ObjectType::Index => unreachable!("SHOW INDEX handled separately"),
+        ShowObjectType::Table { on_source } => show_tables(scx, from, on_source, filter),
+        ShowObjectType::Source { in_cluster } => show_sources(scx, from, in_cluster, filter),
+        ShowObjectType::Subsource { on_source } => show_subsources(scx, from, on_source, filter),
+        ShowObjectType::View => show_views(scx, from, filter),
+        ShowObjectType::Sink { in_cluster } => show_sinks(scx, from, in_cluster, filter),
+        ShowObjectType::Type => show_types(scx, from, filter),
+        ShowObjectType::Object => show_all_objects(scx, from, filter),
+        ShowObjectType::Role => {
+            assert_none!(from, "parser should reject from");
+            show_roles(scx, filter)
+        }
+        ShowObjectType::Cluster => {
+            assert_none!(from, "parser should reject from");
+            show_clusters(scx, filter)
+        }
+        ShowObjectType::ClusterReplica => {
+            assert_none!(from, "parser should reject from");
+            show_cluster_replicas(scx, filter)
+        }
+        ShowObjectType::Secret => show_secrets(scx, from, filter),
+        ShowObjectType::Connection => show_connections(scx, from, filter),
+        ShowObjectType::MaterializedView { in_cluster } => {
+            show_materialized_views(scx, from, in_cluster, filter)
+        }
+        ShowObjectType::Index {
+            in_cluster,
+            on_object,
+        } => show_indexes(scx, from, on_object, in_cluster, filter),
+        ShowObjectType::Database => {
+            assert_none!(from, "parser should reject from");
+            show_databases(scx, filter)
+        }
+        ShowObjectType::Schema { from: db_from } => {
+            assert_none!(from, "parser should reject from");
+            show_schemas(scx, db_from, filter)
+        }
+        ShowObjectType::Privileges { object_type, role } => {
+            assert_none!(from, "parser should reject from");
+            show_privileges(scx, object_type, role, filter)
+        }
+        ShowObjectType::DefaultPrivileges { object_type, role } => {
+            assert_none!(from, "parser should reject from");
+            show_default_privileges(scx, object_type, role, filter)
+        }
+        ShowObjectType::RoleMembership { role } => {
+            assert_none!(from, "parser should reject from");
+            show_role_membership(scx, role, filter)
+        }
+        ShowObjectType::ContinualTask { in_cluster } => {
+            show_continual_tasks(scx, from, in_cluster, filter)
+        }
+        ShowObjectType::NetworkPolicy => {
+            assert_none!(from, "parser should reject from");
+            show_network_policies(scx, filter)
+        }
     }
 }
 
-fn show_schemas<'a>(
+fn show_connections<'a>(
     scx: &'a StatementContext<'a>,
-    extended: bool,
-    full: bool,
-    from: Option<UnresolvedObjectName>,
-    filter: Option<ShowStatementFilter<Raw>>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let database = if let Some(from) = from {
-        scx.resolve_database(from)?
-    } else {
-        scx.resolve_default_database()?
-    };
-    let query = if !full & !extended {
-        format!(
-            "SELECT name FROM mz_catalog.mz_schemas WHERE database_id = {}",
-            database.id(),
-        )
-    } else if full & !extended {
-        format!(
-            "SELECT name, CASE WHEN database_id IS NULL THEN 'system' ELSE 'user' END AS type
-            FROM mz_catalog.mz_schemas
-            WHERE database_id = {}",
-            database.id(),
-        )
-    } else if !full & extended {
-        format!(
-            "SELECT name
-            FROM mz_catalog.mz_schemas
-            WHERE database_id = {} OR database_id IS NULL",
-            database.id(),
-        )
-    } else {
-        format!(
-            "SELECT name, CASE WHEN database_id IS NULL THEN 'system' ELSE 'user' END AS type
-            FROM mz_catalog.mz_schemas
-            WHERE database_id = {} OR database_id IS NULL",
-            database.id(),
-        )
-    };
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+    from: Option<ResolvedSchemaName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+    let query = format!(
+        "SELECT name, type, comment
+        FROM mz_internal.mz_show_connections connections
+        WHERE schema_id = '{schema_spec}'",
+    );
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "type", "comment"]))
 }
 
 fn show_tables<'a>(
     scx: &'a StatementContext<'a>,
-    extended: bool,
-    full: bool,
-    from: Option<UnresolvedObjectName>,
-    filter: Option<ShowStatementFilter<Raw>>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let schema = if let Some(from) = from {
-        scx.resolve_schema(from)?
-    } else {
-        scx.resolve_default_schema()?
-    };
-
+    from: Option<ResolvedSchemaName>,
+    on_source: Option<ResolvedItemName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
     let mut query = format!(
-        "SELECT t.name, mz_internal.mz_classify_object_id(t.id) AS type
-        FROM mz_catalog.mz_tables t
-        JOIN mz_catalog.mz_schemas s ON t.schema_id = s.id
-        WHERE schema_id = {}",
-        schema.id(),
+        "SELECT name, comment
+        FROM mz_internal.mz_show_tables tables
+        WHERE tables.schema_id = '{schema_spec}'",
     );
-    if extended {
-        query += " OR s.database_id IS NULL";
+    if let Some(on_source) = &on_source {
+        let on_item = scx.get_item_by_resolved_name(on_source)?;
+        if on_item.item_type() != CatalogItemType::Source {
+            sql_bail!(
+                "cannot show tables on {} because it is a {}",
+                on_source.full_name_str(),
+                on_item.item_type(),
+            );
+        }
+        query += &format!(" AND tables.source_id = '{}'", on_item.id());
     }
-    if !full {
-        query = format!("SELECT name FROM ({})", query);
-    }
-
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "comment"]))
 }
 
 fn show_sources<'a>(
     scx: &'a StatementContext<'a>,
-    full: bool,
-    materialized: bool,
-    from: Option<UnresolvedObjectName>,
-    filter: Option<ShowStatementFilter<Raw>>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let schema = if let Some(from) = from {
-        scx.resolve_schema(from)?
-    } else {
-        scx.resolve_default_schema()?
-    };
+    from: Option<ResolvedSchemaName>,
+    in_cluster: Option<ResolvedClusterName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+    let mut where_clause = format!("schema_id = '{schema_spec}'");
 
-    let query = match (full, materialized) {
-        (false, false) => format!(
-            "SELECT
-                 name
-             FROM
-                 mz_catalog.mz_sources
-             WHERE
-                 schema_id = {}",
-            schema.id()
-        ),
-        (false, true) => format!(
-            "SELECT
-                 name
-             FROM mz_catalog.mz_sources
-             WHERE
-                 mz_internal.mz_is_materialized(id) AND
-                 schema_id = {}",
-            schema.id()
-        ),
-        (true, false) => format!(
-            "SELECT
-                 name,
-                 mz_internal.mz_classify_object_id(id) AS type,
-                 mz_internal.mz_is_materialized(id) AS materialized,
-                 volatility,
-                 connector_type
-             FROM
-                 mz_catalog.mz_sources
-             WHERE
-                 schema_id = {}",
-            schema.id()
-        ),
-        (true, true) => format!(
-            "SELECT
-                 name,
-                 mz_internal.mz_classify_object_id(id) AS type,
-                 volatility,
-                 connector_type
-             FROM
-                 mz_catalog.mz_sources
-             WHERE
-                  mz_internal.mz_is_materialized(id) AND
-                  schema_id = {}",
-            schema.id()
-        ),
-    };
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+    if let Some(cluster) = in_cluster {
+        write!(where_clause, " AND cluster_id = '{}'", cluster.id)
+            .expect("write on string cannot fail");
+    }
+
+    let query = format!(
+        "SELECT name, type, cluster, comment
+        FROM mz_internal.mz_show_sources
+        WHERE {where_clause}"
+    );
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["name", "type", "cluster", "comment"]),
+    )
+}
+
+fn show_subsources<'a>(
+    scx: &'a StatementContext<'a>,
+    from_schema: Option<ResolvedSchemaName>,
+    on_source: Option<ResolvedItemName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let mut query_filter = Vec::new();
+
+    if on_source.is_none() && from_schema.is_none() {
+        query_filter.push("subsources.id NOT LIKE 's%'".into());
+        let schema_spec = scx.resolve_active_schema().map(|spec| spec.clone())?;
+        query_filter.push(format!("subsources.schema_id = '{schema_spec}'"));
+    }
+
+    if let Some(on_source) = &on_source {
+        let on_item = scx.get_item_by_resolved_name(on_source)?;
+        if on_item.item_type() != CatalogItemType::Source {
+            sql_bail!(
+                "cannot show subsources on {} because it is a {}",
+                on_source.full_name_str(),
+                on_item.item_type(),
+            );
+        }
+        query_filter.push(format!("sources.id = '{}'", on_item.id()));
+    }
+
+    if let Some(schema) = from_schema {
+        let schema_spec = schema.schema_spec();
+        query_filter.push(format!("subsources.schema_id = '{schema_spec}'"));
+    }
+
+    // TODO(database-issues#8322): this looks in both directions for subsources as long as
+    // progress collections still exist
+    let query = format!(
+        "SELECT DISTINCT
+            subsources.name AS name,
+            subsources.type AS type
+        FROM
+            mz_sources AS subsources
+            JOIN mz_internal.mz_object_dependencies deps ON (subsources.id = deps.object_id OR subsources.id = deps.referenced_object_id)
+            JOIN mz_sources AS sources ON (sources.id = deps.object_id OR sources.id = deps.referenced_object_id)
+        WHERE (subsources.type = 'subsource' OR subsources.type = 'progress') AND {}",
+        itertools::join(query_filter, " AND "),
+    );
+    ShowSelect::new(scx, query, filter, None, None)
 }
 
 fn show_views<'a>(
     scx: &'a StatementContext<'a>,
-    full: bool,
-    materialized: bool,
-    from: Option<UnresolvedObjectName>,
-    filter: Option<ShowStatementFilter<Raw>>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let schema = if let Some(from) = from {
-        scx.resolve_schema(from)?
-    } else {
-        scx.resolve_default_schema()?
-    };
+    from: Option<ResolvedSchemaName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+    let query = format!(
+        "SELECT name, comment
+        FROM mz_internal.mz_show_views
+        WHERE schema_id = '{schema_spec}'"
+    );
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "comment"]))
+}
 
-    let query = if !full & !materialized {
-        format!(
-            "SELECT name FROM mz_catalog.mz_views WHERE schema_id = {}",
-            schema.id(),
-        )
-    } else if full & !materialized {
-        format!(
-            "SELECT
-                name,
-                mz_internal.mz_classify_object_id(id) AS type,
-                mz_internal.mz_is_materialized(id) AS materialized,
-                volatility
-             FROM mz_catalog.mz_views
-             WHERE schema_id = {}",
-            schema.id(),
-        )
-    } else if !full & materialized {
-        format!(
-            "SELECT name
-             FROM mz_catalog.mz_views
-             WHERE schema_id = {} AND mz_internal.mz_is_materialized(id)",
-            schema.id(),
-        )
-    } else {
-        format!(
-            "SELECT name, mz_internal.mz_classify_object_id(id) AS type, volatility
-             FROM mz_catalog.mz_views
-             WHERE schema_id = {} AND mz_internal.mz_is_materialized(id)",
-            schema.id(),
-        )
-    };
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+fn show_materialized_views<'a>(
+    scx: &'a StatementContext<'a>,
+    from: Option<ResolvedSchemaName>,
+    in_cluster: Option<ResolvedClusterName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+    let mut where_clause = format!("schema_id = '{schema_spec}'");
+
+    if let Some(cluster) = in_cluster {
+        write!(where_clause, " AND cluster_id = '{}'", cluster.id)
+            .expect("write on string cannot fail");
+    }
+
+    let query = format!(
+        "SELECT name, cluster, comment
+        FROM mz_internal.mz_show_materialized_views
+        WHERE {where_clause}"
+    );
+
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["name", "cluster", "comment"]),
+    )
 }
 
 fn show_sinks<'a>(
     scx: &'a StatementContext<'a>,
-    full: bool,
-    from: Option<UnresolvedObjectName>,
-    filter: Option<ShowStatementFilter<Raw>>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let schema = if let Some(from) = from {
-        scx.resolve_schema(from)?
+    from: Option<ResolvedSchemaName>,
+    in_cluster: Option<ResolvedClusterName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = if let Some(ResolvedSchemaName::Schema { schema_spec, .. }) = from {
+        schema_spec.to_string()
     } else {
-        scx.resolve_default_schema()?
+        scx.resolve_active_schema()?.to_string()
     };
 
-    let query = if full {
-        format!(
-            "SELECT name, mz_internal.mz_classify_object_id(id) AS type, volatility
-            FROM mz_catalog.mz_sinks
-            WHERE schema_id = {}",
-            schema.id(),
-        )
-    } else {
-        format!(
-            "SELECT name FROM mz_catalog.mz_sinks WHERE schema_id = {}",
-            schema.id(),
-        )
-    };
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+    let mut where_clause = format!("schema_id = '{schema_spec}'");
+
+    if let Some(cluster) = in_cluster {
+        write!(where_clause, " AND cluster_id = '{}'", cluster.id)
+            .expect("write on string cannot fail");
+    }
+
+    let query = format!(
+        "SELECT name, type, cluster, comment
+        FROM mz_internal.mz_show_sinks sinks
+        WHERE {where_clause}"
+    );
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["name", "type", "cluster", "comment"]),
+    )
 }
 
 fn show_types<'a>(
     scx: &'a StatementContext<'a>,
-    extended: bool,
-    full: bool,
-    from: Option<UnresolvedObjectName>,
-    filter: Option<ShowStatementFilter<Raw>>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let schema = if let Some(from) = from {
-        scx.resolve_schema(from)?
-    } else {
-        scx.resolve_default_schema()?
-    };
-
-    let mut query = format!(
-        "SELECT t.name, mz_internal.mz_classify_object_id(t.id) AS type
-        FROM mz_catalog.mz_types t
-        JOIN mz_catalog.mz_schemas s ON t.schema_id = s.id
-        WHERE t.schema_id = {}",
-        schema.id(),
+    from: Option<ResolvedSchemaName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+    let query = format!(
+        "SELECT name, comment
+        FROM mz_internal.mz_show_types
+        WHERE schema_id = '{schema_spec}'"
     );
-    if extended {
-        query += " OR s.database_id IS NULL";
-    }
-    if !full {
-        query = format!("SELECT name FROM ({})", query);
-    }
-
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "comment"]))
 }
 
 fn show_all_objects<'a>(
     scx: &'a StatementContext<'a>,
-    extended: bool,
-    full: bool,
-    from: Option<UnresolvedObjectName>,
-    filter: Option<ShowStatementFilter<Raw>>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    let schema = if let Some(from) = from {
-        scx.resolve_schema(from)?
-    } else {
-        scx.resolve_default_schema()?
-    };
-
-    let mut query = format!(
-        "SELECT o.name, mz_internal.mz_classify_object_id(o.id) AS type
-        FROM mz_catalog.mz_objects o
-        JOIN mz_catalog.mz_schemas s ON o.schema_id = s.id
-        WHERE o.schema_id = {}",
-        schema.id(),
+    from: Option<ResolvedSchemaName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+    let query = format!(
+        "SELECT name, type, comment
+         FROM mz_internal.mz_show_all_objects
+         WHERE schema_id = '{schema_spec}'",
     );
-    if extended {
-        query += " OR s.database_id IS NULL";
-    }
-    if !full {
-        query = format!("SELECT name FROM ({})", query);
-    }
-
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "type", "comment"]))
 }
 
 pub fn show_indexes<'a>(
     scx: &'a StatementContext<'a>,
-    ShowIndexesStatement {
-        extended,
-        table_name,
-        filter,
-    }: ShowIndexesStatement<Raw>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    if extended {
-        bail_unsupported!("SHOW EXTENDED INDEXES")
-    }
-    let from = scx.resolve_item(table_name)?;
-    if from.item_type() != CatalogItemType::View
-        && from.item_type() != CatalogItemType::Source
-        && from.item_type() != CatalogItemType::Table
-    {
-        bail!(
-            "cannot show indexes on {} because it is a {}",
-            from.name(),
-            from.item_type(),
-        );
+    from_schema: Option<ResolvedSchemaName>,
+    on_object: Option<ResolvedItemName>,
+    in_cluster: Option<ResolvedClusterName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let mut query_filter = Vec::new();
+
+    if on_object.is_none() && from_schema.is_none() && in_cluster.is_none() {
+        query_filter.push("on_id NOT LIKE 's%'".into());
+        let schema_spec = scx.resolve_active_schema().map(|spec| spec.clone())?;
+        query_filter.push(format!("schema_id = '{schema_spec}'"));
     }
 
+    if let Some(on_object) = &on_object {
+        let on_item = scx.get_item_by_resolved_name(on_object)?;
+        if on_item.item_type() != CatalogItemType::View
+            && on_item.item_type() != CatalogItemType::MaterializedView
+            && on_item.item_type() != CatalogItemType::Source
+            && on_item.item_type() != CatalogItemType::Table
+        {
+            sql_bail!(
+                "cannot show indexes on {} because it is a {}",
+                on_object.full_name_str(),
+                on_item.item_type(),
+            );
+        }
+        query_filter.push(format!("on_id = '{}'", on_item.id()));
+    }
+
+    if let Some(schema) = from_schema {
+        let schema_spec = schema.schema_spec();
+        query_filter.push(format!("schema_id = '{schema_spec}'"));
+    }
+
+    if let Some(cluster) = in_cluster {
+        query_filter.push(format!("cluster_id = '{}'", cluster.id))
+    };
+
     let query = format!(
-        "SELECT
-            objs.name AS on_name,
-            idxs.name AS key_name,
-            idx_cols.index_position AS seq_in_index,
-            obj_cols.name AS column_name,
-            idx_cols.on_expression AS expression,
-            idx_cols.nullable AS nullable,
-            idxs.enabled AS enabled
-        FROM
-            mz_catalog.mz_indexes AS idxs
-            JOIN mz_catalog.mz_index_columns AS idx_cols ON idxs.id = idx_cols.index_id
-            JOIN mz_catalog.mz_objects AS objs ON idxs.on_id = objs.id
-            LEFT JOIN mz_catalog.mz_columns AS obj_cols
-                ON idxs.on_id = obj_cols.id AND idx_cols.on_position = obj_cols.position
-        WHERE
-            objs.id = '{}'",
-        from.id(),
+        "SELECT name, on, cluster, key, comment
+        FROM mz_internal.mz_show_indexes
+        WHERE {}",
+        itertools::join(query_filter.iter(), " AND ")
     );
-    Ok(ShowSelect::new(scx, query, filter, None, None))
+
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["name", "on", "cluster", "key", "comment"]),
+    )
 }
 
 pub fn show_columns<'a>(
     scx: &'a StatementContext<'a>,
-    ShowColumnsStatement {
-        extended,
-        full,
-        table_name,
-        filter,
-    }: ShowColumnsStatement<Raw>,
-) -> Result<ShowSelect<'a>, anyhow::Error> {
-    if extended {
-        bail_unsupported!("SHOW EXTENDED COLUMNS");
-    }
-    if full {
-        bail_unsupported!("SHOW FULL COLUMNS");
-    }
+    ShowColumnsStatement { table_name, filter }: ShowColumnsStatement<Aug>,
+) -> Result<ShowColumnsSelect<'a>, PlanError> {
+    let entry = scx.get_item_by_resolved_name(&table_name)?;
+    let full_name = scx.catalog.resolve_full_name(entry.name());
 
-    let entry = scx.resolve_item(table_name)?;
+    match entry.item_type() {
+        CatalogItemType::Source
+        | CatalogItemType::Table
+        | CatalogItemType::View
+        | CatalogItemType::MaterializedView
+        | CatalogItemType::ContinualTask => (),
+        ty @ CatalogItemType::Connection
+        | ty @ CatalogItemType::Index
+        | ty @ CatalogItemType::Func
+        | ty @ CatalogItemType::Secret
+        | ty @ CatalogItemType::Type
+        | ty @ CatalogItemType::Sink => {
+            sql_bail!("{full_name} is a {ty} and so does not have columns");
+        }
+    }
 
     let query = format!(
-        "SELECT
-            mz_columns.name,
-            mz_columns.nullable,
-            mz_columns.type,
-            mz_columns.position
-         FROM mz_catalog.mz_columns AS mz_columns
-         WHERE mz_columns.id = '{}'",
+        "SELECT name, nullable, type, position, comment
+         FROM mz_internal.mz_show_columns columns
+         WHERE columns.id = '{}'",
         entry.id(),
     );
-    Ok(ShowSelect::new(
+    let (show_select, new_resolved_ids) = ShowSelect::new_with_resolved_ids(
         scx,
         query,
         filter,
         Some("position"),
-        Some(&["name", "nullable", "type"]),
-    ))
+        Some(&["name", "nullable", "type", "comment"]),
+    )?;
+    Ok(ShowColumnsSelect {
+        id: entry.id(),
+        show_select,
+        new_resolved_ids,
+    })
+}
+
+// The rationale for which fields to include in the tuples are those
+// that are mandatory when creating a replica as part of the CREATE
+// CLUSTER command, i.e., name and size.
+pub fn show_clusters<'a>(
+    scx: &'a StatementContext<'a>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let query = "SELECT name, replicas, comment FROM mz_internal.mz_show_clusters".to_string();
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["name", "replicas", "comment"]),
+    )
+}
+
+pub fn show_cluster_replicas<'a>(
+    scx: &'a StatementContext<'a>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let query = "
+    SELECT cluster, replica, size, ready, comment
+    FROM mz_internal.mz_show_cluster_replicas
+    "
+    .to_string();
+
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["cluster", "replica", "size", "ready", "comment"]),
+    )
+}
+
+pub fn show_secrets<'a>(
+    scx: &'a StatementContext<'a>,
+    from: Option<ResolvedSchemaName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+
+    let query = format!(
+        "SELECT name, comment
+        FROM mz_internal.mz_show_secrets
+        WHERE schema_id = '{schema_spec}'",
+    );
+
+    ShowSelect::new(scx, query, filter, None, Some(&["name", "comment"]))
+}
+
+pub fn show_privileges<'a>(
+    scx: &'a StatementContext<'a>,
+    object_type: Option<SystemObjectType>,
+    role: Option<ResolvedRoleName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let mut query_filter = Vec::new();
+    if let Some(object_type) = object_type {
+        query_filter.push(format!(
+            "object_type = '{}'",
+            object_type.to_string().to_lowercase()
+        ));
+    }
+    if let Some(role) = role {
+        let name = role.name;
+        query_filter.push(format!("CASE WHEN grantee = 'PUBLIC' THEN true ELSE pg_has_role('{name}', grantee, 'USAGE') END"));
+    }
+    let query_filter = if query_filter.len() > 0 {
+        format!("WHERE {}", itertools::join(query_filter, " AND "))
+    } else {
+        "".to_string()
+    };
+
+    let query = format!(
+        "SELECT grantor, grantee, database, schema, name, object_type, privilege_type
+        FROM mz_internal.mz_show_all_privileges
+        {query_filter}",
+    );
+
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&[
+            "grantor",
+            "grantee",
+            "database",
+            "schema",
+            "name",
+            "object_type",
+            "privilege_type",
+        ]),
+    )
+}
+
+pub fn show_default_privileges<'a>(
+    scx: &'a StatementContext<'a>,
+    object_type: Option<ObjectType>,
+    role: Option<ResolvedRoleName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let mut query_filter = Vec::new();
+    if let Some(object_type) = object_type {
+        query_filter.push(format!(
+            "object_type = '{}'",
+            object_type.to_string().to_lowercase()
+        ));
+    }
+    if let Some(role) = role {
+        let name = role.name;
+        query_filter.push(format!("CASE WHEN grantee = 'PUBLIC' THEN true ELSE pg_has_role('{name}', grantee, 'USAGE') END"));
+    }
+    let query_filter = if query_filter.len() > 0 {
+        format!("WHERE {}", itertools::join(query_filter, " AND "))
+    } else {
+        "".to_string()
+    };
+
+    let query = format!(
+        "SELECT object_owner, database, schema, object_type, grantee, privilege_type
+        FROM mz_internal.mz_show_default_privileges
+        {query_filter}",
+    );
+
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&[
+            "object_owner",
+            "database",
+            "schema",
+            "object_type",
+            "grantee",
+            "privilege_type",
+        ]),
+    )
+}
+
+pub fn show_role_membership<'a>(
+    scx: &'a StatementContext<'a>,
+    role: Option<ResolvedRoleName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let mut query_filter = Vec::new();
+    if let Some(role) = role {
+        let name = role.name;
+        query_filter.push(format!("pg_has_role('{name}', member, 'USAGE')"));
+    }
+    let query_filter = if query_filter.len() > 0 {
+        format!("WHERE {}", itertools::join(query_filter, " AND "))
+    } else {
+        "".to_string()
+    };
+
+    let query = format!(
+        "SELECT role, member, grantor
+        FROM mz_internal.mz_show_role_members
+        {query_filter}",
+    );
+
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["role", "member", "grantor"]),
+    )
+}
+
+fn show_continual_tasks<'a>(
+    scx: &'a StatementContext<'a>,
+    from: Option<ResolvedSchemaName>,
+    in_cluster: Option<ResolvedClusterName>,
+    filter: Option<ShowStatementFilter<Aug>>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let schema_spec = scx.resolve_optional_schema(&from)?;
+    let mut where_clause = format!("schema_id = '{schema_spec}'");
+
+    if let Some(cluster) = in_cluster {
+        write!(where_clause, " AND cluster_id = '{}'", cluster.id)
+            .expect("write on string cannot fail");
+    }
+
+    let query = format!(
+        "SELECT name, cluster, comment
+        FROM mz_internal.mz_show_continual_tasks
+        WHERE {where_clause}"
+    );
+
+    ShowSelect::new(
+        scx,
+        query,
+        filter,
+        None,
+        Some(&["name", "cluster", "comment"]),
+    )
 }
 
 /// An intermediate result when planning a `SHOW` query.
@@ -590,7 +887,7 @@ pub fn show_columns<'a>(
 /// Can be interrogated for its columns, or converted into a proper [`Plan`].
 pub struct ShowSelect<'a> {
     scx: &'a StatementContext<'a>,
-    stmt: SelectStatement<Raw>,
+    stmt: SelectStatement<Aug>,
 }
 
 impl<'a> ShowSelect<'a> {
@@ -605,10 +902,21 @@ impl<'a> ShowSelect<'a> {
     fn new(
         scx: &'a StatementContext,
         query: String,
-        filter: Option<ShowStatementFilter<Raw>>,
+        filter: Option<ShowStatementFilter<Aug>>,
         order: Option<&str>,
         projection: Option<&[&str]>,
-    ) -> ShowSelect<'a> {
+    ) -> Result<ShowSelect<'a>, PlanError> {
+        Self::new_with_resolved_ids(scx, query, filter, order, projection)
+            .map(|(show_select, _)| show_select)
+    }
+
+    fn new_with_resolved_ids(
+        scx: &'a StatementContext,
+        query: String,
+        filter: Option<ShowStatementFilter<Aug>>,
+        order: Option<&str>,
+        projection: Option<&[&str]>,
+    ) -> Result<(ShowSelect<'a>, ResolvedIds), PlanError> {
         let filter = match filter {
             Some(ShowStatementFilter::Like(like)) => format!("name LIKE {}", Value::String(like)),
             Some(ShowStatementFilter::Where(expr)) => expr.to_string(),
@@ -624,20 +932,226 @@ impl<'a> ShowSelect<'a> {
             order.unwrap_or("q.*")
         );
         let stmts = parse::parse(&query).expect("ShowSelect::new called with invalid SQL");
-        let stmt = match stmts.into_element() {
+        let stmt = match stmts.into_element().ast {
             Statement::Select(select) => select,
             _ => panic!("ShowSelect::new called with non-SELECT statement"),
         };
-        ShowSelect { scx, stmt }
+        let (mut stmt, new_resolved_ids) = names::resolve(scx.catalog, stmt)?;
+        transform_ast::transform(scx, &mut stmt)?;
+        Ok((ShowSelect { scx, stmt }, new_resolved_ids))
     }
 
     /// Computes the shape of this `ShowSelect`.
-    pub fn describe(self) -> Result<StatementDesc, anyhow::Error> {
+    pub fn describe(self) -> Result<StatementDesc, PlanError> {
         dml::describe_select(self.scx, self.stmt)
     }
 
     /// Converts this `ShowSelect` into a [`Plan`].
-    pub fn plan(self) -> Result<Plan, anyhow::Error> {
+    pub fn plan(self) -> Result<Plan, PlanError> {
         dml::plan_select(self.scx, self.stmt, &Params::empty(), None)
     }
+
+    /// Converts this `ShowSelect` into a [`(HirRelationExpr, Scope)`].
+    pub fn plan_hir(self, qcx: &QueryContext) -> Result<(HirRelationExpr, Scope), PlanError> {
+        query::plan_nested_query(&mut qcx.clone(), &self.stmt.query)
+    }
+}
+
+pub struct ShowColumnsSelect<'a> {
+    id: CatalogItemId,
+    new_resolved_ids: ResolvedIds,
+    show_select: ShowSelect<'a>,
+}
+
+impl<'a> ShowColumnsSelect<'a> {
+    pub fn describe(self) -> Result<StatementDesc, PlanError> {
+        self.show_select.describe()
+    }
+
+    pub fn plan(self) -> Result<Plan, PlanError> {
+        let select_plan = self.show_select.plan()?;
+        match select_plan {
+            Plan::Select(select_plan) => Ok(Plan::ShowColumns(ShowColumnsPlan {
+                id: self.id,
+                select_plan,
+                new_resolved_ids: self.new_resolved_ids,
+            })),
+            _ => {
+                tracing::error!(
+                    "SHOW COLUMNS produced a non select plan. plan: {:?}",
+                    select_plan
+                );
+                Err(PlanError::Unstructured(
+                    "SHOW COLUMNS produced an unexpected plan. Please file a bug.".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub fn plan_hir(self, qcx: &QueryContext) -> Result<(HirRelationExpr, Scope), PlanError> {
+        self.show_select.plan_hir(qcx)
+    }
+}
+
+/// Convert a SQL statement into a form that could be used as input, as well as
+/// is more amenable to human consumption.
+fn humanize_sql_for_show_create(
+    catalog: &dyn SessionCatalog,
+    id: CatalogItemId,
+    sql: &str,
+) -> Result<String, PlanError> {
+    use mz_sql_parser::ast::{CreateSourceConnection, MySqlConfigOptionName, PgConfigOptionName};
+
+    let parsed = parse::parse(sql)?.into_element().ast;
+    let (mut resolved, _) = names::resolve(catalog, parsed)?;
+
+    // Simplify names.
+    let mut simplifier = NameSimplifier { catalog };
+    simplifier.visit_statement_mut(&mut resolved);
+
+    match &mut resolved {
+        // Strip internal `AS OF` syntax.
+        Statement::CreateMaterializedView(stmt) => stmt.as_of = None,
+        Statement::CreateContinualTask(stmt) => stmt.as_of = None,
+        // `CREATE SOURCE` statements should roundtrip. However, sources and
+        // their subsources have a complex relationship, so we need to do a lot
+        // of work to reconstruct the statement for multi-output sources.
+        //
+        // For instance, `DROP SOURCE` statements can leave dangling references
+        // to subsources that must be filtered out here, that, due to catalog
+        // transaction limitations, can only be be cleaned up when a top-level
+        // source is altered.
+        Statement::CreateSource(stmt) => {
+            // Collect all current subsource references.
+            let mut curr_references: BTreeMap<UnresolvedItemName, Vec<UnresolvedItemName>> =
+                catalog
+                    .get_item(&id)
+                    .used_by()
+                    .into_iter()
+                    .filter_map(|subsource| {
+                        let item = catalog.get_item(subsource);
+                        item.subsource_details().map(|(_id, reference, _details)| {
+                            let name = item.name();
+                            let subsource_name = catalog.resolve_full_name(name);
+                            let subsource_name = UnresolvedItemName::from(subsource_name);
+                            (reference.clone(), subsource_name)
+                        })
+                    })
+                    .fold(BTreeMap::new(), |mut map, (reference, subsource_name)| {
+                        map.entry(reference)
+                            .or_insert_with(Vec::new)
+                            .push(subsource_name);
+                        map
+                    });
+
+            match &mut stmt.connection {
+                CreateSourceConnection::Postgres { options, .. }
+                | CreateSourceConnection::Yugabyte { options, .. } => {
+                    options.retain_mut(|o| {
+                        match o.name {
+                            // Dropping a subsource does not remove any `TEXT
+                            // COLUMNS` values that refer to the table it
+                            // ingests, which we'll handle below.
+                            PgConfigOptionName::TextColumns => {}
+                            // Drop details, which does not rountrip.
+                            PgConfigOptionName::Details => return false,
+                            _ => return true,
+                        };
+                        match &mut o.value {
+                            Some(WithOptionValue::Sequence(text_cols)) => {
+                                text_cols.retain(|v| match v {
+                                    WithOptionValue::UnresolvedItemName(n) => {
+                                        let mut name = n.clone();
+                                        // Remove the column reference.
+                                        name.0.truncate(3);
+                                        curr_references.contains_key(&name)
+                                    }
+                                    _ => unreachable!(
+                                        "TEXT COLUMNS must be sequence of unresolved item names"
+                                    ),
+                                });
+                                !text_cols.is_empty()
+                            }
+                            _ => unreachable!(
+                                "TEXT COLUMNS must be sequence of unresolved item names"
+                            ),
+                        }
+                    });
+                }
+                CreateSourceConnection::MySql { options, .. } => {
+                    options.retain_mut(|o| {
+                        match o.name {
+                            // Dropping a subsource does not remove any `TEXT
+                            // COLUMNS` values that refer to the table it
+                            // ingests, which we'll handle below.
+                            MySqlConfigOptionName::TextColumns
+                            | MySqlConfigOptionName::ExcludeColumns => {}
+                            // Drop details, which does not rountrip.
+                            MySqlConfigOptionName::Details => return false,
+                        };
+
+                        match &mut o.value {
+                            Some(WithOptionValue::Sequence(seq_unresolved_item_names)) => {
+                                seq_unresolved_item_names.retain(|v| match v {
+                                    WithOptionValue::UnresolvedItemName(n) => {
+                                        let mut name = n.clone();
+                                        // Remove column reference.
+                                        name.0.truncate(2);
+                                        curr_references.contains_key(&name)
+                                    }
+                                    _ => unreachable!(
+                                        "TEXT COLUMNS + EXCLUDE COLUMNS must be sequence of unresolved item names"
+                                    ),
+                                });
+                                !seq_unresolved_item_names.is_empty()
+                            }
+                            _ => unreachable!(
+                                "TEXT COLUMNS + EXCLUDE COLUMNS must be sequence of unresolved item names"
+                            ),
+                        }
+                    });
+                }
+                CreateSourceConnection::LoadGenerator { .. } if !curr_references.is_empty() => {
+                    // Load generator sources with any references only support
+                    // `FOR ALL TABLES`. However, this would change if database-issues#7911
+                    // landed.
+                    curr_references.clear();
+                    stmt.external_references = Some(ExternalReferences::All);
+                }
+                CreateSourceConnection::Kafka { .. }
+                | CreateSourceConnection::LoadGenerator { .. } => {}
+            }
+
+            // If this source has any references, reconstruct them.
+            if !curr_references.is_empty() {
+                let mut subsources: Vec<_> = curr_references
+                    .into_iter()
+                    .flat_map(|(reference, names)| {
+                        names.into_iter().map(move |name| ExternalReferenceExport {
+                            reference: reference.clone(),
+                            alias: Some(name),
+                        })
+                    })
+                    .collect();
+                subsources.sort();
+                stmt.external_references = Some(ExternalReferences::SubsetTables(subsources));
+            }
+        }
+        Statement::CreateSubsource(stmt) => {
+            stmt.with_options.retain_mut(|o| {
+                match o.name {
+                    CreateSubsourceOptionName::TextColumns => true,
+                    CreateSubsourceOptionName::ExcludeColumns => true,
+                    // Drop details, which does not rountrip.
+                    CreateSubsourceOptionName::Details => false,
+                    CreateSubsourceOptionName::ExternalReference => true,
+                    CreateSubsourceOptionName::Progress => true,
+                }
+            });
+        }
+
+        _ => (),
+    }
+
+    Ok(resolved.to_ast_string_stable())
 }

@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # Test UPDATE and DELETE. This must be a testdrive test to avoid symbiosis
 # in sqllogictest.
 
@@ -38,7 +40,7 @@
 4 5 be
 
 ! UPDATE t SET i = '4'::text
-SET clause does not support casting from text to integer
+contains:SET clause does not support casting from text to integer
 
 > DELETE FROM t WHERE i < 4
 
@@ -46,7 +48,7 @@ SET clause does not support casting from text to integer
 4 5 be
 
 ! UPDATE t SET f = 'a'
-invalid input syntax for type double precision
+contains:invalid input syntax for type double precision
 
 # Ensure that we can update after an error.
 > UPDATE t SET f = 6::FLOAT
@@ -63,34 +65,35 @@ invalid input syntax for type double precision
 > SELECT * FROM t
 4 6 xy
 
-# Update subqueries can only reference other tables
 > CREATE MATERIALIZED VIEW v (a) AS SELECT 4;
 
-! UPDATE t SET i = i + 1 WHERE i IN (SELECT a FROM v);
-invalid selection
+> UPDATE t SET i = i + 1 WHERE i IN (SELECT a FROM v);
+
+> SELECT * FROM t
+5 6 xy
 
 ! UPDATE v SET a = 1
-cannot mutate view
+contains:cannot mutate materialized view
 
 ! UPDATE mz_tables SET a = 1
-cannot mutate system table
+contains:cannot mutate system table
 
 ! UPDATE t SET a = 1
-unknown column a
+contains:unknown column a
 
 ! UPDATE t SET i = 1 WHERE a = 1
-column "a" does not exist
+contains:column "a" does not exist
 
 ! UPDATE t SET i = 1 WHERE i = 'a'
-invalid input syntax for type integer
+contains:invalid input syntax for type integer
 
 ! UPDATE t SET i = 1, i = 1
-column i set twice
+contains:column i set twice
 
 > BEGIN
 
 ! UPDATE t SET i = 1
-cannot be run inside a transaction block
+contains:cannot be run inside a transaction block
 
 > ROLLBACK
 
@@ -99,16 +102,52 @@ cannot be run inside a transaction block
 
 > INSERT INTO t DEFAULT VALUES;
 ! UPDATE t SET i = 1
-cannot be run inside a transaction block
+contains:cannot be run inside a transaction block
 
 > ROLLBACK
 
 > BEGIN
 
 ! DELETE FROM t
-cannot be run inside a transaction block
+contains:cannot be run inside a transaction block
 
 > ROLLBACK
+
+# Update subqueries cannot reference sources
+
+$ set schema={
+    "type": "record",
+    "name": "row",
+    "fields": [
+      {"name": "a", "type": "long"},
+      {"name": "b", "type": "float"},
+      {"name": "c", "type": "string"}
+    ]
+  }
+
+$ kafka-create-topic topic=data
+
+$ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
+{"a": 1, "b": 2, "c": "a"}
+
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE source_data
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+
+> CREATE TABLE source_data_tbl FROM SOURCE source_data (REFERENCE "testdrive-data-${testdrive.seed}")
+  FORMAT AVRO USING SCHEMA '${schema}'
+
+> CREATE MATERIALIZED VIEW source_data_mat_view AS
+  SELECT * FROM source_data_tbl;
+
+! UPDATE source_data_tbl SET i = 3;
+contains:cannot mutate non-writeable table 'materialize.public.source_data_tbl'
+
+! UPDATE t SET i = i + 1 WHERE i IN (SELECT a FROM source_data_mat_view)
+contains:invalid selection
 
 # Verify that multiple inserts can be run in a transaction.
 > BEGIN
@@ -119,7 +158,7 @@ cannot be run inside a transaction block
 > COMMIT
 
 > SELECT * FROM t ORDER BY i
-4 6 xy
+5 6 xy
 <null> <null> <null>
 <null> <null> <null>
 
@@ -128,7 +167,7 @@ cannot be run inside a transaction block
 > CREATE TABLE c (a int);
 > INSERT INTO c VALUES (1);
 
-$ postgres-connect name=txn url=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-connect name=txn url=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 
 # In-flight txns don't affect updates/deletes, and vice versa
 
@@ -217,7 +256,7 @@ DELETE FROM c WHERE a < 3;
 
 # Lateral subqueries cannot access `FROM` table
 ! DELETE FROM t3 USING lateral (SELECT t3.x FROM t1) t4 WHERE true;
-column "t3.x" does not exist
+contains:column "t3.x" does not exist
 
 # ...unless it's explicitly brought into scope
 > DELETE FROM t3 USING lateral (SELECT t3.x FROM t3) t4 WHERE true;

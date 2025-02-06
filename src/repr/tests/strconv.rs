@@ -8,30 +8,33 @@
 // by the Apache License, Version 2.0.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use mz_repr::adt::date::Date;
+use mz_repr::adt::datetime::DateTimeField;
+use mz_repr::adt::interval::Interval;
+use mz_repr::strconv;
 
-use repr::adt::datetime::DateTimeField;
-use repr::adt::interval::Interval;
-use repr::strconv;
-
-#[test]
+#[mz_ore::test]
 fn test_parse_date() {
-    run_test_parse_date("000203", NaiveDate::from_ymd(2000, 2, 3));
-    run_test_parse_date("690203", NaiveDate::from_ymd(2069, 2, 3));
-    run_test_parse_date("700203", NaiveDate::from_ymd(1970, 2, 3));
-    run_test_parse_date("010203", NaiveDate::from_ymd(2001, 2, 3));
-    run_test_parse_date("0010203", NaiveDate::from_ymd(1, 2, 3));
-    run_test_parse_date("00010203", NaiveDate::from_ymd(1, 2, 3));
-    run_test_parse_date("20010203", NaiveDate::from_ymd(2001, 2, 3));
-    run_test_parse_date("99990203", NaiveDate::from_ymd(9999, 2, 3));
-    run_test_parse_date("2001-02-03", NaiveDate::from_ymd(2001, 2, 3));
-    run_test_parse_date("2001 02 03", NaiveDate::from_ymd(2001, 2, 3));
-    run_test_parse_date("2001-02-03 04:05:06.789", NaiveDate::from_ymd(2001, 2, 3));
+    run_test_parse_date("000203", NaiveDate::from_ymd_opt(2000, 2, 3).unwrap());
+    run_test_parse_date("690203", NaiveDate::from_ymd_opt(2069, 2, 3).unwrap());
+    run_test_parse_date("700203", NaiveDate::from_ymd_opt(1970, 2, 3).unwrap());
+    run_test_parse_date("010203", NaiveDate::from_ymd_opt(2001, 2, 3).unwrap());
+    run_test_parse_date("0010203", NaiveDate::from_ymd_opt(1, 2, 3).unwrap());
+    run_test_parse_date("00010203", NaiveDate::from_ymd_opt(1, 2, 3).unwrap());
+    run_test_parse_date("20010203", NaiveDate::from_ymd_opt(2001, 2, 3).unwrap());
+    run_test_parse_date("99990203", NaiveDate::from_ymd_opt(9999, 2, 3).unwrap());
+    run_test_parse_date("2001-02-03", NaiveDate::from_ymd_opt(2001, 2, 3).unwrap());
+    run_test_parse_date("2001 02 03", NaiveDate::from_ymd_opt(2001, 2, 3).unwrap());
+    run_test_parse_date(
+        "2001-02-03 04:05:06.789",
+        NaiveDate::from_ymd_opt(2001, 2, 3).unwrap(),
+    );
     fn run_test_parse_date(s: &str, n: NaiveDate) {
-        assert_eq!(strconv::parse_date(s).unwrap(), n);
+        assert_eq!(NaiveDate::from(strconv::parse_date(s).unwrap()), n);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_date_errors() {
     run_test_parse_date_errors(
         "0000203",
@@ -93,25 +96,31 @@ fn test_parse_date_errors() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_time() {
     run_test_parse_time(
         "01:02:03.456",
-        NaiveTime::from_hms_nano(1, 2, 3, 456_000_000),
+        NaiveTime::from_hms_nano_opt(1, 2, 3, 456_000_000).unwrap(),
     );
-    run_test_parse_time("01:02:03", NaiveTime::from_hms(1, 2, 3));
-    run_test_parse_time("02:03.456", NaiveTime::from_hms_nano(0, 2, 3, 456_000_000));
-    run_test_parse_time("01:02", NaiveTime::from_hms(1, 2, 0));
+    run_test_parse_time("01:02:03", NaiveTime::from_hms_opt(1, 2, 3).unwrap());
+    run_test_parse_time(
+        "02:03.456",
+        NaiveTime::from_hms_nano_opt(0, 2, 3, 456_000_000).unwrap(),
+    );
+    run_test_parse_time("01:02", NaiveTime::from_hms_opt(1, 2, 0).unwrap());
 
-    // Regression for #6272.
-    run_test_parse_time("9::60", NaiveTime::from_hms_nano(9, 0, 59, 1_000_000_000));
+    // Regression for database-issues#1933.
+    run_test_parse_time(
+        "9::60",
+        NaiveTime::from_hms_nano_opt(9, 0, 59, 1_000_000_000).unwrap(),
+    );
 
     fn run_test_parse_time(s: &str, t: NaiveTime) {
         assert_eq!(strconv::parse_time(s).unwrap(), t);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_time_errors() {
     run_test_parse_time_errors(
         "26:01:02.345",
@@ -142,35 +151,55 @@ fn test_parse_time_errors() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_timestamp() {
+    use mz_repr::adt::timestamp::CheckedTimestamp;
+
     run_test_parse_timestamp(
         "2001-02-03 04:05:06.789",
-        NaiveDate::from_ymd(2001, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(2001, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
     );
     run_test_parse_timestamp(
         "2001-02-03",
-        NaiveDate::from_ymd(2001, 2, 3).and_hms(0, 0, 0),
+        NaiveDate::from_ymd_opt(2001, 2, 3)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
     );
     run_test_parse_timestamp(
         "2001-02-03 01:02:03",
-        NaiveDate::from_ymd(2001, 2, 3).and_hms(1, 2, 3),
+        NaiveDate::from_ymd_opt(2001, 2, 3)
+            .unwrap()
+            .and_hms_opt(1, 2, 3)
+            .unwrap(),
     );
     run_test_parse_timestamp(
         "2001-02-03 02:03.456",
-        NaiveDate::from_ymd(2001, 2, 3).and_hms_nano(0, 2, 3, 456_000_000),
+        NaiveDate::from_ymd_opt(2001, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(0, 2, 3, 456_000_000)
+            .unwrap(),
     );
     run_test_parse_timestamp(
         "2001-02-03 01:02",
-        NaiveDate::from_ymd(2001, 2, 3).and_hms(1, 2, 0),
+        NaiveDate::from_ymd_opt(2001, 2, 3)
+            .unwrap()
+            .and_hms_opt(1, 2, 0)
+            .unwrap(),
     );
 
     fn run_test_parse_timestamp(s: &str, ts: NaiveDateTime) {
-        assert_eq!(strconv::parse_timestamp(s).unwrap(), ts);
+        assert_eq!(
+            strconv::parse_timestamp(s).unwrap(),
+            CheckedTimestamp::from_timestamplike(ts).unwrap()
+        );
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_timestamp_errors() {
     run_test_parse_timestamp_errors(
         "2001-01",
@@ -214,8 +243,10 @@ fn test_parse_timestamp_errors() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_timestamptz() {
+    use mz_repr::adt::timestamp::CheckedTimestamp;
+
     #[rustfmt::skip]
     let test_cases = [("1999-01-01 01:23:34.555", 1999, 1, 1, 1, 23, 34, 555_000_000, 0),
         ("1999-01-01 01:23:34.555+0:00", 1999, 1, 1, 1, 23, 34, 555_000_000, 0),
@@ -245,17 +276,19 @@ fn test_parse_timestamptz() {
     for test in test_cases.iter() {
         let actual = strconv::parse_timestamptz(test.0).unwrap();
 
-        let expected = NaiveDate::from_ymd(test.1, test.2, test.3)
-            .and_hms_nano(test.4, test.5, test.6, test.7);
-        let offset = FixedOffset::east(test.8);
+        let expected = NaiveDate::from_ymd_opt(test.1, test.2, test.3)
+            .unwrap()
+            .and_hms_nano_opt(test.4, test.5, test.6, test.7)
+            .unwrap();
+        let offset = FixedOffset::east_opt(test.8).unwrap();
         let dt_fixed_offset = offset.from_local_datetime(&expected).earliest().unwrap();
-        let expected = DateTime::<Utc>::from_utc(dt_fixed_offset.naive_utc(), Utc);
+        let expected = CheckedTimestamp::from_timestamplike(dt_fixed_offset.to_utc()).unwrap();
 
         assert_eq!(actual, expected);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_timestamptz_errors() {
     run_test_parse_timestamptz_errors(
         "1999-01-01 01:23:34.555 +25:45",
@@ -281,7 +314,7 @@ fn test_parse_timestamptz_errors() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_interval_monthlike() {
     run_test_parse_interval_monthlike(
         "2 year",
@@ -318,42 +351,50 @@ fn test_parse_interval_monthlike() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_interval_durationlike() {
     use DateTimeField::*;
 
-    run_test_parse_interval_durationlike("10", Interval::new(0, 10, 0).unwrap());
+    run_test_parse_interval_durationlike("10", Interval::new(0, 0, 10 * 1_000_000));
 
-    run_test_parse_interval_durationlike_from_sql(
-        "10",
-        Day,
-        Interval::new(0, 10 * 24 * 60 * 60, 0).unwrap(),
-    );
+    run_test_parse_interval_durationlike_from_sql("10", Day, Interval::new(0, 10, 0));
 
     run_test_parse_interval_durationlike_from_sql(
         "10",
         Hour,
-        Interval::new(0, 10 * 60 * 60, 0).unwrap(),
+        Interval::new(0, 0, 10 * 60 * 60 * 1_000_000),
     );
 
     run_test_parse_interval_durationlike_from_sql(
         "10",
         Minute,
-        Interval::new(0, 10 * 60, 0).unwrap(),
+        Interval::new(0, 0, 10 * 60 * 1_000_000),
     );
 
-    run_test_parse_interval_durationlike_from_sql("10", Second, Interval::new(0, 10, 0).unwrap());
+    run_test_parse_interval_durationlike_from_sql(
+        "10",
+        Second,
+        Interval::new(0, 0, 10 * 1_000_000),
+    );
 
-    run_test_parse_interval_durationlike("0.01", Interval::new(0, 0, 10_000_000).unwrap());
+    run_test_parse_interval_durationlike("0.01", Interval::new(0, 0, 10_000));
 
     run_test_parse_interval_durationlike(
         "1 2:3:4.5",
-        Interval::new(0, 93_784, 500_000_000).unwrap(),
+        Interval::new(
+            0,
+            1,
+            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
+        ),
     );
 
     run_test_parse_interval_durationlike(
         "-1 2:3:4.5",
-        Interval::new(0, -79_015, -500_000_000).unwrap(),
+        Interval::new(
+            0,
+            -1,
+            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
+        ),
     );
 
     fn run_test_parse_interval_durationlike(s: &str, expected: Interval) {
@@ -365,58 +406,86 @@ fn test_parse_interval_durationlike() {
         d: DateTimeField,
         expected: Interval,
     ) {
-        let actual = strconv::parse_interval_w_disambiguator(s, d).unwrap();
+        let actual = strconv::parse_interval_w_disambiguator(s, None, d).unwrap();
         assert_eq!(actual, expected);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_parse_interval_full() {
     use DateTimeField::*;
 
     run_test_parse_interval_full(
         "6-7 1 2:3:4.5",
-        Interval::new(79, 93_784, 500_000_000).unwrap(),
+        Interval::new(
+            79,
+            1,
+            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
+        ),
     );
 
     run_test_parse_interval_full(
         "-6-7 1 2:3:4.5",
-        Interval::new(-79, 93_784, 500_000_000).unwrap(),
+        Interval::new(
+            -79,
+            1,
+            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
+        ),
     );
 
     run_test_parse_interval_full(
         "6-7 -1 -2:3:4.5",
-        Interval::new(79, -93_784, -500_000_000).unwrap(),
+        Interval::new(
+            79,
+            -1,
+            (-2 * 60 * 60 * 1_000_000) + (-3 * 60 * 1_000_000) + (-4 * 1_000_000) + -500_000,
+        ),
     );
 
     run_test_parse_interval_full(
         "-6-7 -1 -2:3:4.5",
-        Interval::new(-79, -93_784, -500_000_000).unwrap(),
+        Interval::new(
+            -79,
+            -1,
+            (-2 * 60 * 60 * 1_000_000) + (-3 * 60 * 1_000_000) + (-4 * 1_000_000) + -500_000,
+        ),
     );
 
     run_test_parse_interval_full(
         "-6-7 1 -2:3:4.5",
-        Interval::new(-79, 79_015, 500_000_000).unwrap(),
+        Interval::new(
+            -79,
+            1,
+            (-2 * 60 * 60 * 1_000_000) + (-3 * 60 * 1_000_000) + (-4 * 1_000_000) + -500_000,
+        ),
     );
 
     run_test_parse_interval_full(
         "-6-7 -1 2:3:4.5",
-        Interval::new(-79, -79_015, -500_000_000).unwrap(),
+        Interval::new(
+            -79,
+            -1,
+            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
+        ),
     );
 
-    run_test_parse_interval_full_from_sql("-6-7 1", Minute, Interval::new(-79, 60, 0).unwrap());
+    run_test_parse_interval_full_from_sql(
+        "-6-7 1",
+        Minute,
+        Interval::new(-79, 0, 1 * 60 * 1_000_000),
+    );
 
     fn run_test_parse_interval_full(s: &str, expected: Interval) {
         let actual = strconv::parse_interval(s).unwrap();
         assert_eq!(actual, expected);
     }
     fn run_test_parse_interval_full_from_sql(s: &str, d: DateTimeField, expected: Interval) {
-        let actual = strconv::parse_interval_w_disambiguator(s, d).unwrap();
+        let actual = strconv::parse_interval_w_disambiguator(s, None, d).unwrap();
         assert_eq!(actual, expected);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn parse_interval_error() {
     fn run_test_parse_interval_errors(s: &str, e: &str) {
         assert_eq!(
@@ -432,7 +501,7 @@ fn parse_interval_error() {
     );
 }
 
-#[test]
+#[mz_ore::test]
 fn miri_test_format_list() {
     let list = vec![
         Some("a"),
@@ -448,114 +517,172 @@ fn miri_test_format_list() {
     ];
     let mut out = String::new();
     strconv::format_list(&mut out, &list, |lw, el| match el {
-        None => lw.write_null(),
-        Some(el) => strconv::format_string(lw.nonnull_buffer(), el),
-    });
+        None => Ok::<_, ()>(lw.write_null()),
+        Some(el) => Ok(strconv::format_string(lw.nonnull_buffer(), el)),
+    })
+    .unwrap();
     assert_eq!(
         out,
         r#"{a,"a\"b","",NULL,"NULL",nUlL,"  spaces ","a,b","\\","a\\b\"c\\d\""}"#
     );
 }
 
-#[test]
+#[mz_ore::test]
 fn test_format_date() {
-    run_test_format_date(NaiveDate::from_ymd(20000, 2, 3), "20000-02-03");
-    run_test_format_date(NaiveDate::from_ymd(2000, 2, 3), "2000-02-03");
-    run_test_format_date(NaiveDate::from_ymd(200, 2, 3), "0200-02-03");
-    run_test_format_date(NaiveDate::from_ymd(20, 2, 3), "0020-02-03");
-    run_test_format_date(NaiveDate::from_ymd(2, 2, 3), "0002-02-03");
-    run_test_format_date(NaiveDate::from_ymd(0, 2, 3), "0001-02-03 BC");
-    run_test_format_date(NaiveDate::from_ymd(-1, 2, 3), "0002-02-03 BC");
-    run_test_format_date(NaiveDate::from_ymd(-19, 2, 3), "0020-02-03 BC");
-    run_test_format_date(NaiveDate::from_ymd(-199, 2, 3), "0200-02-03 BC");
-    run_test_format_date(NaiveDate::from_ymd(-1999, 2, 3), "2000-02-03 BC");
+    run_test_format_date(NaiveDate::from_ymd_opt(20000, 2, 3).unwrap(), "20000-02-03");
+    run_test_format_date(NaiveDate::from_ymd_opt(2000, 2, 3).unwrap(), "2000-02-03");
+    run_test_format_date(NaiveDate::from_ymd_opt(200, 2, 3).unwrap(), "0200-02-03");
+    run_test_format_date(NaiveDate::from_ymd_opt(20, 2, 3).unwrap(), "0020-02-03");
+    run_test_format_date(NaiveDate::from_ymd_opt(2, 2, 3).unwrap(), "0002-02-03");
+    run_test_format_date(NaiveDate::from_ymd_opt(0, 2, 3).unwrap(), "0001-02-03 BC");
+    run_test_format_date(NaiveDate::from_ymd_opt(-1, 2, 3).unwrap(), "0002-02-03 BC");
+    run_test_format_date(NaiveDate::from_ymd_opt(-19, 2, 3).unwrap(), "0020-02-03 BC");
+    run_test_format_date(
+        NaiveDate::from_ymd_opt(-199, 2, 3).unwrap(),
+        "0200-02-03 BC",
+    );
+    run_test_format_date(
+        NaiveDate::from_ymd_opt(-1999, 2, 3).unwrap(),
+        "2000-02-03 BC",
+    );
 
     fn run_test_format_date(n: NaiveDate, e: &str) {
         let mut buf = String::new();
-        strconv::format_date(&mut buf, n);
+        strconv::format_date(&mut buf, Date::try_from(n).unwrap());
         assert_eq!(buf, e);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_format_timestamp() {
     run_test_format_timestamp(
-        NaiveDate::from_ymd(20000, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(20000, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "20000-02-03 04:05:06",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(2000, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(2000, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "2000-02-03 04:05:06",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(2000, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(2000, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
         "2000-02-03 04:05:06.789",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(200, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(200, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "0200-02-03 04:05:06",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(200, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(200, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
         "0200-02-03 04:05:06.789",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(20, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(20, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "0020-02-03 04:05:06",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(20, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(20, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
         "0020-02-03 04:05:06.789",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(2, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(2, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "0002-02-03 04:05:06",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(2, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(2, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
         "0002-02-03 04:05:06.789",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(0, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(0, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "0001-02-03 04:05:06 BC",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(-1, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(-1, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "0002-02-03 04:05:06 BC",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(-19, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(-19, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "0020-02-03 04:05:06 BC",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(-19, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(-19, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
         "0020-02-03 04:05:06.789 BC",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(-199, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(-199, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "0200-02-03 04:05:06 BC",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(-199, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(-199, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
         "0200-02-03 04:05:06.789 BC",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(-1999, 2, 3).and_hms(4, 5, 6),
+        NaiveDate::from_ymd_opt(-1999, 2, 3)
+            .unwrap()
+            .and_hms_opt(4, 5, 6)
+            .unwrap(),
         "2000-02-03 04:05:06 BC",
     );
     run_test_format_timestamp(
-        NaiveDate::from_ymd(-1999, 2, 3).and_hms_nano(4, 5, 6, 789_000_000),
+        NaiveDate::from_ymd_opt(-1999, 2, 3)
+            .unwrap()
+            .and_hms_nano_opt(4, 5, 6, 789_000_000)
+            .unwrap(),
         "2000-02-03 04:05:06.789 BC",
     );
 
     fn run_test_format_timestamp(n: NaiveDateTime, e: &str) {
         let mut buf = String::new();
-        strconv::format_timestamp(&mut buf, n);
+        strconv::format_timestamp(&mut buf, &n);
         assert_eq!(buf, e);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_format_timestamptz() {
     run_test_format_timestamptz(
         datetime_utc(20000, 2, 3, 4, 5, 6, 0),
@@ -629,15 +756,17 @@ fn test_format_timestamptz() {
         sec: u32,
         nano: u32,
     ) -> DateTime<Utc> {
-        DateTime::from_utc(
-            NaiveDate::from_ymd(year, month, day).and_hms_nano(hour, min, sec, nano),
-            Utc,
+        Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_nano_opt(hour, min, sec, nano)
+                .unwrap(),
         )
     }
 
     fn run_test_format_timestamptz(n: DateTime<Utc>, e: &str) {
         let mut buf = String::new();
-        strconv::format_timestamptz(&mut buf, n);
+        strconv::format_timestamptz(&mut buf, &n);
         assert_eq!(buf, e);
     }
 }

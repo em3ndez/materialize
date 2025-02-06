@@ -1,143 +1,124 @@
-# Project management
+# Project Management
 
-*Last updated February 18, 2020.*
+At Materialize, we have a
+[unified Engineering, Product, Design (EPD) backlog](https://github.com/orgs/MaterializeInc/projects/43).
+The backlog describes all prioritized projects across our EPD teams, including:
+Product Teams, Functional Teams, Product Design, and Analytics. Each roadmap
+item is marked with a priority ("Now," "Next," or "Later") that indicates the
+timeline upon which the item will be picked up, worked on, and eventually
+delivered.
 
-This note addresses a scary subject: project management. The current strategy
-is to impose the bare minimum amount of process to make sure everyone knows what
-to work on next.
+Each project marked "Now" must be owned by a single Directly Responsible
+Individual (DRI). The DRI for a project can be any member of the larger
+EPD team. The DRI is responsible for driving the project to completion,
+and also for keeping the status of the project visible and up to date
+at all times. The DRI for any given project can change over time, as
+long as the handoff is publicly documented.
 
-A problem I've had in other jobs is that the backlog is either non-durable,
-existing only in engineers' minds, or durable but essentially infinite, where no
-matter how many issues you close in a month, the issue list continues to grow.
+The unified EPD backlog is revised by EPD management once a quarter.
+For the most part, projects are picked up and prioritized from the
+existing backlog of issues. In some cases, new projects will be spun
+up to address an urgent and important need that is not already
+represented in the backlog.
 
-Filing copious GitHub issues neatly solves the durability problem, but
-introduces a new problem. Issues are filed for problems big and small, and
-sometimes filed not for problems at all, but for open-ended discussion.
-As soon as the issue list exceeds some small number, like 50 or 100, it becomes
-nearly impossible to keep track of what's important and what's not. How many
-of the open issues are scheduled for the next release? How many of those
-are actual bugs, and how many are just new features? How should I figure out,
-as an engineer, what to work on next?
+The EPD backlog is not set in stone. Although we only holistically
+revise the backlog once a quarter, prioritizations of individual
+projects can and should change as we learn new information. EPD
+management is responsible for ensuring that we are working on the
+right things each week in a recurring review. During this review,
+the priority and staffing of any individual project can be updated.
 
-The following sections detail the elements of our project management process
-that are visible through GitHub.
+The rest of this document describes how individual projects are
+managed at Materialize, broken down into four interconnected phases:
+identification, triage, discovery, and delivery.
 
-## Project Boards
+## Identification
 
-**If you're looking for your next task, start here.**
+Fundamentally, there are two types of issues we create to identify
+potential work: bugs and problems. Bugs report a defect in an
+existing feature. Bugs can be reported by internal team members
+and external users, and should be created in the repository that
+contains the buggy code wherever possible (use a private repository
+if the issue description contains sensitive information that you
+want to record).
 
-We currently use [organization-wide project boards](https://github.com/orgs/MaterializeInc/projects)
-to track prioritized tasks using a kanban style of organization. Tasks flow from
-left to right. The project descriptions should contain more detail. Note that
-you must be a member of the MateralizeInc organization to see the project
-boards.
+Problems, on the other hand, can identify potential improvements
+as well as net-new features. Because of this, they can vary greatly
+in both size and complexity. They can be as small and as scoped as
+adding a simple SQL function to Materialize, or as large and as
+unbounded as making sure that users can sufficiently observe Materialize's
+performance. Both types of problems are important to solve in order to
+ensure the overall success of Materialize as a product.
 
-## Milestones
+By default, all created issues will end up in a Materialize-wide
+backlog. Issues created in our public GitHub repository will be
+visible outside of our team.
 
-As each issue is triaged, we will assign a milestone. A milestone should be
-treated as an upper bound for when the issue should be resolved. Everyone will
-be quite happy if you merge a PR that resolves an issue any time before the date
-of the milestone. We aim to have releases roughly once a week, so your merged
-PRs will go out in the next release. Marketing for new features may wait until
-the milestone.
+## Triage
 
-If a required change is unlikely to merge before the associated milestone,
-please make that clear in a comment in the issue as early as possible.
+The purpose of the Triage phase is to ensure we're working on the
+most urgent and important problems at all times.
 
-## Issue labels
+Newly reported bugs will be triaged most frequently. If the reported
+bug has been assigned a `P0` or `release-blocker` label, it must be
+triaged within 24 hours. All other bugs will be triaged within 5
+business days. The remaining backlog of problem Issues will be triaged
+by EPD management at least once a month.
 
-The last piece of the puzzle is fastidiously assigning labels to issues. The
-scheme is documented in the next section. The idea here is to make it possible
-to ask questions like "are there any outstanding bugs in this release?" or "what
-scheduled SQL features are missing from this release?" without doing a full
-table scan.
+Some problems will be sufficiently straightforward with a clearly
+defined scope, a limited solution space, and limited effects on other
+teams and projects. In these cases, these GitHub Issues can be directly
+assigned to an owner for implementation.
 
-There are presently four classes of GitHub labels:
+Other problems will be less straightforward. Some may require more
+digging or debugging to understand what's going wrong. Some may only
+highlight a symptom of a larger issue with the product, and require
+the Product team to discover the true underlying problem. Some may
+impact the work of other teams or require ongoing stakeholder management.
+In any of these cases, or in any case where a solution does not feel
+simple, problems should be turned into a GitHub Epic.
 
-* **C**ategory labels, like **C-bug**, identify the type of issue. There are
-  four categories: bugs, refactorings, features, and musings.
+Each standalone Issue and Epic will be prioritized and tagged with
+a Milestone: ["Now," "Next," or "Later,"](https://www.notion.so/Product-Planning-and-Prioritization-Guidance-ce7f91bd5e224a71841630c306414700#b745adb7b4604268a93033b38a504aae)
+indicating when work for the project will begin. A DRI must be
+assigned to an Issue or an Epic as it is marked to be worked on
+"Now," moving the project forward to the Discovery phase.
 
-  Bugs, refactorings, and features should be quite familiar: bugs are defects in
-  existing code, refactorings are inelegant or suboptimal pieces of code, and
-  features dictate new code to be written. The line between a bug, a
-  refactoring, and a feature is occasionally blurry. To distinguish, ask
-  yourself, "would we be embarrased to document this issue as a known
-  limitation?" If the answer is yes, it's a bug or refactoring. If the answer is
-  no, it's a feature. To distinguish between bug and refactoring consider
-  whether we believe the current code to be working as intended and the scope
-  of the change. If it is working as extended and the scope is on the larger
-  side, then chances are it's a refactoring. Also, we might occasionally
-  choose to ship a release with an embarrassing bug documented as a known
-  limitation, but this is usually a good litmus test nonetheless.
+## Discovery
 
-  Musings are issues that are intended to start discussion or record some
-  thoughts, rather than serving directly as a work item. Issues are not
-  necessarily the optimal forum for such discussions. You might also want to
-  consider starting a mailing list thread or scheduling an in-person discussion
-  at the next engineering huddle.
+The purpose of the Discovery phase is to sufficiently explore the
+solution space of a problem before committing to a particular solution.
+Design documents are the tool that we use to do this. The DRI is
+responsible for driving the Design Document Process for their project.
 
-* **A**rea labels, like **A-sql**, identify the area of the codebase that a
-  given issue impacts.
+If a project is sufficiently straightforward, the DRI can opt to skip
+the Design Document Process. The DRI will need to write that they're
+skipping this step in the GitHub Epic.
 
-  As mentioned below, the area labels are not intended to be an exact promise of
-  what modules are impacted. They're just meant to guide engineers looking for
-  the next work item in a given region of the code, and to give management
-  a rough sense of how many open bugs/feature requests a given area of the code
-  has.
+Otherwise, the DRI is responsible for researching the solution space,
+proposing potential solutions, and getting signoff from relevant stakeholders.
+This does not mean that the DRI is required to convince everyone of their chosen
+solution — we do not intend to design by committee. If you are the DRI for a
+project and need help identifying your relevant stakeholders, please reach
+out to your manager.
 
-  As a result, area labels are not particularly specific. We'll need to split
-  things up over time (e.g., the "integrations" area will almost certainly
-  evolve to mention specific integrations), but getting too specific too soon
-  increases the burden when filing an issue without much benefit.
+## Delivery
 
-* Theme labels, like **T-performance**, that identify the nature of the work
-  required.
+Once a design has been approved, the DRI can move a project from Discovery
+to Delivery. During Delivery, the DRI is responsible for ushering
+their project through all of the phases of our [Project Lifecycle](./project-lifecycle.md),
+from Internal Development to General Availability.
 
-  Themes cut across categories and areas. For example, performance work might
-  be a bug or a feature, depending upon how bad the current performance is, and
-  can occur in any area.
+It is not required that the DRI personally deliver each piece
+of work attached to a project. The DRI will likely require help from a
+Product Manager, a Product Designer, Engineers, and our testing and GTM
+teams along the way. The DRI is responsible for assigning each piece of
+work attached to a project, and ensuring that progress is moving along
+as expected.
 
-  The intent is to help find projects for an engineer who knows what sort of
-  work they're interested in (e.g., "I want to do some perf hacking; what's
-  available?").
-
-* Automatically generated labels, like **Epic** and **dependencies**. Our
-  external tools insist upon adding these labels, and we don't get control over
-  their text. Typically just ignore these.
-
-* Standard labels, like **good early issue**. GitHub has several of these that
-  come default with new repositories. They don't quite conform to our naming
-  scheme, but it seems worthwhile to keep the default names so that external
-  contributors can more easily find their way around when we make the
-  repository public.
-
-You can see the most up to date list of labels here:
-https://github.com/MaterializeInc/materialize/labels.
-
-When filing an issue, these are the rules to adhere to:
-
-1. Assign exactly *one* category label. Is it a bug, a feature, or a musing?
-
-2. If the category is not "musing," assign at least one area label, or more if
-   the issue touches multiple areas.
-
-   Don't worry about being exact with the area labels. If an issue is 90% a
-   problem with the dataflow layer, but will have some small changes in the
-   SQL layer and the glue layer, feel free to just assign **A-dataflow**.
-
-3. Assign **good first issue** if the issue would make a good starter project
-   for a new employee. You will be soundly thanked for this when the next
-   employee starts!
-
-## Communicating changes
-
-When landing large or substantial changes, we want to make sure users are aware of the work you're doing! This means we require:
-
-- Coordination with a technical writer to generate or update user-facing documentation that will show up on <materialize.com/docs>. If you have questions, open an issue with the `A-docs` tag.
-- Generating release notes by describing your change in `doc/user/release-notes.md`. If there any questions about which version the feature will be released in, consult <materialize.com/docs/versions> or chat with us.
-
-### Changes that require documentation
-
-- All new features
-- All API changes
-- Large bug fixes
+The DRI is also responsible for ensuring that the status of their project
+is up to date and visible at all times. At a minimum, this means including
+the GitHub Epic on their team's GitHub project, marking the Epic with the
+correct lifecycle phase, and proactively calling out any potential blockers.
+Depending on the project, it might be useful to broadcast even more
+information more frequently.

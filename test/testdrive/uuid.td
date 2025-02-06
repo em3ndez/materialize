@@ -7,58 +7,50 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 # This test exercises UUIDs at the boundary (e.g., by sending them
 # through pgwire). Operations on UUIDs are more thoroughly tested in
 # uuid.slt.
 
+
+
 $ set schema={
+    "name": "row",
     "type": "record",
-    "name": "envelope",
     "fields": [
       {
-        "name": "before",
-        "type": [
-          {
-            "name": "row",
-            "type": "record",
-            "fields": [
-              {
-                "name": "u",
-                "type": {
-                  "type": "string",
-                  "logicalType": "uuid"
-                }
-              }
-            ]
-          },
-          "null"
-        ]
-      },
-      { "name": "after", "type": ["row", "null"] }
+        "name": "u",
+        "type": {
+          "type": "string",
+          "logicalType": "uuid"
+        }
+      }
     ]
   }
 
 $ kafka-create-topic topic=data
 
-$ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"row":{"u": "16fd95b0-65b7-4249-9b66-1547cd95923d"}}}
-{"before": null, "after": {"row":{"u": "b141698b-fb7f-492d-bc8a-0d159641c7a3"}}}
+$ kafka-ingest format=avro topic=data schema=${schema}
+{"u": "16fd95b0-65b7-4249-9b66-1547cd95923d"}
+{"u": "b141698b-fb7f-492d-bc8a-0d159641c7a3"}
 
-$ kafka-ingest format=avro topic=data schema=${schema} timestamp=10
-{"before": null, "after": null}
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
-> CREATE SOURCE data FROM
-  KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
+> CREATE SOURCE data
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
 
-> CREATE MATERIALIZED VIEW data_view as SELECT * from data
+> CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-data-${testdrive.seed}")
+  FORMAT AVRO USING SCHEMA '${schema}'
 
-> SHOW COLUMNS FROM data_view
-name   nullable  type
----------------------
-u      false     uuid
+> SHOW COLUMNS FROM data_tbl
+name   nullable  type  comment
+------------------------------
+u      false     uuid  ""
 
-> SELECT * FROM data_view
+> SELECT * FROM data_tbl
 "16fd95b0-65b7-4249-9b66-1547cd95923d"
 "b141698b-fb7f-492d-bc8a-0d159641c7a3"
 
@@ -68,9 +60,17 @@ u      false     uuid
 > SELECT '85907cb9-ac9b-4e35-84b8-60dc69368aca'::uuid::text
 "85907cb9-ac9b-4e35-84b8-60dc69368aca"
 
-> CREATE SINK uuid_sink_${testdrive.seed} FROM data_view
-  INTO AVRO OCF '${testdrive.temp-dir}/uuid-sink.ocf'
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
 
-$ avro-ocf-verify sink=materialize.public.uuid_sink_${testdrive.seed}
+> CREATE SINK uuid_sink_${testdrive.seed}
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM data_tbl
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-sink-data-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+
+$ kafka-verify-data format=avro sort-messages=true sink=materialize.public.uuid_sink_${testdrive.seed}
 {"before": null, "after": {"row":{"u": "16fd95b0-65b7-4249-9b66-1547cd95923d"}}}
 {"before": null, "after": {"row":{"u": "b141698b-fb7f-492d-bc8a-0d159641c7a3"}}}

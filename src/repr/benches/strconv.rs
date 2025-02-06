@@ -8,11 +8,10 @@
 // by the Apache License, Version 2.0.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use mz_repr::strconv;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-
-use repr::strconv;
 
 fn bench_parse_float32(c: &mut Criterion) {
     for s in &["-3.0", "9.7", "NaN", "inFiNiTy"] {
@@ -44,8 +43,9 @@ fn bench_format_list_simple(c: &mut Criterion) {
         b.iter(|| {
             let mut buf = String::new();
             strconv::format_list(&mut buf, black_box(&list), |lw, i| {
-                strconv::format_int32(lw.nonnull_buffer(), *i)
+                Ok::<_, ()>(strconv::format_int32(lw.nonnull_buffer(), *i))
             })
+            .unwrap()
         })
     });
 }
@@ -77,10 +77,11 @@ fn bench_format_list_nested(c: &mut Criterion) {
             strconv::format_list(&mut buf, black_box(&list), |lw, list| {
                 strconv::format_list(lw.nonnull_buffer(), list, |lw, list| {
                     strconv::format_list(lw.nonnull_buffer(), list, |lw, s| {
-                        strconv::format_string(lw.nonnull_buffer(), s)
+                        Ok::<_, ()>(strconv::format_string(lw.nonnull_buffer(), s))
                     })
                 })
-            });
+            })
+            .unwrap();
         })
     });
 }

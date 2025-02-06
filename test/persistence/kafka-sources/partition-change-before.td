@@ -29,19 +29,26 @@ $ set schema={
 
 $ kafka-create-topic topic=partition-change partitions=5
 
-$ kafka-ingest format=avro topic=partition-change key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=10000
+$ kafka-ingest format=avro topic=partition-change key-format=avro key-schema=${keyschema} schema=${schema} repeat=10000
 {"f1": ${kafka-ingest.iteration}} {"f2": ${kafka-ingest.iteration}}
 
-> CREATE MATERIALIZED SOURCE partition_change
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-partition-change-${testdrive.seed}'
-  WITH(topic_metadata_refresh_interval_ms=100)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE CONNECTION IF NOT EXISTS kafka_conn TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
+> CREATE SOURCE partition_change
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-partition-change-${testdrive.seed}')
+
+> CREATE TABLE partition_change_tbl FROM SOURCE partition_change (REFERENCE "testdrive-partition-change-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE UPSERT
 
-> SELECT COUNT(*) > 0 FROM partition_change;
+> SELECT COUNT(*) > 0 FROM partition_change_tbl;
 true
 
 $ kafka-add-partitions topic=partition-change total-partitions=10
 
-$ kafka-ingest format=avro topic=partition-change key-format=avro key-schema=${keyschema} schema=${schema} publish=true repeat=1000
+$ kafka-ingest format=avro topic=partition-change key-format=avro key-schema=${keyschema} schema=${schema} repeat=1000
 {"f1": ${kafka-ingest.iteration}} {"f2": ${kafka-ingest.iteration}}

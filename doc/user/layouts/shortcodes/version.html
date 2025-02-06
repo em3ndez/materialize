@@ -1,1 +1,5 @@
-{{ (index $.Site.Params.versions 0).name -}}
+{{- $releasesPage := (index (where $.Site.Sections "Title" "Releases") 0) -}}
+{{- $publishedReleases := (where $releasesPage.Pages "Params.released" true) -}}
+{{- $latestPublishedRelease := (index $publishedReleases.ByDate.Reverse 0) -}}
+{{- $patch := default 0 $latestPublishedRelease.Params.patch -}}
+{{- $latestPublishedRelease.File.ContentBaseName -}}.{{- $patch -}}

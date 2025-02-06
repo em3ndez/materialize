@@ -14,7 +14,7 @@ user documentation, if you haven't already:
 
   1. [Get Started](https://materialize.com/docs/get-started/)
   2. [What Is Materialized?](https://materialize.com/docs/overview/what-is-materialize/)
-  3. [Architecture Overview](https://materialize.com/docs/overview/architecture/)
+  3. [Architecture Overview](https://materialize.com/blog/materialize-architecture/)
 
 Then, once you're up to speed, dive into the [developer guide](guide.md). The
 guide is intended to be skimmed from start to finish, to give you the lay of the
@@ -25,11 +25,14 @@ land, and then browsed as reference material as you skill up on the codebase.
 * [change-data-capture.md](change-data-capture.md) describes our change data
   capture (CDC) requirements.
 
+* [ci-regexp.md](ci-regexp.md) describes how to mark a CI issue with a regular
+  expression to ignore it in future CI runs.
+
+* [code-coverage.md](code-coverage.md) explains the system we have in place in
+  CI for code coverage of pull requests.
+
 * [debugging.md](debugging.md) is a guide to debugging Materialize using
   rust-gdb / rust-lldb.
-
-* [demos.md](demos.md) explains the two tiers of demos in this codebase and
-  how to add a new one.
 
 * Our diagnostics guide is a work in progress. The sections we have so far are
   themselves works in progress. Feel free to add to them if you think up of
@@ -42,6 +45,8 @@ land, and then browsed as reference material as you skill up on the codebase.
 
 * [fast-compiles.md](fast-compiles.md) describes various tricks for speeding
   up Rust compilation.
+
+* [feature-lifecycle.md](feature-lifecycle.md) outlines how we ship features.
 
 * [guide.md](guide.md) walks you through hacking on this codebase and our
   development philosophy.
@@ -57,16 +62,19 @@ land, and then browsed as reference material as you skill up on the codebase.
 * [mzbuild.md](mzbuild.md) describes the custom build system we use to manage
   our Docker images and Docker Compose configurations.
 
-* [project-management.md](project-management.md) attempts to describe our
-  current process for managing GitHub issues and milestones. Note that while all
-  of these docs are subject to change, this one is _especially_ subject to
-  change.
+* [project-management.md](project-management.md) describes our processes for
+  organizing, prioritizing, and shipping projects.
 
-* [setup-mysql-debezium.md](setup-mysql-debezium.md) describes how to use
-  Materialize as a fast read replica for a MySQL database.
+* [publishing.md](publishing.md) details how to publish packages, like Rust
+  crates or Docker images.
 
-* [setup-postgres-debezium.md](setup-postgres-debezium.md) describes how to use
-  Materialize as a fast read replica for a PostgreSQL database.
+* [reading.md](reading.md) contains a reading list.
 
 * [sqllogictest.md](sqllogictest.md) contains detailed information about
   our SQL logic testing framework.
+
+* [tracing.md](tracing.md) explains what tracing is, why we do it, and what
+  our best practices are
+
+* We have basic introductions for developers for various parts of the system:
+  * [Query Compilation 101](101-query-compilation.md) (for members of the optimizer team).

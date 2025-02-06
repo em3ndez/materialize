@@ -41,6 +41,9 @@ your latest changes. You can also run a command other than Bash directly:
 $ bin/ci-builder run stable echo "hello from abroad"
 ```
 
+You can specify the parameter `--detach` to start a detached Docker container.
+You can assign a name to the container using the parameter `--name`.
+
 When you're happy with your changes, open a PR. CI will build and push the
 image to Docker Hub so that no one else needs to build the image from scratch.
 
@@ -65,13 +68,18 @@ shared volumes, those files will be owned by root *on your host machine*.
 
 ## Upgrading the Rust version
 
-1. Update the [rust-toolchain.toml] file with the desired version.
+1. Update the workspace [Cargo.toml] file with the desired version.
+2. Update your local stable Rust installation so that it can build with the new minimum version:
 
-2. Run `bin/check` and `bin/lint` to see if there are any new Clippy lints or
-   rustfmt style adjustments in this release. If so, fix them.
+   ```
+   rustup update
+   ```
 
-3. (optional) [Rebuild the image](#modifying-the-image)
-4. Commit all outstanding changes and open a PR.
+3. Run `cargo clippy --all-targets` and `bin/lint` to see if there are any new
+   Clippy lints or rustfmt style adjustments in this release. If so, fix them.
+
+4. (optional) [Rebuild the image](#modifying-the-image)
+5. Commit all outstanding changes and open a PR.
 
 You may also need to upgrade the nightly version of the image, if it has become
 sufficiently out-of-date that it can no longer compile our codebase. That
@@ -84,5 +92,4 @@ or miri. If that happens, you'll get a somewhat cryptic error message, like
 the required components using the [component history tracker][rust-toolstate].
 
 [bin/ci-builder]: /bin/ci-builder
-[rust-toolchain.toml]: /rust-toolchain.toml
 [rust-toolstate]: https://rust-lang.github.io/rustup-components-history/

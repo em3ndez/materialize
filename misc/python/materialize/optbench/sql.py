@@ -9,14 +9,20 @@
 
 import logging
 import re
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, cast
 
 import numpy as np
-import pg8000
+import psycopg
 import sqlparse
 
 from . import Scenario, util
+
+
+class Dialect(Enum):
+    PG = 0
+    MZ = 1
 
 
 class Query:
@@ -35,9 +41,19 @@ class Query:
         m = re.search(p, self.query, re.MULTILINE)
         return m.group("name") if m else "anonoymous"
 
-    def explain(self, timing: bool) -> str:
-        """Prepends 'EXPLAIN (TIMING {timing}) PLAN FOR' to the query."""
-        return "\n".join([f"EXPLAIN (TIMING {bool(timing)}) PLAN FOR", self.query])
+    def explain(self, timing: bool, dialect: Dialect = Dialect.MZ) -> str:
+        """Prepends 'EXPLAIN ...' to the query respecting the given dialect."""
+
+        if dialect == Dialect.PG:
+            if timing:
+                return "\n".join(["EXPLAIN (ANALYZE, TIMING TRUE)", self.query])
+            else:
+                return "\n".join(["EXPLAIN", self.query])
+        else:
+            if timing:
+                return "\n".join(["EXPLAIN WITH(timing)", self.query])
+            else:
+                return "\n".join(["EXPLAIN", self.query])
 
 
 class ExplainOutput:
@@ -49,17 +65,11 @@ class ExplainOutput:
     def __str__(self) -> str:
         return self.output
 
-    def decorrelation_time(self) -> Optional[np.timedelta64]:
-        """Optionally, returns the decorrelation_time for an 'EXPLAIN (TIMING true)' output."""
-        p = r"Decorrelation time\: (?P<time>[0-9]{2}\:[0-9]{2}\:[0-9]{2}\.[0-9]+)"
+    def optimization_time(self) -> np.timedelta64 | None:
+        """Optionally, returns the optimization_time time for an 'EXPLAIN' output."""
+        p = r"(Optimization time|Planning Time)\: (?P<time>[0-9]+(\.[0-9]+)?\s?\S+)"
         m = re.search(p, self.output, re.MULTILINE)
-        return util.str_to_ns(m.group("time")) if m else None
-
-    def optimization_time(self) -> Optional[np.timedelta64]:
-        """Optionally, returns the optimization_time time for an 'EXPLAIN (TIMING true)' output."""
-        p = r"Optimization time\: (?P<time>[0-9]{2}\:[0-9]{2}\:[0-9]{2}\.[0-9]+)"
-        m = re.search(p, self.output, re.MULTILINE)
-        return util.str_to_ns(m.group("time")) if m else None
+        return util.duration_to_timedelta(m["time"]) if m else None
 
 
 class Database:
@@ -70,13 +80,36 @@ class Database:
         port: int,
         host: str,
         user: str,
+        password: str | None,
+        database: str | None,
+        require_ssl: bool,
     ) -> None:
         logging.debug(f"Initialize Database with host={host} port={port}, user={user}")
-        self.conn = pg8000.connect(host=host, port=port, user=user)
 
-    def mz_version(self) -> str:
-        result = self.query_one("SELECT mz_version()")
+        self.conn = psycopg.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            dbname=database,
+            sslmode="require" if require_ssl else "disable",
+        )
+        self.conn.autocommit = True
+        self.dialect = Dialect.MZ if "Materialize" in self.version() else Dialect.PG
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def version(self) -> str:
+        result = self.query_one("SELECT version()")
         return cast(str, result[0])
+
+    def mz_version(self) -> str | None:
+        if self.dialect == Dialect.MZ:
+            result = self.query_one("SELECT mz_version()")
+            return cast(str, result[0])
+        else:
+            return None
 
     def drop_database(self, scenario: Scenario) -> None:
         logging.debug(f'Drop database "{scenario}"')
@@ -86,38 +119,34 @@ class Database:
         logging.debug(f'Create database "{scenario}"')
         self.execute(f"CREATE DATABASE {scenario}")
 
-    def set_database(self, scenario: Scenario) -> None:
-        logging.debug(f'Set default database to "{scenario}"')
-        self.execute(f"SET DATABASE = {scenario}")
-
     def explain(self, query: Query, timing: bool) -> "ExplainOutput":
-        result = self.query_one(query.explain(timing))
-        return ExplainOutput(result[0])
+        result = self.query_all(query.explain(timing, self.dialect))
+        return ExplainOutput("\n".join([col for line in result for col in line]))
 
     def execute(self, statement: str) -> None:
         with self.conn.cursor() as cursor:
-            cursor.execute(statement)
+            cursor.execute(statement.encode())
 
-    def execute_all(self, statements: List[str]) -> None:
+    def execute_all(self, statements: list[str]) -> None:
         with self.conn.cursor() as cursor:
             for statement in statements:
-                cursor.execute(statement)
+                cursor.execute(statement.encode())
 
-    def query_one(self, query: str) -> Dict[Any, Any]:
+    def query_one(self, query: str) -> dict[Any, Any]:
         with self.conn.cursor() as cursor:
-            cursor.execute(query)
-            return cast(Dict[Any, Any], cursor.fetchone())
+            cursor.execute(query.encode())
+            return cast(dict[Any, Any], cursor.fetchone())
 
-    def query_all(self, query: str) -> Dict[Any, Any]:
+    def query_all(self, query: str) -> dict[Any, Any]:
         with self.conn.cursor() as cursor:
-            cursor.execute(query)
-            return cast(Dict[Any, Any], cursor.fetchall())
+            cursor.execute(query.encode())
+            return cast(dict[Any, Any], cursor.fetchall())
 
 
 # Utility functions
 # -----------------
 
 
-def parse_from_file(path: Path) -> List[str]:
+def parse_from_file(path: Path) -> list[str]:
     """Parses a *.sql file to a list of queries."""
     return sqlparse.split(path.read_text())

@@ -12,20 +12,21 @@
 mode cockroach
 
 # Two columns here represent a validity interval [a, b].
+# These values must be castable to mz_timestamp, otherwise the BETWEEN will error.
 statement ok
-CREATE VIEW intervals (a, b) AS VALUES (1, 10), (1, 2), (2, 13), (3, 1), (-3, 10), (5, 18446744073709551616)
+CREATE VIEW intervals (a, b) AS VALUES (1, 10), (1, 2), (2, 13), (3, 1), (0, 10), (5, 18446744073709551614)
 
 # Select out rows when each are valid.
 statement ok
 CREATE MATERIALIZED VIEW valid AS
 SELECT *
 FROM intervals
-WHERE mz_logical_timestamp() BETWEEN a AND b;
+WHERE mz_now() BETWEEN a AND b;
 
 query II rowsort
 select * from valid AS OF 2;
 ----
--3  10
+0  10
 1  10
 1  2
 2  13
@@ -33,7 +34,7 @@ select * from valid AS OF 2;
 query II rowsort
 select * from valid AS OF 3;
 ----
--3  10
+0  10
 1  10
 2  13
 
@@ -41,22 +42,37 @@ query II rowsort
 select * from valid AS OF 11;
 ----
 2  13
-5  18446744073709551616
+5  18446744073709551614
 
 query II rowsort
 select * from valid AS OF 14;
 ----
-5  18446744073709551616
+5  18446744073709551614
 
 # Test that rows are not dropped just before the end of time.
 # That big number there should be u64::MAX.
 query II rowsort
-select * from valid AS OF 18446744073709551615;
+select * from valid AS OF 18446744073709551614;
 ----
-5  18446744073709551616
+5  18446744073709551614
+
+
+# We don't currently support specifying the max timestamp due to a limitation in linear.rs and the step_mz_timestamp internal function.
+# That big number there should be u64::MAX.
+statement ok
+CREATE VIEW intervals_max (a, b) AS VALUES (0, 18446744073709551615)
+
+statement ok
+CREATE MATERIALIZED VIEW valid_max AS
+SELECT *
+FROM intervals_max
+WHERE mz_now() BETWEEN a AND b
+
+query error step mz_timestamp overflow
+select * from valid_max AS OF 0
 
 #
-# Regression test for #6635
+# Regression test for database-issues#2066
 #
 statement ok
 CREATE TABLE events (
@@ -69,11 +85,149 @@ statement ok
 CREATE MATERIALIZED VIEW valid_events AS
 SELECT content, count(*)
 FROM events
-WHERE mz_logical_timestamp() >= insert_ts
-  AND mz_logical_timestamp()  < delete_ts
+WHERE mz_now() >= insert_ts
+  AND mz_now()  < delete_ts
 GROUP BY content;
 
 
 query TI rowsort
 select * from valid_events;
 ----
+
+statement error mz_logical_timestamp\(\) has been renamed to mz_now\(\)
+CREATE VIEW mlt AS SELECT 1 WHERE mz_logical_timestamp() = 0;
+
+# Regression test for view visitation order.
+
+statement ok
+CREATE SCHEMA dev_fy2023;
+
+statement ok
+CREATE SCHEMA dev_warm;
+
+statement ok
+CREATE SCHEMA dev;
+
+statement ok
+CREATE VIEW dev.mock_data_days AS
+    WITH
+        days AS (
+            SELECT generate_series(
+                CAST('2023-12-01 11:00:00' AS timestamp),
+                CAST('2024-01-06' AS timestamp),
+                CAST('1 day' AS interval)
+            ) AS "day"
+            UNION ALL
+            SELECT generate_series(
+                CAST('10000-12-01 11:00:00' AS timestamp),
+                CAST('10001-01-01' AS timestamp),
+                CAST('1 day' AS interval)
+            ) AS "day"
+        )
+    SELECT
+        "day" AS ts,
+        datediff('hour', CAST('2020-01-01' AS timestamp), "day") AS id
+    FROM days;
+
+statement ok
+CREATE VIEW dev_warm.stg_data_days AS
+    SELECT *
+    FROM dev.mock_data_days
+    WHERE
+        TIMESTAMP '2024-12-21' <= date_trunc('year', ts + CAST('1 year' AS interval)) AND
+        ts + CAST('7 days' AS interval) - CAST('1 month' AS interval) < TIMESTAMP '2024-12-21';
+
+statement ok
+CREATE VIEW dev_warm.count_by_day AS
+    SELECT
+        date_trunc('day', ts) AS "day",
+        count(*) AS cnt
+    FROM dev_warm.stg_data_days
+    GROUP BY 1
+    HAVING
+        NOT (TIMESTAMP '2024-12-21' <= date_trunc('day', ts) + CAST('7 days' AS interval)) AND
+        TIMESTAMP '2024-12-21' <= date_trunc('year', date_trunc('day', ts) + CAST('1 year' AS interval));
+
+statement ok
+CREATE VIEW dev_fy2023.stg_data_days AS
+    SELECT *
+    FROM dev.mock_data_days
+    WHERE
+        CAST('2023-01-01' AS timestamp) <= ts AND
+        ts - CAST('1 month' AS interval) < CAST('2024-01-01' AS timestamp) AND
+        ts - CAST('0 month' AS interval) < CAST('2025-01-01' AS timestamp);
+
+statement ok
+CREATE VIEW dev_fy2023.count_by_day AS
+    SELECT
+        date_trunc('day', ts) AS "day",
+        count(*) AS cnt
+    FROM dev_fy2023.stg_data_days
+    GROUP BY 1
+    HAVING
+        NOT (CAST('2024-01-01' AS timestamp) <= date_trunc('day', ts)) AND
+        CAST('2023-01-01' AS timestamp) <= date_trunc('day', ts);
+
+query TIT
+SELECT *, 'fy2023' AS origin FROM dev_fy2023.count_by_day
+UNION ALL
+SELECT *, 'warm' AS origin FROM dev_warm.count_by_day
+ORDER BY day DESC;
+----
+2024-01-05␠00:00:00  1  warm
+2024-01-04␠00:00:00  1  warm
+2024-01-03␠00:00:00  1  warm
+2024-01-02␠00:00:00  1  warm
+2024-01-01␠00:00:00  1  warm
+2023-12-31␠00:00:00  1  fy2023
+2023-12-30␠00:00:00  1  fy2023
+2023-12-29␠00:00:00  1  fy2023
+2023-12-28␠00:00:00  1  fy2023
+2023-12-27␠00:00:00  1  fy2023
+2023-12-26␠00:00:00  1  fy2023
+2023-12-25␠00:00:00  1  fy2023
+2023-12-24␠00:00:00  1  fy2023
+2023-12-23␠00:00:00  1  fy2023
+2023-12-22␠00:00:00  1  fy2023
+2023-12-21␠00:00:00  1  fy2023
+2023-12-20␠00:00:00  1  fy2023
+2023-12-19␠00:00:00  1  fy2023
+2023-12-18␠00:00:00  1  fy2023
+2023-12-17␠00:00:00  1  fy2023
+2023-12-16␠00:00:00  1  fy2023
+2023-12-15␠00:00:00  1  fy2023
+2023-12-14␠00:00:00  1  fy2023
+2023-12-13␠00:00:00  1  fy2023
+2023-12-12␠00:00:00  1  fy2023
+2023-12-11␠00:00:00  1  fy2023
+2023-12-10␠00:00:00  1  fy2023
+2023-12-09␠00:00:00  1  fy2023
+2023-12-08␠00:00:00  1  fy2023
+2023-12-07␠00:00:00  1  fy2023
+2023-12-06␠00:00:00  1  fy2023
+2023-12-05␠00:00:00  1  fy2023
+2023-12-04␠00:00:00  1  fy2023
+2023-12-03␠00:00:00  1  fy2023
+2023-12-02␠00:00:00  1  fy2023
+2023-12-01␠00:00:00  1  fy2023
+
+# Constant queries should have a timestamp near the current time (instead of, e.g., u64::MAX)
+query B
+select mz_now() < '3000-01-01';
+----
+true
+
+# Regression test for https://github.com/MaterializeInc/database-issues/issues/7560
+query B
+with v as (select mz_now() < '3000-01-01') select * from v;
+----
+true
+
+# Make sure that we find temporal expressions also in referenced views.
+statement ok
+create view v as select mz_now() as x;
+
+query B
+select x < '3000-01-01' from v;
+----
+true

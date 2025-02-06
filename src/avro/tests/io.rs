@@ -25,42 +25,72 @@
 
 use std::io::Cursor;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
-use chrono::{NaiveDate, NaiveDateTime};
-use lazy_static::lazy_static;
+use chrono::{DateTime, NaiveDate};
+use mz_avro::error::Error as AvroError;
 use mz_avro::schema::resolve_schemas;
-use mz_avro::types::AvroMap;
-use mz_avro::{
-    error::Error as AvroError,
-    from_avro_datum, to_avro_datum,
-    types::{DecimalValue, Value},
-    Schema, ValidationError,
-};
+use mz_avro::types::{DecimalValue, Value};
+use mz_avro::{from_avro_datum, to_avro_datum, Schema, ValidationError};
+use mz_ore::assert_err;
 
-lazy_static! {
-    static ref SCHEMAS_TO_VALIDATE: Vec<(&'static str, Value)> = vec![
+static SCHEMAS_TO_VALIDATE: LazyLock<Vec<(&'static str, Value)>> = LazyLock::new(|| {
+    vec![
         (r#""null""#, Value::Null),
         (r#""boolean""#, Value::Boolean(true)),
-        (r#""string""#, Value::String("adsfasdf09809dsf-=adsf".to_string())),
-        (r#""bytes""#, Value::Bytes("12345abcd".to_string().into_bytes())),
+        (
+            r#""string""#,
+            Value::String("adsfasdf09809dsf-=adsf".to_string()),
+        ),
+        (
+            r#""bytes""#,
+            Value::Bytes("12345abcd".to_string().into_bytes()),
+        ),
         (r#""int""#, Value::Int(1234)),
         (r#""long""#, Value::Long(1234)),
         (r#""float""#, Value::Float(1234.0)),
         (r#""double""#, Value::Double(1234.0)),
-        (r#"{"type": "fixed", "name": "Test", "size": 1}"#, Value::Fixed(1, vec![b'B'])),
-        (r#"{"type": "enum", "name": "Test", "symbols": ["A", "B"]}"#, Value::Enum(1, "B".to_string())),
-        (r#"{"type": "array", "items": "long"}"#, Value::Array(vec![Value::Long(1), Value::Long(3), Value::Long(2)])),
-        (r#"{"type": "map", "values": "long"}"#, Value::Map(AvroMap([("a".to_string(), Value::Long(1i64)), ("b".to_string(), Value::Long(3i64)), ("c".to_string(), Value::Long(2i64))].iter().cloned().collect()))),
-        (r#"["string", "null", "long"]"#, Value::Union{
-            index: 1,
-            inner: Box::new(Value::Null),
-            n_variants:3,
-            null_variant:Some(1)
-        }),
-        (r#"{"type": "record", "name": "Test", "fields": [{"name": "f", "type": "long"}]}"#, Value::Record(vec![("f".to_string(), Value::Long(1))]))
-    ];
+        (
+            r#"{"type": "fixed", "name": "Test", "size": 1}"#,
+            Value::Fixed(1, vec![b'B']),
+        ),
+        (
+            r#"{"type": "enum", "name": "Test", "symbols": ["A", "B"]}"#,
+            Value::Enum(1, "B".to_string()),
+        ),
+        (
+            r#"{"type": "array", "items": "long"}"#,
+            Value::Array(vec![Value::Long(1), Value::Long(3), Value::Long(2)]),
+        ),
+        (
+            r#"{"type": "map", "values": "long"}"#,
+            Value::Map(
+                [
+                    ("a".to_string(), Value::Long(1i64)),
+                    ("b".to_string(), Value::Long(3i64)),
+                    ("c".to_string(), Value::Long(2i64)),
+                ]
+                .into(),
+            ),
+        ),
+        (
+            r#"["string", "null", "long"]"#,
+            Value::Union {
+                index: 1,
+                inner: Box::new(Value::Null),
+                n_variants: 3,
+                null_variant: Some(1),
+            },
+        ),
+        (
+            r#"{"type": "record", "name": "Test", "fields": [{"name": "f", "type": "long"}]}"#,
+            Value::Record(vec![("f".to_string(), Value::Long(1))]),
+        ),
+    ]
+});
 
-    static ref BINARY_ENCODINGS: Vec<(i64, Vec<u8>)> = vec![
+static BINARY_ENCODINGS: LazyLock<Vec<(i64, Vec<u8>)>> = LazyLock::new(|| {
+    vec![
         (0, vec![0x00]),
         (-1, vec![0x01]),
         (1, vec![0x02]),
@@ -70,26 +100,50 @@ lazy_static! {
         (64, vec![0x80, 0x01]),
         (8192, vec![0x80, 0x80, 0x01]),
         (-8193, vec![0x81, 0x80, 0x01]),
-    ];
+    ]
+});
 
-    static ref DEFAULT_VALUE_EXAMPLES: Vec<(&'static str, &'static str, Value)> = vec![
-        (r#""null""#, "null", Value::Null),
-        (r#""boolean""#, "true", Value::Boolean(true)),
-        (r#""string""#, r#""foo""#, Value::String("foo".to_string())),
-        //(r#""bytes""#, r#""\u00FF\u00FF""#, Value::Bytes(vec![0xff, 0xff])),
-        (r#""int""#, "5", Value::Int(5)),
-        (r#""long""#, "5", Value::Long(5)),
-        (r#""float""#, "1.1", Value::Float(1.1)),
-        (r#""double""#, "1.1", Value::Double(1.1)),
-        //(r#"{"type": "fixed", "name": "F", "size": 2}"#, r#""\u00FF\u00FF""#, Value::Bytes(vec![0xff, 0xff])),
-        //(r#"{"type": "enum", "name": "F", "symbols": ["FOO", "BAR"]}"#, r#""FOO""#, Value::Enum(0, "FOO".to_string())),
-        (r#"{"type": "array", "items": "int"}"#, "[1, 2, 3]", Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])),
-        (r#"{"type": "map", "values": "int"}"#, r#"{"a": 1, "b": 2}"#, Value::Map(AvroMap([("a".to_string(), Value::Int(1)), ("b".to_string(), Value::Int(2))].iter().cloned().collect()))),
-        //(r#"["int", "null"]"#, "5", Value::Union(Box::new(Value::Int(5)))),
-        (r#"{"type": "record", "name": "F", "fields": [{"name": "A", "type": "int"}]}"#, r#"{"A": 5}"#,Value::Record(vec![("A".to_string(), Value::Int(5))])),
-    ];
+static DEFAULT_VALUE_EXAMPLES: LazyLock<Vec<(&'static str, &'static str, Value)>> =
+    LazyLock::new(|| {
+        vec![
+            (r#""null""#, "null", Value::Null),
+            (r#""boolean""#, "true", Value::Boolean(true)),
+            (r#""string""#, r#""foo""#, Value::String("foo".to_string())),
+            //(r#""bytes""#, r#""\u00FF\u00FF""#, Value::Bytes(vec![0xff, 0xff])),
+            (r#""int""#, "5", Value::Int(5)),
+            (r#""long""#, "5", Value::Long(5)),
+            (r#""float""#, "1.1", Value::Float(1.1)),
+            (r#""double""#, "1.1", Value::Double(1.1)),
+            //(r#"{"type": "fixed", "name": "F", "size": 2}"#, r#""\u00FF\u00FF""#, Value::Bytes(vec![0xff, 0xff])),
+            //(r#"{"type": "enum", "name": "F", "symbols": ["FOO", "BAR"]}"#, r#""FOO""#, Value::Enum(0, "FOO".to_string())),
+            (
+                r#"{"type": "array", "items": "int"}"#,
+                "[1, 2, 3]",
+                Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ),
+            (
+                r#"{"type": "map", "values": "int"}"#,
+                r#"{"a": 1, "b": 2}"#,
+                Value::Map(
+                    [
+                        ("a".to_string(), Value::Int(1)),
+                        ("b".to_string(), Value::Int(2)),
+                    ]
+                    .into(),
+                ),
+            ),
+            //(r#"["int", "null"]"#, "5", Value::Union(Box::new(Value::Int(5)))),
+            (
+                r#"{"type": "record", "name": "F", "fields": [{"name": "A", "type": "int"}]}"#,
+                r#"{"A": 5}"#,
+                Value::Record(vec![("A".to_string(), Value::Int(5))]),
+            ),
+        ]
+    });
 
-    static ref LONG_RECORD_SCHEMA: Schema = Schema::from_str(r#"
+static LONG_RECORD_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::from_str(
+        r#"
     {
         "type": "record",
         "name": "Test",
@@ -103,9 +157,13 @@ lazy_static! {
             {"name": "G", "type": "int"}
         ]
     }
-    "#).unwrap();
+    "#,
+    )
+    .unwrap()
+});
 
-    static ref LONG_RECORD_DATUM: Value = Value::Record(vec![
+static LONG_RECORD_DATUM: LazyLock<Value> = LazyLock::new(|| {
+    Value::Record(vec![
         ("A".to_string(), Value::Int(1)),
         ("B".to_string(), Value::Int(2)),
         ("C".to_string(), Value::Int(3)),
@@ -113,10 +171,10 @@ lazy_static! {
         ("E".to_string(), Value::Int(5)),
         ("F".to_string(), Value::Int(6)),
         ("G".to_string(), Value::Int(7)),
-    ]);
-}
+    ])
+});
 
-#[test]
+#[mz_ore::test]
 fn test_validate() {
     for (raw_schema, value) in SCHEMAS_TO_VALIDATE.iter() {
         let schema = Schema::from_str(raw_schema).unwrap();
@@ -129,7 +187,7 @@ fn test_validate() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_round_trip() {
     for (raw_schema, value) in SCHEMAS_TO_VALIDATE.iter() {
         let schema = Schema::from_str(raw_schema).unwrap();
@@ -139,35 +197,32 @@ fn test_round_trip() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_binary_int_encoding() {
     for (number, hex_encoding) in BINARY_ENCODINGS.iter() {
         let encoded = to_avro_datum(
             &Schema::from_str("\"int\"").unwrap(),
-            Value::Int(*number as i32),
+            Value::Int(i32::try_from(*number).unwrap()),
         )
         .unwrap();
         assert_eq!(&encoded, hex_encoding);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_binary_long_encoding() {
     for (number, hex_encoding) in BINARY_ENCODINGS.iter() {
-        let encoded = to_avro_datum(
-            &Schema::from_str("\"long\"").unwrap(),
-            Value::Long(*number as i64),
-        )
-        .unwrap();
+        let encoded =
+            to_avro_datum(&Schema::from_str("\"long\"").unwrap(), Value::Long(*number)).unwrap();
         assert_eq!(&encoded, hex_encoding);
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_schema_promotion() {
     // Each schema is present in order of promotion (int -> long, long -> float, float -> double)
     // Each value represents the expected decoded value when promoting a value previously encoded with a promotable schema
-    let promotable_schemas = vec![r#""int""#, r#""long""#, r#""float""#, r#""double""#];
+    let promotable_schemas = [r#""int""#, r#""long""#, r#""float""#, r#""double""#];
     let promotable_values = vec![
         Value::Int(219),
         Value::Long(219),
@@ -193,7 +248,7 @@ fn test_schema_promotion() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_unknown_symbol() {
     let writer_schema =
         Schema::from_str(r#"{"type": "enum", "name": "Test", "symbols": ["FOO", "BAR"]}"#).unwrap();
@@ -203,10 +258,10 @@ fn test_unknown_symbol() {
     let encoded = to_avro_datum(&writer_schema, original_value).unwrap();
     let resolved_schema = resolve_schemas(&writer_schema, &reader_schema).unwrap();
     let decoded = from_avro_datum(&resolved_schema, &mut Cursor::new(encoded));
-    assert!(decoded.is_err());
+    assert_err!(decoded);
 }
 
-#[test]
+#[mz_ore::test]
 fn test_default_value() {
     for (field_type, default_json, default_datum) in DEFAULT_VALUE_EXAMPLES.iter() {
         let reader_schema = Schema::from_str(&format!(
@@ -232,7 +287,7 @@ fn test_default_value() {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_no_default_value() -> Result<(), String> {
     let reader_schema = Schema::from_str(
         r#"{
@@ -257,7 +312,7 @@ fn test_no_default_value() -> Result<(), String> {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_union_default() {
     let reader_schema = Schema::from_str(
         r#"{
@@ -283,7 +338,7 @@ fn test_union_default() {
     resolve_schemas(&writer_schema, &reader_schema).unwrap();
 }
 
-#[test]
+#[mz_ore::test]
 fn test_datetime_resolutions() {
     let writer_schema = Schema::from_str(
         r#"{
@@ -392,36 +447,41 @@ fn test_datetime_resolutions() {
         ("f1".into(), Value::Int(1000)),
         (
             "f2".into(),
-            Value::Timestamp(NaiveDateTime::from_timestamp(12345, 0)),
+            Value::Timestamp(DateTime::from_timestamp(12345, 0).unwrap().naive_utc()),
         ),
         ("f3".into(), Value::Long(23456000)),
         (
             "f4".into(),
-            Value::Timestamp(NaiveDateTime::from_timestamp(34567, 0)),
+            Value::Timestamp(DateTime::from_timestamp(34567, 0).unwrap().naive_utc()),
         ),
         ("f5".into(), Value::Int(365 * 2)),
-        ("f6".into(), Value::Date(NaiveDate::from_ymd(1973, 1, 1))),
-        ("f7".into(), Value::Date(NaiveDate::from_ymd(1974, 1, 1))),
+        ("f6".into(), Value::Date(365 * 3 + 1)),
+        ("f7".into(), Value::Date(365 * 4 + 1)),
     ]);
     let datum_to_read = Value::Record(vec![
         (
             "f1".into(),
-            Value::Timestamp(NaiveDateTime::from_timestamp(1, 0)),
+            Value::Timestamp(DateTime::from_timestamp(1, 0).unwrap().naive_utc()),
         ),
         (
             "f2".into(),
-            Value::Timestamp(NaiveDateTime::from_timestamp(12345, 0)),
+            Value::Timestamp(DateTime::from_timestamp(12345, 0).unwrap().naive_utc()),
         ),
         (
             "f3".into(),
-            Value::Timestamp(NaiveDateTime::from_timestamp(23456, 0)),
+            Value::Timestamp(DateTime::from_timestamp(23456, 0).unwrap().naive_utc()),
         ),
         ("f4".into(), Value::Long(34567000000)),
-        ("f5".into(), Value::Date(NaiveDate::from_ymd(1972, 1, 1))),
+        ("f5".into(), Value::Date(365 * 2)),
         ("f6".into(), Value::Int(365 * 3 + 1)), // +1 because 1972 was a leap year
         (
             "f7".into(),
-            Value::Timestamp(NaiveDate::from_ymd(1974, 1, 1).and_hms(0, 0, 0)),
+            Value::Timestamp(
+                NaiveDate::from_ymd_opt(1974, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            ),
         ),
     ]);
     let encoded = to_avro_datum(&writer_schema, datum_to_write).unwrap();
@@ -430,7 +490,7 @@ fn test_datetime_resolutions() {
     assert_eq!(datum_to_read, datum_read);
 }
 
-#[test]
+#[mz_ore::test]
 fn test_projection() {
     let reader_schema = Schema::from_str(
         r#"
@@ -455,7 +515,7 @@ fn test_projection() {
     assert_eq!(datum_to_read, datum_read);
 }
 
-#[test]
+#[mz_ore::test]
 fn test_field_order() {
     let reader_schema = Schema::from_str(
         r#"
@@ -480,7 +540,7 @@ fn test_field_order() {
     assert_eq!(datum_to_read, datum_read);
 }
 
-#[test]
+#[mz_ore::test]
 fn test_type_exception() -> Result<(), String> {
     let writer_schema = Schema::from_str(
         r#"
@@ -509,7 +569,7 @@ fn test_type_exception() -> Result<(), String> {
     }
 }
 
-#[test]
+#[mz_ore::test]
 fn test_namespaces() {
     let schema = r#"
     {
@@ -549,7 +609,7 @@ fn test_namespaces() {
     assert_eq!(datum_to_write, datum_read);
 }
 
-#[test]
+#[mz_ore::test]
 fn test_self_referential_schema() {
     let schema = r#"
         {
@@ -649,7 +709,7 @@ fn test_self_referential_schema() {
     assert_eq!(datum_to_write, datum_read);
 }
 
-#[test]
+#[mz_ore::test]
 fn test_complex_resolutions() {
     // Attempt to exercise many of the hard parts of schema resolution:
     // Reordering fields in "some_record", field "f0" missing from writer, field "f3" missing
@@ -803,11 +863,7 @@ fn test_complex_resolutions() {
                 ),
                 (
                     "f0_2".to_owned(),
-                    Value::Map(AvroMap(
-                        vec![("a".to_string(), Value::Long(42))]
-                            .into_iter()
-                            .collect(),
-                    )),
+                    Value::Map([("a".to_string(), Value::Long(42))].into()),
                 ),
             ]),
         ),
@@ -974,7 +1030,7 @@ fn test_complex_resolutions() {
     assert_eq!(expected_read, datum_read);
 }
 
-#[test]
+#[mz_ore::test]
 fn test_partially_broken_union() {
     // If one variant of a union fails to match or resolve, we should still be able to decode one of the others.
     // The first variant will fail to match (there is no "r" in the reader schema).
@@ -1040,5 +1096,5 @@ fn test_partially_broken_union() {
     let err_read = from_avro_datum(&resolved_schema, &mut err_encoded.as_slice()).unwrap_err();
     assert!(err_read
         .to_string()
-        .contains("Reader field `a` not found in writer"));
+        .contains("Reader field `s.a` not found in writer"));
 }

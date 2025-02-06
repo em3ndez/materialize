@@ -3,10 +3,8 @@ title: "CREATE TYPE"
 description: "`CREATE TYPE` defines a new data type."
 menu:
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
-
-{{< version-added v0.6.1 />}}
 
 `CREATE TYPE` defines a new data type.
 
@@ -19,32 +17,37 @@ types](../types/#custom-types).
 ### Use
 
 Currently, custom types provide a shorthand for referring to
-otherwise-annoying-to-type names, but in the future will provide [binary
-encoding and decoding][binary] for these types, as well.
-
-[binary]:https://github.com/MaterializeInc/materialize/issues/4628
+otherwise-annoying-to-type names.
 
 ## Syntax
 
 {{< diagram "create-type.svg" >}}
 
-Field | Use
-------|-----
-_type&lowbar;name_ | A name for the type.
-_field_ **=** _val_ | A property of the new type. Note that type properties can only refer to data types within the catalog, i.e. they cannot refer to anonymous `list` or `map` types.
+ Field               | Use
+---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ _type&lowbar;name_  | A name for the type.
+ **MAP / LIST**      | The data type. If not specified, a row type is assumed.
+ _property_ **=** _val_ | A property of the new type. This is required when specifying a `LIST` or `MAP` type. Note that type properties can only refer to data types within the catalog, i.e. they cannot refer to anonymous `list` or `map` types.
+
+### `row` properties
+
+Field               | Use
+--------------------|----------------------------------------------------
+_field_name_        | The name of a field in a row type.
+_field_type_        | The data type of a field indicated by _field_name_.
 
 ### `list` properties
 
-Name | Use
+Field | Use
 -----|-----
-`element_type` | Creates a custom [`list`](../types/list) whose elements are are of `element_type`.
+`ELEMENT TYPE` | Creates a custom [`list`](../types/list) whose elements are of `ELEMENT TYPE`.
 
 ### `map` properties
 
-Name | Use
+Field | Use
 -----|-----
-`key_type` | Creates a custom [`map`](../types/map) whose keys are are of `key_type`. `key_type` must resolve to [`text`](../types/text).
-`value_type` | Creates a custom [`map`](../types/map) whose values are are of `value_type`.
+`KEY TYPE` | Creates a custom [`map`](../types/map) whose keys are of `KEY TYPE`. `KEY TYPE` must resolve to [`text`](../types/text).
+`VALUE TYPE` | Creates a custom [`map`](../types/map) whose values are of `VALUE TYPE`.
 
 ## Details
 
@@ -62,10 +65,10 @@ custom type's properties.
 
 ## Examples
 
-### Custom `list`s
+### Custom `list`
 
-```sql
-CREATE TYPE int4_list AS LIST (element_type = int4);
+```mzsql
+CREATE TYPE int4_list AS LIST (ELEMENT TYPE = int4);
 
 SELECT '{1,2}'::int4_list::text AS custom_list;
 ```
@@ -75,10 +78,10 @@ SELECT '{1,2}'::int4_list::text AS custom_list;
  {1,2}
 ```
 
-### Nested custom `list`s
+### Nested custom `list`
 
-```sql
-CREATE TYPE int4_list_list AS LIST (element_type = int4_list);
+```mzsql
+CREATE TYPE int4_list_list AS LIST (ELEMENT TYPE = int4_list);
 
 SELECT '{{1,2}}'::int4_list_list::text AS custom_nested_list;
 ```
@@ -88,10 +91,10 @@ SELECT '{{1,2}}'::int4_list_list::text AS custom_nested_list;
  {{1,2}}
 ```
 
-### Custom `map`s
+### Custom `map`
 
-```sql
-CREATE TYPE int4_map AS MAP (key_type=text, value_type=int4);
+```mzsql
+CREATE TYPE int4_map AS MAP (KEY TYPE = text, VALUE TYPE = int4);
 
 SELECT '{a=>1}'::int4_map::text AS custom_map;
 ```
@@ -101,10 +104,10 @@ SELECT '{a=>1}'::int4_map::text AS custom_map;
  {a=>1}
 ```
 
-### Nested custom `map`s
+### Nested custom `map`
 
-```sql
-CREATE TYPE int4_map_map AS MAP (key_type=text, value_type=int4_map);
+```mzsql
+CREATE TYPE int4_map_map AS MAP (KEY TYPE = text, VALUE TYPE = int4_map);
 
 SELECT '{a=>{a=>1}}'::int4_map_map::text AS custom_nested_map;
 ```
@@ -113,6 +116,36 @@ SELECT '{a=>{a=>1}}'::int4_map_map::text AS custom_nested_map;
 -------------------
 {a=>{a=>1}}
 ```
+
+### Custom `row` type
+```mzsql
+CREATE TYPE row_type AS (a int, b text);
+SELECT ROW(1, 'a')::row_type as custom_row_type;
+```
+```
+custom_row_type
+-----------------
+(1,a)
+```
+
+### Nested `row` type
+```mzsql
+CREATE TYPE nested_row_type AS (a row_type, b float8);
+SELECT ROW(ROW(1, 'a'), 2.3)::nested_row_type AS custom_nested_row_type;
+```
+```
+custom_nested_row_type
+------------------------
+("(1,a)",2.3)
+```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `CREATE` privileges on the containing schema.
+- `USAGE` privileges on all types used in the type definition.
+- `USAGE` privileges on the schemas that all types in the statement are contained in.
 
 ## Related pages
 

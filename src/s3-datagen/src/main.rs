@@ -7,22 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::io;
-use std::iter;
+use std::{io, iter};
 
-use aws_sdk_s3::error::{CreateBucketError, CreateBucketErrorKind};
-use aws_sdk_s3::model::{BucketLocationConstraint, CreateBucketConfiguration};
-use aws_sdk_s3::SdkError;
+use aws_sdk_s3::operation::create_bucket::CreateBucketError;
+use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use clap::Parser;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use tracing::{error, info, Level};
+use mz_ore::cast::CastFrom;
+use mz_ore::cli::{self, CliConfig};
+use mz_ore::error::ErrorExt;
+use tracing::{error, event, info, Level};
 use tracing_subscriber::filter::EnvFilter;
-use tracing_subscriber::fmt;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-
-use mz_aws_util::config::AwsConfig;
-use ore::cast::CastFrom;
 
 /// Generate meaningless data in S3 to test download speeds
 #[derive(Parser)]
@@ -35,7 +30,7 @@ struct Args {
     #[clap(
         short = 's',
         long,
-        parse(try_from_str = parse_object_size)
+        value_parser = parse_object_size,
     )]
     object_size: usize,
 
@@ -52,29 +47,34 @@ struct Args {
     bucket: String,
 
     /// Which region to operate in
-    #[clap(short = 'r', long, default_value = "us-east-2")]
+    #[clap(short = 'r', long, default_value = "us-east-1")]
     region: String,
 
     /// Number of copy operations to run concurrently
     #[clap(long, default_value = "50")]
     concurrent_copies: usize,
+
+    /// Which log messages to emit.
+    ///
+    /// See environmentd's `--log-filter` option for details.
+    #[clap(long, value_name = "FILTER", default_value = "off")]
+    log_filter: String,
 }
 
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        error!("{:#}", e);
+        error!("{}", e.display_with_causes());
         std::process::exit(1);
     }
 }
 
 async fn run() -> anyhow::Result<()> {
-    let args: Args = ore::cli::parse_args();
-    let env_filter =
-        EnvFilter::try_from_env("MZ_LOG_FILTER").or_else(|_| EnvFilter::try_new("info"))?;
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt::layer().with_writer(io::stderr))
+    let args: Args = cli::parse_args(CliConfig::default());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from(args.log_filter))
+        .with_writer(io::stderr)
         .init();
 
     info!(
@@ -98,8 +98,8 @@ async fn run() -> anyhow::Result<()> {
         })
         .collect::<String>();
 
-    let config = AwsConfig::load_from_env().await;
-    let client = mz_aws_util::s3::client(&config)?;
+    let config = mz_aws_util::defaults().load().await;
+    let client = mz_aws_util::s3::new_client(&config);
 
     let first_object_key = format!("{}{:>05}", args.key_prefix, 0);
 
@@ -121,19 +121,12 @@ async fn run() -> anyhow::Result<()> {
         .send()
         .await
         .map(|_| info!("created s3 bucket {}", args.bucket))
-        .or_else(|e| match e {
-            SdkError::ServiceError {
-                err:
-                    CreateBucketError {
-                        kind: CreateBucketErrorKind::BucketAlreadyOwnedByYou(_),
-                        ..
-                    },
-                ..
-            } => {
-                tracing::event!(Level::INFO, bucket = %args.bucket, "reusing existing bucket");
+        .or_else(|e| match e.into_service_error() {
+            CreateBucketError::BucketAlreadyOwnedByYou(_) => {
+                event!(Level::INFO, bucket = %args.bucket, "reusing existing bucket");
                 Ok(())
             }
-            _ => Err(e),
+            e => Err(e),
         })?;
 
     let mut total_created = 0;

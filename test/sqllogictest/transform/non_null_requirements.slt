@@ -1,0 +1,47 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+#
+# Test various cases of literal lifting
+#
+
+mode cockroach
+
+statement ok
+CREATE TABLE t1 (f1 INTEGER, f2 INTEGER);
+
+# WITH MUTUALLY RECURSIVE support
+# -------------------------------
+
+# Simplify non-nullable trees with multiple non-recursive bindings defined under
+# a single`WITH MUTUALLY RECURSIVE` block
+# As of materialize#27389 this no longer tests what it used to test.
+# Issue database-issues#8294 tracks tests that may not be serving their intended
+# purpose; perhaps we can remove the test if we remove the
+# non_null_requirements transform.
+query T multiline
+EXPLAIN WITH(arity, join implementations)
+WITH MUTUALLY RECURSIVE
+  c0(x INT, y INT, z INT) AS (
+    SELECT *, null::int FROM t1
+  ),
+  c1(x INT, y INT, z INT) AS (
+    SELECT * FROM c0 WHERE z > 0 UNION SELECT x, y, 42 FROM c1
+  ),
+  c2(x INT, y INT, z INT) AS (
+    SELECT y, x, z FROM c0
+  )
+SELECT * FROM (SELECT * FROM c1 UNION ALL SELECT * FROM c2) WHERE z > 0
+----
+Explained Query (fast path):
+  Constant <empty>
+
+Target cluster: quickstart
+
+EOF

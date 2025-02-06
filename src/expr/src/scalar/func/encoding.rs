@@ -10,10 +10,9 @@
 //! Encoding and decoding support for various formats that represent binary data
 //! as text data.
 
+use mz_ore::fmt::FormatBuffer;
+use mz_repr::strconv;
 use uncased::UncasedStr;
-
-use ore::fmt::FormatBuffer;
-use repr::strconv;
 
 use crate::EvalError;
 
@@ -48,6 +47,7 @@ impl Base64Format {
         match b {
             b'A'..=b'Z' => Ok(b - b'A'),
             b'a'..=b'z' => Ok(b - b'a' + 26),
+            b'0'..=b'9' => Ok(b + 4),
             b'+' => Ok(62),
             b'/' => Ok(63),
             _ => Err(EvalError::InvalidBase64Symbol(char::from(b))),

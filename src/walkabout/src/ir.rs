@@ -40,7 +40,7 @@ pub enum Item {
 }
 
 impl Item {
-    pub fn fields<'a>(&'a self) -> Box<dyn Iterator<Item = &Field> + 'a> {
+    pub fn fields<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Field> + 'a> {
         match self {
             Item::Struct(s) => Box::new(s.fields.iter()),
             Item::Enum(e) => Box::new(e.variants.iter().flat_map(|v| &v.fields)),
@@ -134,6 +134,10 @@ pub enum Type {
     /// The value will need to be visited by calling the appropriate `Visit`
     /// or `VisitMut` trait method on the value.
     Local(String),
+    /// A BTreeMap type
+    ///
+    /// Each value will need to be visited.
+    Map { key: Box<Type>, value: Box<Type> },
 }
 
 /// Analyzes the provided items and produces an IR.
@@ -164,8 +168,12 @@ pub(crate) fn analyze(syn_items: &[syn::DeriveInput]) -> Result<Ir> {
             syn::Data::Union(_) => bail!("Unable to analyze union: {}", syn_item.ident),
         };
         for field in item.fields() {
-            if let Type::Abstract(ty) = &field.ty {
-                items.insert(ty.clone(), Item::Abstract);
+            let mut field_ty = &field.ty;
+            while let Type::Box(ty) | Type::Vec(ty) | Type::Option(ty) = field_ty {
+                field_ty = ty;
+            }
+            if let Type::Abstract(name) = field_ty {
+                items.insert(name.clone(), Item::Abstract);
             }
         }
         items.insert(name, item);
@@ -265,18 +273,16 @@ where
 
 fn analyze_type(ty: &syn::Type) -> Result<Type> {
     match ty {
-        syn::Type::Path(syn::TypePath { qself: None, path }) => {
-            match path.segments.len() {
-                2 => {
-                    let name = path.segments.iter().map(|s| s.ident.to_string()).join("::");
-                    Ok(Type::Abstract(name))
-                }
-                1 => {
-                    let segment = path.segments.last().unwrap();
-                    let segment_name = segment.ident.to_string();
+        syn::Type::Path(syn::TypePath { qself: None, path }) => match path.segments.len() {
+            2 => {
+                let name = path.segments.iter().map(|s| s.ident.to_string()).join("::");
+                Ok(Type::Abstract(name))
+            }
+            1 => {
+                let segment = path.segments.last().unwrap();
+                let segment_name = segment.ident.to_string();
 
-                    let container = |construct_ty: fn(Box<Type>) -> Type| {
-                        match &segment.arguments {
+                let container = |construct_ty: fn(Box<Type>) -> Type| match &segment.arguments {
                     syn::PathArguments::AngleBracketed(args) if args.args.len() == 1 => {
                         match args.args.last().unwrap() {
                             syn::GenericArgument::Type(ty) => {
@@ -298,36 +304,55 @@ fn analyze_type(ty: &syn::Type) -> Result<Type> {
                         "Container type is missing type argument: {}",
                         ty.into_token_stream()
                     ),
-                }
-                    };
+                };
 
-                    match &*segment_name {
-                        // HACK(benesch): DateTimeField is part of the sqlparser AST but
-                        // comes from another crate whose source code is not easily
-                        // accessible here. We probably want our own local definition of
-                        // this type, but for now, just hardcode it as a primitive.
-                        "bool" | "usize" | "u64" | "char" | "String" | "PathBuf"
-                        | "DateTimeField" => match segment.arguments {
+                match &*segment_name {
+                    "bool" | "usize" | "u8" | "u16" | "u32" | "u64" | "isize" | "i8" | "i16"
+                    | "i32" | "i64" | "f32" | "f64" | "char" | "String" | "PathBuf" => {
+                        match segment.arguments {
                             syn::PathArguments::None => Ok(Type::Primitive),
                             _ => bail!(
                                 "Primitive type had unexpected arguments: {}",
                                 ty.into_token_stream()
                             ),
-                        },
-                        "Vec" => container(Type::Vec),
-                        "Option" => container(Type::Option),
-                        "Box" => container(Type::Box),
-                        _ => Ok(Type::Local(segment_name)),
+                        }
                     }
-                }
-                _ => {
-                    bail!(
-                        "Unable to analyze type path with more than two components: '{}'",
-                        path.into_token_stream()
-                    )
+                    "Vec" => container(Type::Vec),
+                    "Option" => container(Type::Option),
+                    "Box" => container(Type::Box),
+                    "BTreeMap" => match &segment.arguments {
+                        syn::PathArguments::None => bail!("Map type missing arguments"),
+                        syn::PathArguments::AngleBracketed(args) if args.args.len() == 2 => {
+                            let key = match &args.args[0] {
+                                syn::GenericArgument::Type(t) => t,
+                                _ => bail!("Invalid argument to map container, should be a Type"),
+                            };
+                            let value = match &args.args[1] {
+                                syn::GenericArgument::Type(t) => t,
+                                _ => bail!("Invalid argument to map container, should be a Type"),
+                            };
+                            Ok(Type::Map {
+                                key: Box::new(analyze_type(key)?),
+                                value: Box::new(analyze_type(value)?),
+                            })
+                        }
+                        &syn::PathArguments::AngleBracketed(_) => {
+                            bail!("wrong type of arguments for map container")
+                        }
+                        syn::PathArguments::Parenthesized(_) => {
+                            bail!("wrong type of arguments for map container")
+                        }
+                    },
+                    _ => Ok(Type::Local(segment_name)),
                 }
             }
-        }
+            _ => {
+                bail!(
+                    "Unable to analyze type path with more than two components: '{}'",
+                    path.into_token_stream()
+                )
+            }
+        },
         _ => bail!(
             "Unable to analyze non-struct, non-enum type: {}",
             ty.into_token_stream()

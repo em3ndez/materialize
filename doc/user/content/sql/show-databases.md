@@ -1,17 +1,24 @@
 ---
 title: "SHOW DATABASES"
-description: "`SHOW DATABASES` returns a list of all databases available to your Materialize instances."
+description: "`SHOW DATABASES` returns a list of all databases in Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`SHOW DATABASES` returns a list of all databases available to your Materialize
-instances.
+`SHOW DATABASES` returns a list of all databases in Materialize.
 
 ## Syntax
 
-{{< diagram "show-databases.svg" >}}
+```sql
+SHOW DATABASES
+[LIKE <pattern> | WHERE <condition(s)>]
+```
+
+Option                        | Description
+------------------------------|------------
+**LIKE** \<pattern\>          | If specified, only show databases that match the pattern.
+**WHERE** <condition(s)>      | If specified, only show databases that match the condition(s).
 
 ## Details
 
@@ -19,16 +26,12 @@ instances.
 
 `SHOW DATABASES`'s output is a table with one column, `name`.
 
-{{< version-changed v0.5.0 >}}
-The output column is renamed from `DATABASES` to `name`.
-{{< /version-changed >}}
-
 ## Examples
 
-```sql
+```mzsql
 CREATE DATABASE my_db;
 ```
-```sql
+```mzsql
 SHOW DATABASES;
 ```
 ```nofmt

@@ -7,28 +7,34 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
-use repr::{ColumnName, ColumnType, Datum, RelationDesc, Row};
+use mz_repr::{ColumnName, ColumnType, Datum, RelationDesc, Row};
 
 pub trait Encode {
-    fn get_format_name(&self) -> &str;
+    fn encode_unchecked(&self, row: Row) -> Vec<u8>;
 
-    fn encode_key_unchecked(&self, row: Row) -> Vec<u8>;
-
-    fn encode_value_unchecked(&self, row: Row) -> Vec<u8>;
+    /// Given the output of a call to [`Encode::encode_unchecked`], returns
+    /// a hash that is suitable for stable partitioning.
+    fn hash(&self, buf: &[u8]) -> u64 {
+        // We use seahash as it outperforms pretty much all other options, and
+        // has great mathematically proven statistical properties. It truly is a
+        // remarkable non-cryptographic hash. More details can be found here:
+        // https://docs.rs/seahash/latest/seahash/
+        seahash::hash(buf)
+    }
 }
 
 /// Bundled information sufficient to encode Datums.
 #[derive(Debug)]
 pub struct TypedDatum<'a> {
     pub datum: Datum<'a>,
-    pub typ: ColumnType,
+    pub typ: &'a ColumnType,
 }
 
 impl<'a> TypedDatum<'a> {
     /// Pairs a datum and its type, for encoding.
-    pub fn new(datum: Datum<'a>, typ: ColumnType) -> Self {
+    pub fn new(datum: Datum<'a>, typ: &'a ColumnType) -> Self {
         Self { datum, typ }
     }
 }
@@ -39,7 +45,7 @@ pub fn column_names_and_types(desc: RelationDesc) -> Vec<(ColumnName, ColumnType
     let mut columns: Vec<_> = desc.into_iter().collect();
 
     // Deduplicate names.
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     for (name, _ty) in &mut columns {
         let stem_len = name.as_str().len();
         let mut i = 1;

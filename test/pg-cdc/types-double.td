@@ -11,6 +11,14 @@
 # Test the floating-point types
 #
 
+> CREATE SECRET pgpass AS 'postgres'
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass
+  )
+
 # Insert data pre-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 ALTER USER postgres WITH replication;
@@ -31,14 +39,12 @@ INSERT INTO t1 VALUES ('-1111111111111111111111111111111', '-1111111111111111111
 
 CREATE PUBLICATION mz_source FOR ALL TABLES;
 
-> CREATE MATERIALIZED SOURCE mz_source
-  FROM POSTGRES CONNECTION 'host=postgres port=5432 user=postgres password=postgres sslmode=require dbname=postgres'
-  PUBLICATION 'mz_source';
+> CREATE SOURCE mz_source FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
 
-> SELECT COUNT(*) > 0 FROM mz_source;
+> CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE t1);
+
+> SELECT COUNT(*) > 0 FROM t1;
 true
-
-> CREATE VIEWS FROM SOURCE mz_source;
 
 # Insert the same data post-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
@@ -50,8 +56,8 @@ INSERT INTO t1 SELECT * FROM t1;
 # Note that there is some expected loss of precision on the very large numbers
 
 > SELECT * FROM t1;
--1111110000000000000000000000000 -1111111111111110000000000000000
--1111110000000000000000000000000 -1111111111111110000000000000000
+-1111111100000000000000000000000 -1111111111111111000000000000000
+-1111111100000000000000000000000 -1111111111111111000000000000000
 -inf -inf
 -inf -inf
 0.000000000000000000000000000001 0.000000000000000000000000000001

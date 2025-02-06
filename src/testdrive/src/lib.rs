@@ -12,10 +12,18 @@
 #![warn(missing_docs)]
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::path::Path;
 
-use self::error::InputError;
-use self::parser::LineReader;
+use action::Run;
+use anyhow::{anyhow, Context};
+use mz_ore::error::ErrorExt;
+use tempfile::NamedTempFile;
+use tracing::debug;
+
+use crate::action::ControlFlow;
+use crate::error::{ErrorLocation, PosError};
+use crate::parser::{BuiltinCommand, Command, LineReader};
 
 mod action;
 mod error;
@@ -23,16 +31,18 @@ mod format;
 mod parser;
 mod util;
 
-pub use self::action::Config;
-pub use self::error::{Error, ResultExt};
+pub use crate::action::consistency::Level as ConsistencyCheckLevel;
+pub use crate::action::{CatalogConfig, Config};
+pub use crate::error::Error;
 
 /// Runs a testdrive script stored in a file.
-pub async fn run_file(config: &Config, filename: &str) -> Result<(), Error> {
-    let mut file = File::open(&filename).err_ctx(format!("opening {}", filename))?;
+pub async fn run_file(config: &Config, filename: &Path) -> Result<(), Error> {
+    let mut file =
+        File::open(filename).with_context(|| format!("opening {}", filename.display()))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)
-        .err_ctx(format!("reading {}", filename))?;
-    run_string(config, filename, &contents).await
+        .with_context(|| format!("reading {}", filename.display()))?;
+    run_string(config, Some(filename), &contents).await
 }
 
 /// Runs a testdrive script from the standard input.
@@ -40,8 +50,8 @@ pub async fn run_stdin(config: &Config) -> Result<(), Error> {
     let mut contents = String::new();
     io::stdin()
         .read_to_string(&mut contents)
-        .err_ctx("reading <stdin>")?;
-    run_string(config, "<stdin>", &contents).await
+        .context("reading <stdin>")?;
+    run_string(config, None, &contents).await
 }
 
 /// Runs a testdrive script stored in a string.
@@ -49,86 +59,135 @@ pub async fn run_stdin(config: &Config) -> Result<(), Error> {
 /// The script in `contents` is used verbatim. The provided `filename` is used
 /// only as output in error messages and such. No attempt is made to read
 /// `filename`.
-pub async fn run_string(config: &Config, filename: &str, contents: &str) -> Result<(), Error> {
-    println!("--- {}", filename);
+pub async fn run_string(
+    config: &Config,
+    filename: Option<&Path>,
+    contents: &str,
+) -> Result<(), Error> {
+    if let Some(f) = filename {
+        println!("--- {}", f.display());
+    }
 
     let mut line_reader = LineReader::new(contents);
-    run_line_reader(config, &mut line_reader)
+    run_line_reader(config, &mut line_reader, contents, filename)
         .await
-        .map_err(|e| e.with_input_details(&filename, &contents, &line_reader))
+        .map_err(|e| {
+            let location = e.pos.map(|pos| {
+                let (line, col) = line_reader.line_col(pos);
+                ErrorLocation::new(filename, contents, line, col)
+            });
+            Error::new(e.source, location)
+        })
 }
 
-async fn run_line_reader(config: &Config, line_reader: &mut LineReader<'_>) -> Result<(), Error> {
+pub(crate) async fn run_line_reader(
+    config: &Config,
+    line_reader: &mut LineReader<'_>,
+    contents: &str,
+    filename: Option<&Path>,
+) -> Result<(), PosError> {
     // TODO(benesch): consider sharing state between files, to avoid
     // reconnections for every file. For now it's nice to not open any
     // connections until after parsing.
     let cmds = parser::parse(line_reader)?;
-    let mut cmds_exec = cmds.clone();
-    // Extract number of executions
-    let mut execution_count = 1;
-    if let Some(command) = cmds_exec.iter_mut().find(|el| {
-        if let parser::Command::Builtin(c) = &el.command {
-            if c.name == "set-execution-count" {
-                return true;
-            }
+
+    if cmds.is_empty() {
+        return Err(PosError::from(anyhow!("No input provided!")));
+    } else {
+        debug!("Received {} commands to run", cmds.len());
+    }
+
+    let has_kafka_cmd = cmds.iter().any(|cmd| {
+        matches!(
+            &cmd.command,
+            Command::Builtin(BuiltinCommand { name, .. }, _) if name.starts_with("kafka-"),
+        )
+    });
+
+    let (mut state, state_cleanup) = action::create_state(config).await?;
+
+    if config.reset {
+        // Delete any existing Materialize and Kafka state *before* the test
+        // script starts. We don't clean up Materialize or Kafka state at the
+        // end of the script because it's useful to leave the state around,
+        // e.g., for debugging, or when using a testdrive script to set up
+        // Materialize for further tinkering.
+
+        state.reset_materialize().await?;
+
+        // Only try to clean up Kafka state if the test script uses a Kafka
+        // action. Tests that don't use Kafka likely don't have a Kafka
+        // broker available.
+        if has_kafka_cmd {
+            state.reset_kafka().await?;
         }
-        false
-    }) {
-        if let parser::Command::Builtin(c) = &mut command.command {
-            let count = c.args.string("count").unwrap_or_default();
-            execution_count = count.parse::<u32>().unwrap_or(1);
-        }
-    };
-    println!("Running test {} time(s) ... ", execution_count);
-    for _ in 1..execution_count + 1 {
-        println!("Run {} ...", execution_count);
-        cmds_exec = cmds.clone();
-        let (mut state, state_cleanup) = action::create_state(config).await?;
+    }
 
-        let actions = action::build(cmds_exec, &state).await?;
+    let mut errors = Vec::new();
 
-        if config.reset {
-            state.reset_materialized().await?;
+    let mut skipping = false;
 
-            for a in actions.iter().rev() {
-                let undo = a.action.undo(&mut state);
-                undo.await.map_err(|e| InputError { msg: e, pos: a.pos })?;
+    for cmd in cmds {
+        if skipping {
+            if let Command::Builtin(builtin, _) = cmd.command {
+                if builtin.name == "skip-end" {
+                    println!("skip-end reached");
+                    skipping = false;
+                } else if builtin.name == "skip-if" {
+                    errors.push(PosError {
+                        source: anyhow!("nested skip-if not allowed"),
+                        pos: Some(cmd.pos),
+                    });
+                    break;
+                }
             }
-        }
-
-        for a in &actions {
-            let redo = a.action.redo(&mut state);
-            redo.await.map_err(|e| InputError { msg: e, pos: a.pos })?;
+            continue;
         }
 
-        if config.reset {
-            let mut errors = Vec::new();
-
-            if let Err(e) = state.reset_s3().await {
-                errors.push(e);
+        match cmd.run(&mut state).await {
+            Ok(ControlFlow::Continue) => (),
+            Ok(ControlFlow::SkipBegin) => {
+                skipping = true;
+                ()
             }
-
-            if let Err(e) = state.reset_sqs().await {
+            // ignore, already handled above
+            Ok(ControlFlow::SkipEnd) => (),
+            Err(e) => {
                 errors.push(e);
-            }
-
-            if let Err(e) = state.reset_kinesis().await {
-                errors.push(e);
-            }
-
-            drop(state);
-            if let Err(e) = state_cleanup.await {
-                errors.push(e);
-            }
-
-            if !errors.is_empty() {
-                return Err(Error::General {
-                    ctx: "Failed to clean up state at shut down".into(),
-                    causes: errors.into_iter().map(Into::into).collect(),
-                    hints: Vec::new(),
-                });
+                break;
             }
         }
     }
-    Ok(())
+    if config.consistency_checks == action::consistency::Level::File {
+        if let Err(e) = action::consistency::run_consistency_checks(&state).await {
+            errors.push(e.into());
+        }
+    }
+    state.clear_skip_consistency_checks();
+
+    if config.rewrite_results {
+        let mut f = NamedTempFile::new_in(filename.unwrap().parent().unwrap()).unwrap();
+        let mut pos = 0;
+        for rewrite in &state.rewrites {
+            write!(f, "{}", &contents[pos..rewrite.start]).expect("rewriting results");
+            write!(f, "{}", rewrite.content).expect("rewriting results");
+            pos = rewrite.end;
+        }
+        write!(f, "{}", &contents[pos..]).expect("rewriting results");
+        f.persist(filename.unwrap()).expect("rewriting results");
+    }
+
+    if config.reset {
+        drop(state);
+        if let Err(e) = state_cleanup.await {
+            errors.push(anyhow!("cleanup failed: error: {}", e.to_string_with_causes()).into());
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        // Only surface the first error encountered for sake of simplicity
+        Err(errors.remove(0))
+    }
 }

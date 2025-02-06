@@ -1,5 +1,5 @@
 ---
-title: "jsonb_object_agg Function"
+title: "jsonb_object_agg function"
 description: "Aggregate keys and values (including nulls) into a jsonb object"
 menu:
   main:
@@ -47,21 +47,37 @@ Instead, we recommend that you materialize all components required for the
 `jsonb_object_agg` on top of that. That pattern is illustrated in the following
 statements:
 
-```sql
-CREATE MATERIALIZED VIEW foo_view AS SELECT * FROM foo;
-CREATE VIEW bar AS SELECT jsonb_object_agg(foo_view.bar);
+```mzsql
+CREATE MATERIALIZED VIEW foo_view AS SELECT key_col, val_col FROM foo;
+CREATE VIEW bar AS SELECT jsonb_object_agg(key_col, val_col) FROM foo_view;
 ```
 
 ## Examples
 
-```sql
-SELECT jsonb_object_agg(column1, column2) FROM (VALUES ('key1', 1), ('key2', null))
+Consider this query:
+```mzsql
+SELECT
+  jsonb_object_agg(
+    t.col1,
+    t.col2
+    ORDER BY t.ts ASC
+  ) FILTER (WHERE t.col2 IS NOT NULL) AS my_agg
+FROM (
+  VALUES
+  ('k1', 1, now()),
+  ('k2', 2, now() - INTERVAL '1s'),
+  ('k2', -1, now()),
+  ('k2', NULL, now() + INTERVAL '1s')
+  ) AS t(col1, col2, ts);
 ```
 ```nofmt
- jsonb_object_agg
+      my_agg
 ------------------
- {"key1": 1, "key2": null}
+ {"k1": 1, "k2": -1}
 ```
+In this example, there are multiple values associated with the `k2` key.
+
+The `FILTER` clause in the statement above returns values that are not `NULL` and orders them by the timestamp column to return the most recent associated value.
 
 ## See also
 

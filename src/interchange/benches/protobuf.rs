@@ -8,76 +8,76 @@
 // by the Apache License, Version 2.0.
 
 use criterion::{black_box, Criterion, Throughput};
-use futures::executor::block_on;
-use protobuf::{Message, MessageField};
+use mz_interchange::protobuf::{DecodedDescriptors, Decoder};
+use mz_ore::cast::CastFrom;
+use prost::Message;
 
-use interchange::protobuf::{DecodedDescriptors, Decoder, NormalizedProtobufMessageName};
-
-use gen::benchmark::{Connector, Record, Value};
+use self::gen::benchmark::{Connector, Record, Value};
 
 mod gen {
-    include!(concat!(env!("OUT_DIR"), "/protobuf/mod.rs"));
+    include!(concat!(env!("OUT_DIR"), "/benchproto.rs"));
 }
 
 pub fn bench_protobuf(c: &mut Criterion) {
-    let mut value = Value::new();
-    value.l_orderkey = 1;
-    value.l_orderkey = 155_190;
-    value.l_suppkey = 7706;
-    value.l_linenumber = 1;
-    value.l_quantity = 17.0;
-    value.l_extendedprice = 21168.23;
-    value.l_discount = 0.04;
-    value.l_tax = 0.02;
-    value.l_returnflag = "N".into();
-    value.l_linestatus = "O".into();
-    value.l_shipdate = 9567;
-    value.l_commitdate = 9537;
-    value.l_receiptdate = 9537;
-    value.l_shipinstruct = "DELIVER IN PERSON".into();
-    value.l_shipmode = "TRUCK".into();
-    value.l_comment = "egular courts above the".into();
+    let value = Value {
+        l_orderkey: 155_190,
+        l_suppkey: 7706,
+        l_linenumber: 1,
+        l_quantity: 17.0,
+        l_extendedprice: 21168.23,
+        l_discount: 0.04,
+        l_tax: 0.02,
+        l_returnflag: "N".into(),
+        l_linestatus: "O".into(),
+        l_shipdate: 9567,
+        l_commitdate: 9537,
+        l_receiptdate: 9537,
+        l_shipinstruct: "DELIVER IN PERSON".into(),
+        l_shipmode: "TRUCK".into(),
+        l_comment: "egular courts above the".into(),
+        ..Default::default()
+    };
 
-    let mut connector = Connector::new();
-    connector.version = "0.9.5.Final".into();
-    connector.connector = "mysql".into();
-    connector.name = "tcph".into();
-    connector.server_id = 0;
-    connector.ts_sec = 0;
-    connector.gtid = "".into();
-    connector.file = "binlog.000004".into();
-    connector.pos = 951_896_181;
-    connector.row = 0;
-    connector.snapshot = true;
-    connector.thread = 0;
-    connector.db = "tcph".into();
-    connector.table = "lineitem".into();
-    connector.query = "".into();
+    let connector = Connector {
+        version: "0.9.5.Final".into(),
+        connector: "mysql".into(),
+        name: "tcph".into(),
+        server_id: 0,
+        ts_sec: 0,
+        gtid: "".into(),
+        file: "binlog.000004".into(),
+        pos: 951_896_181,
+        row: 0,
+        snapshot: true,
+        thread: 0,
+        db: "tcph".into(),
+        table: "lineitem".into(),
+        query: "".into(),
+    };
 
-    let mut record = Record::new();
-    record.tcph_tcph_lineitem_value = MessageField::some(value);
-    record.source = MessageField::some(connector);
-    record.op = "c".into();
-    record.ts_ms = 1_560_886_948_093;
+    let record = Record {
+        tcph_tcph_lineitem_value: Some(value),
+        source: Some(connector),
+        op: "c".into(),
+        ts_ms: 1_560_886_948_093,
+    };
 
-    let buf = record
-        .write_to_bytes()
-        .expect("record failed to serialize to bytes");
-    let len = buf.len() as u64;
+    let buf = record.encode_to_vec();
+    let len = u64::cast_from(buf.len());
     let mut decoder = Decoder::new(
         DecodedDescriptors::from_bytes(
-            gen::FILE_DESCRIPTOR_SET_DATA,
-            NormalizedProtobufMessageName::new(".bench.Record".to_string()),
+            &include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.pb"))[..],
+            ".benchmark.Record".to_string(),
         )
         .unwrap(),
-        None,
+        false,
     )
     .unwrap();
 
     let mut bg = c.benchmark_group("protobuf");
     bg.throughput(Throughput::Bytes(len));
     bg.bench_function("decode", move |b| {
-        b.iter(|| black_box(block_on(decoder.decode(&buf)).unwrap()))
+        b.iter(|| black_box(decoder.decode(&buf).unwrap()))
     });
     bg.finish();
 }

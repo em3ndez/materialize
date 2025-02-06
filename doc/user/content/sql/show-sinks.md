@@ -1,60 +1,67 @@
 ---
 title: "SHOW SINKS"
-description: "`SHOW SINKS` returns a list of all sinks available to your Materialize instances."
+description: "`SHOW SINKS` returns a list of all sinks available in Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 aliases:
     - /sql/show-sink
 ---
 
-`SHOW SINKS` returns a list of all sinks available to your Materialize instances.
+`SHOW SINKS` returns a list of all sinks available in Materialize.
 
 ## Syntax
 
-{{< diagram "show-sinks.svg" >}}
+```mzsql
+SHOW SINKS [ FROM <schema_name> ] [ IN CLUSTER <cluster_name> ]
+```
 
 ## Details
 
-Field | Use
-------|-----
-_schema&lowbar;name_ | The schema to show sinks from. Defaults to `public` in the current database. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
-**FULL** | Return details about your sinks.
+Option                        | Description
+------------------------------|------------
+**FROM** <schema_name>        | If specified, only show sinks from the specified schema. Defaults to first resolvable schema in the search path. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
+**IN CLUSTER** <cluster_name> | If specified, only show sinks from the specified cluster. For available clusters, see [`SHOW CLUSTERS`](../show-clusters).
 
 ### Output format
 
-`SHOW FULL SINKS`'s output is a table, with this structure:
+`SHOW SINKS`'s output is a table, with this structure:
 
 ```nofmt
- name  | type | volatile
--------+------+---------
- ...   | ...  | ...
+name  | type | cluster
+------+------+--------
+...   | ...  | ...
 ```
 
-Field | Meaning
-------|--------
-**name** | The name of the sink
-**type** | Whether the sink was created by the `user` or the `system`
-**volatility** | Whether the sink is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
-
-{{< version-changed v0.5.0 >}}
-The output column is renamed from `SINKS` to `name`.
-{{< /version-changed >}}
-
-{{< version-added v0.7.2 >}}
-The `volatile` column.
-{{< /version-added >}}
+Field       | Meaning
+------------|--------
+**name**    | The name of the sink.
+**type**    | The type of the sink: currently only `kafka` is supported.
+**cluster** | The cluster the sink is associated with.
 
 ## Examples
 
-```sql
+```mzsql
 SHOW SINKS;
 ```
 ```nofmt
-my_sink
+name          | type  | cluster
+--------------+-------+--------
+my_sink       | kafka | c1
+my_other_sink | kafka | c2
+```
+
+```mzsql
+SHOW SINKS IN CLUSTER c1;
+```
+```nofmt
+name    | type  | cluster
+--------+-------+--------
+my_sink | kafka | c1
 ```
 
 ## Related pages
 
 - [`CREATE SINK`](../create-sink)
 - [`DROP SINK`](../drop-sink)
+- [`SHOW CREATE SINK`](../show-create-sink)

@@ -11,14 +11,13 @@ import argparse
 import datetime
 import json
 import sys
-from typing import Any, Dict, List
+from typing import Any
 
 from materialize.cli.scratch import check_required_vars
 from materialize.scratch import (
     DEFAULT_INSTANCE_PROFILE_NAME,
-    DEFAULT_SECURITY_GROUP_ID,
-    DEFAULT_SUBNET_ID,
-    ROOT,
+    DEFAULT_SECURITY_GROUP_NAME,
+    MZ_ROOT,
     MachineDesc,
     launch_cluster,
     mssh,
@@ -26,10 +25,10 @@ from materialize.scratch import (
     whoami,
 )
 
-MAX_AGE = datetime.timedelta(weeks=1)
+MAX_AGE_DAYS = 1.5
 
 
-def multi_json(s: str) -> List[Dict[Any, Any]]:
+def multi_json(s: str) -> list[dict[Any, Any]]:
     """Read zero or more JSON objects from a string,
     without requiring each of them to be on its own line.
 
@@ -53,17 +52,35 @@ def multi_json(s: str) -> List[Dict[Any, Any]]:
 
 
 def configure_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--subnet-id", type=str, default=DEFAULT_SUBNET_ID)
-    parser.add_argument("--key-name", type=str, required=False)
     parser.add_argument(
-        "--security-group-id", type=str, default=DEFAULT_SECURITY_GROUP_ID
+        "--key-name", type=str, required=False, help="Optional EC2 Key Pair name"
     )
-    parser.add_argument("--extra-tags", type=str, required=False)
     parser.add_argument(
-        "--instance-profile", type=str, default=DEFAULT_INSTANCE_PROFILE_NAME
+        "--security-group-name",
+        type=str,
+        default=DEFAULT_SECURITY_GROUP_NAME,
+        help="EC2 Security Group name. Defaults to Materialize scratch account.",
+    )
+    parser.add_argument(
+        "--extra-tags",
+        type=str,
+        required=False,
+        help='Additional EC2 tags for created instance. Format: {"key", "value"}',
+    )
+    parser.add_argument(
+        "--instance-profile",
+        type=str,
+        default=DEFAULT_INSTANCE_PROFILE_NAME,
+        help="EC2 instance profile / IAM role. Defaults to `%s`."
+        % DEFAULT_INSTANCE_PROFILE_NAME,
     )
     parser.add_argument("--output-format", choices=["table", "csv"], default="table")
-    parser.add_argument("--git-rev", type=str, default="HEAD")
+    parser.add_argument(
+        "--git-rev",
+        type=str,
+        default="HEAD",
+        help="Git revision of `materialize` codebase to push to scratch instance. Defaults to `HEAD`",
+    )
     parser.add_argument(
         "--ssh",
         action="store_true",
@@ -80,6 +97,12 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             "Use a config from {machine}.json in `misc/scratch`. "
             "Hint: `dev-box` is a good starter!"
         ),
+    )
+    parser.add_argument(
+        "--max-age-days",
+        type=float,
+        default=MAX_AGE_DAYS,
+        help="Maximum age for scratch instance in days. Defaults to 1.5",
     )
 
 
@@ -99,25 +122,30 @@ def run(args: argparse.Namespace) -> None:
     extra_tags["LaunchedBy"] = whoami()
 
     if args.machine:
-        with open(ROOT / "misc" / "scratch" / "{}.json".format(args.machine)) as f:
+        with open(MZ_ROOT / "misc" / "scratch" / f"{args.machine}.json") as f:
 
-            print("Reading machine configs from {}".format(f.name))
-            descs = [MachineDesc.parse_obj(obj) for obj in multi_json(f.read())]
+            print(f"Reading machine configs from {f.name}")
+            descs = [MachineDesc.model_validate(obj) for obj in multi_json(f.read())]
     else:
         print("Reading machine configs from stdin...")
-        descs = [MachineDesc.parse_obj(obj) for obj in multi_json(sys.stdin.read())]
+        descs = [
+            MachineDesc.model_validate(obj) for obj in multi_json(sys.stdin.read())
+        ]
 
     if args.ssh and len(descs) != 1:
-        raise RuntimeError("Cannot use `--ssh` with {} instances".format(len(descs)))
+        raise RuntimeError(f"Cannot use `--ssh` with {len(descs)} instances")
+
+    if args.max_age_days <= 0:
+        raise RuntimeError(f"max_age_days must be positive, got {args.max_age_days}")
+    max_age = datetime.timedelta(days=args.max_age_days)
 
     instances = launch_cluster(
         descs,
-        subnet_id=args.subnet_id,
         key_name=args.key_name,
-        security_group_id=args.security_group_id,
+        security_group_name=args.security_group_name,
         instance_profile=args.instance_profile,
         extra_tags=extra_tags,
-        delete_after=datetime.datetime.utcnow() + MAX_AGE,
+        delete_after=datetime.datetime.utcnow() + max_age,
         git_rev=args.git_rev,
         extra_env={},
     )
@@ -126,5 +154,5 @@ def run(args: argparse.Namespace) -> None:
     print_instances(instances, args.output_format)
 
     if args.ssh:
-        print("ssh-ing into: {}".format(instances[0].instance_id))
+        print(f"ssh-ing into: {instances[0].instance_id}")
         mssh(instances[0], "")

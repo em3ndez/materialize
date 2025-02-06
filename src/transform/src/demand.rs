@@ -9,16 +9,18 @@
 
 //! Transformation based on pushing demand information about columns toward sources.
 
-use std::collections::{HashMap, HashSet};
+use itertools::Itertools;
+use mz_ore::assert_none;
+use std::collections::{BTreeMap, BTreeSet};
 
-use expr::{
+use mz_expr::{
     AggregateExpr, AggregateFunc, Id, JoinInputMapper, MirRelationExpr, MirScalarExpr,
     RECURSION_LIMIT,
 };
-use ore::stack::{CheckedRecursion, RecursionGuard};
-use repr::{Datum, Row};
+use mz_ore::stack::{CheckedRecursion, RecursionGuard};
+use mz_repr::{Datum, Row};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Drive demand from the root through operators.
 ///
@@ -32,6 +34,25 @@ use crate::TransformArgs;
 /// not observed in its output. Internal arrangements need not maintain
 /// columns that are no longer required in the join pipeline, which are
 /// those columns not required by the output nor any further equalities.
+///
+/// Nowadays, this transform is mostly obsoleted by `ProjectionPushdown`.
+/// However, I know of one thing that it still does that `ProjectionPushdown`
+/// doesn't do (there might be more such things):
+/// if you have something like
+/// ```code
+///     Project (#0, #1)
+///       Join on=(#0 = #1)
+/// ```
+/// then this is turned into
+/// ```code
+///     Project (#0, #0)
+///       Join on=(#0 = #1)
+/// ```
+/// This can be beneficial for projecting out some columns earlier inside a complex join (by the LIR
+/// planning), and then recovering them after the join (if needed) by duplicating existing columns.
+///
+/// After the last run of `Demand`, there should always be a `ProjectionPushdown`, so that dummies
+/// are eliminated from plans.
 #[derive(Debug)]
 pub struct Demand {
     recursion_guard: RecursionGuard,
@@ -52,16 +73,27 @@ impl CheckedRecursion for Demand {
 }
 
 impl crate::Transform for Demand {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "Demand"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "demand")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        self.action(
+        let result = self.action(
             relation,
             (0..relation.arity()).collect(),
-            &mut HashMap::new(),
-        )
+            &mut BTreeMap::new(),
+        );
+        mz_repr::explain::trace_plan(&*relation);
+        result
     }
 }
 
@@ -70,8 +102,8 @@ impl Demand {
     fn action(
         &self,
         relation: &mut MirRelationExpr,
-        mut columns: HashSet<usize>,
-        gets: &mut HashMap<Id, HashSet<usize>>,
+        mut columns: BTreeSet<usize>,
+        gets: &mut BTreeMap<Id, BTreeSet<usize>>,
     ) -> Result<(), crate::TransformError> {
         self.checked_recur(|_| {
             // A valid relation type is only needed for Maps, but we can't borrow
@@ -88,21 +120,54 @@ impl Demand {
                     Ok(())
                 }
                 MirRelationExpr::Get { id, .. } => {
-                    gets.entry(*id).or_insert_with(HashSet::new).extend(columns);
+                    gets.entry(*id)
+                        .or_insert_with(BTreeSet::new)
+                        .extend(columns);
                     Ok(())
                 }
                 MirRelationExpr::Let { id, value, body } => {
                     // Let harvests any requirements of get from its body,
                     // and pushes the union of the requirements at its value.
                     let id = Id::Local(*id);
-                    let prior = gets.insert(id, HashSet::new());
+                    let prior = gets.insert(id, BTreeSet::new());
+                    assert_none!(prior); // no shadowing
                     self.action(body, columns, gets)?;
-                    let needs = gets.remove(&id).unwrap();
+                    let needs = gets.remove(&id).expect("existing gets entry");
                     if let Some(prior) = prior {
                         gets.insert(id, prior);
                     }
 
                     self.action(value, needs, gets)
+                }
+                MirRelationExpr::LetRec {
+                    ids,
+                    values,
+                    limits: _,
+                    body,
+                } => {
+                    let ids_used_across_iterations = MirRelationExpr::recursive_ids(ids, values)
+                        .iter()
+                        .map(|id| Id::Local(*id))
+                        .collect::<BTreeSet<_>>();
+                    let ids = ids.iter().map(|id| Id::Local(*id)).collect_vec();
+                    for id in ids.iter() {
+                        let prior = gets.insert(id.clone(), BTreeSet::new());
+                        assert_none!(prior); // no shadowing
+                    }
+                    self.action(body, columns, gets)?;
+                    for (id, value) in ids.iter().rev().zip_eq(values.iter_mut().rev()) {
+                        let needs = if !ids_used_across_iterations.contains(id) {
+                            gets.remove(id).expect("existing gets entry")
+                        } else {
+                            // Remove, but ignore the collected needs
+                            gets.remove(id).expect("existing gets entry");
+                            // Instead of using `gets`, we'll say we need all columns for a
+                            // recursive id
+                            (0..value.arity()).collect::<BTreeSet<_>>()
+                        };
+                        self.action(value, needs, gets)?;
+                    }
+                    Ok(())
                 }
                 MirRelationExpr::Project { input, outputs } => self.action(
                     input,
@@ -111,7 +176,7 @@ impl Demand {
                 ),
                 MirRelationExpr::Map { input, scalars } => {
                     let relation_type = relation_type.as_ref().unwrap();
-                    let arity = input.arity();
+                    let arity = relation_type.arity() - scalars.len();
                     // contains columns whose supports have yet to be explored
                     let mut new_columns = columns.clone();
                     new_columns.retain(|c| *c >= arity);
@@ -152,16 +217,15 @@ impl Demand {
                     // A FlatMap which returns zero rows acts like a filter
                     // so we always need to execute it
                     for expr in exprs {
-                        columns.extend(expr.support());
+                        expr.support_into(&mut columns);
                     }
-                    columns.retain(|c| *c < input.arity());
+                    let arity = input.arity();
+                    columns.retain(|c| *c < arity);
                     self.action(input, columns, gets)
                 }
                 MirRelationExpr::Filter { input, predicates } => {
                     for predicate in predicates {
-                        for column in predicate.support() {
-                            columns.insert(column);
-                        }
+                        predicate.support_into(&mut columns)
                     }
                     self.action(input, columns, gets)
                 }
@@ -196,7 +260,7 @@ impl Demand {
                     // Each equivalence class imposes internal demand for columns.
                     for equivalence in equivalences.iter() {
                         for expr in equivalence.iter() {
-                            columns.extend(expr.support());
+                            expr.support_into(&mut columns);
                         }
                     }
 
@@ -223,17 +287,20 @@ impl Demand {
                     monotonic: _,
                     expected_group_size: _,
                 } => {
-                    let mut new_columns = HashSet::new();
+                    let mut new_columns = BTreeSet::new();
                     // Group keys determine aggregation granularity and are
                     // each crucial in determining aggregates and even the
                     // multiplicities of other keys.
-                    new_columns.extend(group_key.iter().flat_map(|e| e.support()));
+                    for k in group_key.iter() {
+                        k.support_into(&mut new_columns)
+                    }
                     for column in columns.iter() {
                         // No obvious requirements on aggregate columns.
                         // A "non-empty" requirement, I guess?
                         if *column >= group_key.len() {
-                            new_columns
-                                .extend(aggregates[*column - group_key.len()].expr.support());
+                            aggregates[*column - group_key.len()]
+                                .expr
+                                .support_into(&mut new_columns);
                         }
                     }
 
@@ -241,7 +308,7 @@ impl Demand {
                     let input_type = input.typ();
                     for index in (0..aggregates.len()).rev() {
                         if !columns.contains(&(group_key.len() + index)) {
-                            let typ = aggregates[index].typ(&input_type);
+                            let typ = aggregates[index].typ(&input_type.column_types);
                             aggregates[index] = AggregateExpr {
                                 func: AggregateFunc::Dummy,
                                 expr: MirScalarExpr::literal_ok(Datum::Dummy, typ.scalar_type),
@@ -256,20 +323,23 @@ impl Demand {
                     input,
                     group_key,
                     order_key,
+                    limit,
                     ..
                 } => {
-                    // Group and order keys must be retained, as they define
-                    // which rows are retained.
+                    // Group and order keys and limit must be retained, as they
+                    // define which rows are retained.
                     columns.extend(group_key.iter().cloned());
                     columns.extend(order_key.iter().map(|o| o.column));
+                    if let Some(limit) = limit {
+                        // Strictly speaking not needed because the
+                        // `limit` support should be a subset of the
+                        // `group_key` support, but we don't want to
+                        // take this for granted here.
+                        limit.support_into(&mut columns)
+                    }
                     self.action(input, columns, gets)
                 }
                 MirRelationExpr::Negate { input } => self.action(input, columns, gets),
-                MirRelationExpr::DeclareKeys { input, keys: _ } => {
-                    // TODO[btv] - If and when we add a "debug mode" that asserts whether this is truly a key,
-                    // we will probably need to add the key to the set of demanded columns.
-                    self.action(input, columns, gets)
-                }
                 MirRelationExpr::Threshold { input } => {
                     // Threshold requires all columns, as collapsing any distinct values
                     // has the potential to change how it thresholds counts. This could
@@ -287,7 +357,7 @@ impl Demand {
                 MirRelationExpr::ArrangeBy { input, keys } => {
                     for key_set in keys {
                         for key in key_set {
-                            columns.extend(key.support());
+                            key.support_into(&mut columns);
                         }
                     }
                     self.action(input, columns, gets)

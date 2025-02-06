@@ -7,42 +7,60 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use ore::{
-    metric,
-    metrics::{raw::HistogramVec, MetricsRegistry, UIntCounter},
-};
+use mz_ore::metric;
+use mz_ore::metrics::raw::IntCounterVec;
+use mz_ore::metrics::{IntCounter, MetricsRegistry};
+
+#[derive(Clone, Debug)]
+pub struct MetricsConfig {
+    connection_status: IntCounterVec,
+}
+
+impl MetricsConfig {
+    pub fn register_into(registry: &MetricsRegistry) -> Self {
+        Self {
+            connection_status: registry.register(metric! {
+                name: "mz_connection_status",
+                help: "Count of completed network connections, by status",
+                var_labels: ["source", "status"],
+            }),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Metrics {
-    pub command_durations: HistogramVec,
-    pub bytes_sent: UIntCounter,
-    pub rows_returned: UIntCounter,
-    pub query_count: UIntCounter,
+    inner: MetricsConfig,
+    label: &'static str,
 }
 
 impl Metrics {
-    pub fn register_into(registry: &MetricsRegistry) -> Metrics {
-        Metrics {
-            command_durations: registry.register(metric!(
-                name: "mz_command_durations",
-                help: "how long individual commands took",
-                var_labels: ["command", "status"],
-            )),
+    pub fn new(inner: MetricsConfig, label: &'static str) -> Self {
+        let self_ = Self { inner, label };
 
-            query_count: registry.register(metric!(
-                name: "mz_query_count",
-                help: "total number of queries executed",
-            )),
+        // pre-initialize labels we are planning to use to ensure they are all
+        // always emitted as time series
+        self_.connection_status(false);
+        self_.connection_status(true);
 
-            rows_returned: registry.register(metric!(
-                name: "mz_pg_sent_rows",
-                help: "total number of rows sent to clients from pgwire",
-            )),
+        self_
+    }
 
-            bytes_sent: registry.register(metric!(
-                name: "mz_pg_sent_bytes",
-                help: "total number of bytes sent to clients from pgwire",
-            )),
+    pub fn connection_status(&self, is_ok: bool) -> IntCounter {
+        self.inner
+            .connection_status
+            .with_label_values(&[self.source_label(), Self::status_label(is_ok)])
+    }
+
+    fn status_label(is_ok: bool) -> &'static str {
+        if is_ok {
+            "success"
+        } else {
+            "error"
         }
+    }
+
+    fn source_label(&self) -> &'static str {
+        self.label
     }
 }

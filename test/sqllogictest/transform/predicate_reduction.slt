@@ -23,20 +23,30 @@ SELECT * FROM t1 WHERE f1 = 0 and (f1 = 0 or f1 = 1)
 NULL
 
 query T multiline
-EXPLAIN SELECT * FROM t1 WHERE f1 = 0 and (f1 = 0 or f1 = 1)
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 WHERE f1 = 0 and (f1 = 0 or f1 = 1)
 ----
-%0 =
-| Get materialize.public.t1 (u1)
-| Filter (#0 = 0)
+Explained Query:
+  Filter (#0 = 0) // { arity: 2 }
+    ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+  filter=((#0 = 0))
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN SELECT * FROM t1 WHERE f1 is null and (f1 is null or f1 = 1)
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 WHERE f1 is null and (f1 is null or f1 = 1)
 ----
-%0 =
-| Get materialize.public.t1 (u1)
-| Filter isnull(#0)
+Explained Query:
+  Filter (#0) IS NULL // { arity: 2 }
+    ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+  filter=((#0) IS NULL)
+
+Target cluster: quickstart
 
 EOF
 
@@ -52,11 +62,16 @@ NULL
 # other instances of `predicate` with `false`.
 
 query T multiline
-EXPLAIN SELECT * FROM t1 WHERE f1 is not null and (f1 is null or f1 = 1)
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 WHERE f1 is not null and (f1 is null or f1 = 1)
 ----
-%0 =
-| Get materialize.public.t1 (u1)
-| Filter (#0 = 1)
+Explained Query:
+  Filter (#0 = 1) // { arity: 2 }
+    ReadStorage materialize.public.t1 // { arity: 2 }
+
+Source materialize.public.t1
+  filter=((#0 = 1))
+
+Target cluster: quickstart
 
 EOF
 
@@ -71,26 +86,25 @@ NULL
 # A test that simplification works when overlapping subexpressions are nested.
 
 query T multiline
-EXPLAIN DECORRELATED PLAN FOR SELECT * FROM t1 WHERE (f1 is null)::int - 1 = 0 and ((f1 is null) or ((f1 is null)::int - 1 = 0))
+EXPLAIN DECORRELATED PLAN WITH(arity) FOR SELECT * FROM t1 WHERE (f1 is null)::int - 1 = 0 and ((f1 is null) or ((f1 is null)::int - 1 = 0))
 ----
-%0 = Let l0 =
-| Constant ()
+Filter (((boolean_to_integer((#0) IS NULL) - 1) = 0) AND ((#0) IS NULL OR ((boolean_to_integer((#0) IS NULL) - 1) = 0))) // { arity: 2 }
+  CrossJoin // { arity: 2 }
+    Constant // { arity: 0 }
+      - ()
+    Get materialize.public.t1 // { arity: 2 }
 
-%1 =
-| Get materialize.public.t1 (u1)
-
-%2 =
-| Join %0 %1
-| | implementation = Unimplemented
-| Filter (((booltoi32(isnull(#0)) - 1) = 0) && (isnull(#0) || ((booltoi32(isnull(#0)) - 1) = 0)))
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN SELECT * FROM t1 WHERE ((f1 is null)::int - 1)::string LIKE '1' and ((f1 is null) or not (((f1 is null)::int - 1)::string LIKE '1'))
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 WHERE ((f1 is null)::int - 1)::string LIKE '1' and ((f1 is null) or not (((f1 is null)::int - 1)::string LIKE '1'))
 ----
-%0 =
-| Constant
+Explained Query (fast path):
+  Constant <empty>
+
+Target cluster: quickstart
 
 EOF
 
@@ -104,24 +118,36 @@ statement ok
 INSERT INTO t2 VALUES (0, -1), (1, 5), (1, -2)
 
 query T multiline
-EXPLAIN SELECT * FROM t2 WHERE f1 + f2 > 0 and case when f1 + f2 > 0 then 1/f1 > 0 else false end;
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t2 WHERE f1 + f2 > 0 and case when f1 + f2 > 0 then 1/f1 > 0 else false end;
 ----
-%0 =
-| Get materialize.public.t2 (u3)
-| Map ((#0 + #1) > 0)
-| Filter #2, if #2 then {((1 / #0) > 0)} else {false}
-| Project (#0, #1)
+Explained Query:
+  Project (#0, #1) // { arity: 2 }
+    Filter #2 AND case when #2 then ((1 / #0) > 0) else false end // { arity: 3 }
+      Map (((#0 + #1) > 0)) // { arity: 3 }
+        ReadStorage materialize.public.t2 // { arity: 2 }
+
+Source materialize.public.t2
+  filter=(#2 AND case when #2 then ((1 / #0) > 0) else false end)
+  map=(((#0 + #1) > 0))
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN SELECT * FROM t2 WHERE case when f1 + f2 > 0 then 1/f1 > 0 else false end and f1 + f2 > 0;
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t2 WHERE case when f1 + f2 > 0 then 1/f1 > 0 else false end and f1 + f2 > 0;
 ----
-%0 =
-| Get materialize.public.t2 (u3)
-| Map ((#0 + #1) > 0)
-| Filter #2, if #2 then {((1 / #0) > 0)} else {false}
-| Project (#0, #1)
+Explained Query:
+  Project (#0, #1) // { arity: 2 }
+    Filter #2 AND case when #2 then ((1 / #0) > 0) else false end // { arity: 3 }
+      Map (((#0 + #1) > 0)) // { arity: 3 }
+        ReadStorage materialize.public.t2 // { arity: 2 }
+
+Source materialize.public.t2
+  filter=(#2 AND case when #2 then ((1 / #0) > 0) else false end)
+  map=(((#0 + #1) > 0))
+
+Target cluster: quickstart
 
 EOF
 

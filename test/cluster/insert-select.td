@@ -40,52 +40,6 @@
 7 8 d
 9 10 e
 
-! INSERT INTO t SELECT * FROM (
-    VALUES ('11', '12', 'f')
-  );
-column "i" is of type integer but expression is of type text
-
-> BEGIN
-
-> INSERT INTO t VALUES (11, 12, 'f')
-
-! INSERT INTO t SELECT * FROM (
-    VALUES (13, 14, 'g')
-  );
-cannot be run inside a transaction block
-
-> COMMIT
-
-> SELECT * FROM t ORDER BY i
-1 2 a
-3 4 b
-5 6 c
-7 8 d
-9 10 e
-
-> BEGIN
-
-! INSERT INTO t SELECT * FROM (
-    VALUES (11, 12, 'f')
-  );
-cannot be run inside a transaction block
-
-> COMMIT
-
-> CREATE MATERIALIZED VIEW v (a, b, c) AS SELECT 11, 12::real, 'f';
-
-! INSERT INTO t SELECT * FROM v;
-invalid selection
-
-# Table check descends into select targets
-! INSERT INTO t (i, f, t) SELECT column1, column2, column3
-    FROM ( VALUES (11, 12, 'f') )
-    LEFT JOIN (
-        SELECT a, b, c FROM v
-    ) AS y
-    ON y.a = column1
-invalid selection
-
 # Multiple connections
 
 > CREATE TABLE c (a int);
@@ -93,14 +47,13 @@ invalid selection
 
 > CREATE TABLE s (a int);
 
-$ postgres-connect name=writer url=postgres://materialize:materialize@${testdrive.materialized-addr}
+$ postgres-connect name=writer url=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
 
 # In-flight txns don't affect updates/deletes, and vice versa
 
 $ postgres-execute connection=writer
 BEGIN;
 INSERT INTO s VALUES (2);
-INSERT INTO c VALUES (3);
 
 > INSERT INTO c SELECT * FROM s;
 
@@ -109,7 +62,7 @@ INSERT INTO c VALUES (3);
 
 $ postgres-execute connection=writer
 
-INSERT INTO s VALUES (4);
+INSERT INTO s VALUES (3);
 COMMIT;
 
 > INSERT INTO c SELECT * FROM s;
@@ -118,14 +71,12 @@ COMMIT;
 1
 2
 3
-4
 
 > BEGIN;
 > SELECT a FROM c
 1
 2
 3
-4
 
 $ postgres-execute connection=writer
 INSERT INTO c SELECT * FROM s;
@@ -134,19 +85,17 @@ INSERT INTO c SELECT * FROM s;
 1
 2
 3
-4
 
 > COMMIT;
 
 # Every value from s should be duplicated in c
 > SELECT a FROM s
 2
-4
+3
 
 > SELECT a FROM c;
 1
 2
 2
 3
-4
-4
+3

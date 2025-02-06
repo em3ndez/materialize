@@ -1,83 +1,71 @@
 ---
 title: "SHOW OBJECTS"
-description: "`SHOW OBJECTS` returns a list of all objects available to your Materialize instances."
+description: "`SHOW OBJECTS` returns a list of all objects in Materialize for a given schema."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 aliases:
     - /sql/show-object
 ---
 
-`SHOW OBJECTS` returns a list of all objects available to your Materialize instances in a given schema.
-Objects include tables, sources, views, indexes, and sinks.
+`SHOW OBJECTS` returns a list of all objects in Materialize for a given schema.
+Objects include tables, sources, sinks, views, materialized views, indexes,
+secrets and connections.
 
 ## Syntax
 
-{{< diagram "show-objects.svg" >}}
+```mzsql
+SHOW OBJECTS [ FROM <schema_name> ]
+```
 
-Field | Use
-------|-----
-_schema&lowbar;name_ | The schema to show objects from. Defaults to `public` in the current database. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
+Option                       | Description
+-----------------------------|------------
+**FROM** <schema_name>       | If specified, only show objects from the specified schema. Defaults to first resolvable schema in the search path. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
 
 ## Details
 
 ### Output format
 
-`SHOW OBJECTS`'s output is a table with one column, `name`. `SHOW FULL OBJECTS` will output a table with
-two columns, `name` and `type`. `type` indicates whether the object was created by the `system` or a `user`.
+`SHOW OBJECTS` will output a table with two columns, `name`and `type`.
 
 ## Examples
 
-```sql
+```mzsql
 SHOW SCHEMAS;
 ```
 ```nofmt
-public
+  name
+--------
+ public
 ```
-```sql
+```mzsql
 SHOW OBJECTS FROM public;
 ```
 ```nofmt
-my_table
-my_source
-my_sink
-my_other_sink
+  name          | type
+----------------+-------
+my_table        | table
+my_source       | source
+my_view         | view
+my_other_source | source
 ```
-```sql
+```mzsql
 SHOW OBJECTS;
 ```
 ```nofmt
-my_table
-my_source
-my_sink
-my_other_sink
-```
-
-```sql
-SHOW FULL OBJECTS;
-```
-```nofmt
-my_table        user
-my_source       user
-my_sink         user
-my_other_sink   user
-```
-
-```sql
-SHOW EXTENDED FULL OBJECTS;
-```
-```nofmt
-my_table        user
-my_source       user
-my_sink         user
-my_other_sink   user
-builtin_view    system
+  name    | type
+----------+-------
+my_table  | table
+my_source | source
+my_view   | view
 ```
 
 ## Related pages
 
 - [`SHOW TABLES`](../show-tables)
 - [`SHOW SOURCES`](../show-sources)
+- [`SHOW SINKS`](../show-sinks)
 - [`SHOW VIEWS`](../show-views)
 - [`SHOW INDEXES`](../show-indexes)
-- [`SHOW SINKS`](../show-sinks)
+- [`SHOW SECRETS`](../show-secrets)
+- [`SHOW CONNECTIONS`](../show-connections)

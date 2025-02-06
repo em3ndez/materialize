@@ -3,17 +3,10 @@ title: "INSERT"
 description: "`INSERT` inserts values into a table."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-{{< version-added v0.5.0 />}}
-
 `INSERT` writes values to [user-defined tables](../create-table).
-
-{{< warning >}}
-At the moment, tables do not persist any data that is inserted. This means that restarting a
-Materialize instance will lose any data that was previously stored in a table.
-{{< /warning >}}
 
 ## Conceptual framework
 
@@ -36,10 +29,13 @@ _query_ | A [`SELECT`](../select) statements whose returned rows you want to wri
 
 ## Details
 
-### Restrictions
+The optional `RETURNING` clause causes `INSERT` to return values based on each inserted row.
 
-Tables do not persist any data that is inserted. This means that restarting a
-Materialize instance will lose any data that was previously stored in a table.
+### Known limitations
+
+* `INSERT ... SELECT` can reference [user-created tables](../create-table) but not [sources](../create-source) _(or views, materialized views, and indexes that depend on sources)_.
+* **Low performance.** While processing an `INSERT ... SELECT` statement,
+  Materialize cannot process other `INSERT`, `UPDATE`, or `DELETE` statements.
 
 ## Examples
 
@@ -47,7 +43,7 @@ To insert data into a table, execute an `INSERT` statement where the `VALUES` cl
 is followed by a list of tuples. Each tuple in the `VALUES` clause must have a value
 for each column in the table. If a column is nullable, a `NULL` value may be provided.
 
-```sql
+```mzsql
 CREATE TABLE t (a int, b text NOT NULL);
 
 INSERT INTO t VALUES (1, 'a'), (NULL, 'b');
@@ -64,7 +60,7 @@ is nullable. `NULL` values may not be inserted into column `b`, which is not nul
 
 You may also insert data using a column specification.
 
-```sql
+```mzsql
 CREATE TABLE t (a int, b text NOT NULL);
 
 INSERT INTO t (b, a) VALUES ('a', 1), ('b', NULL);
@@ -80,7 +76,7 @@ SELECT * FROM t;
 
 You can also insert the values returned from `SELECT` statements:
 
-```sql
+```mzsql
 CREATE TABLE s (a text);
 
 INSERT INTO s VALUES ('c');
@@ -96,6 +92,19 @@ SELECT * FROM t;
    | c
  1 | a
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `USAGE` privileges on the schemas that all relations and types in the query are contained in.
+- `INSERT` privileges on `table_name`.
+- `SELECT` privileges on all relations in the query.
+  - NOTE: if any item is a view, then the view owner must also have the necessary privileges to
+    execute the view definition. Even if the view owner is a _superuser_, they still must explicitly be
+    granted the necessary privileges.
+- `USAGE` privileges on all types used in the query.
+- `USAGE` privileges on the active cluster.
 
 ## Related pages
 

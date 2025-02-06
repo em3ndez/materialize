@@ -14,4 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-version = "0.18.1"
+# If you bump this version, bump it in setup.py too.
+version = "1.9.3"

@@ -9,26 +9,38 @@
 
 //! Fuses a sequence of `Negate` operators in to one or zero `Negate` operators.
 
-use crate::TransformArgs;
-use expr::MirRelationExpr;
+use mz_expr::MirRelationExpr;
+
+use crate::TransformCtx;
 
 /// Fuses a sequence of `Negate` operators in to one or zero `Negate` operators.
 #[derive(Debug)]
 pub struct Negate;
 
 impl crate::Transform for Negate {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "NegateFusion"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "negate_fusion")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        relation.try_visit_mut_pre(&mut |e| Ok(self.action(e)))
+        relation.visit_pre_mut(Self::action);
+        mz_repr::explain::trace_plan(&*relation);
+        Ok(())
     }
 }
 
 impl Negate {
     /// Fuses a sequence of `Negate` operators into one or zero `Negate` operators.
-    pub fn action(&self, relation: &mut MirRelationExpr) {
+    pub fn action(relation: &mut MirRelationExpr) {
         if let MirRelationExpr::Negate { input } = relation {
             let mut require_negate = true;
             while let MirRelationExpr::Negate { input: inner_input } = &mut **input {

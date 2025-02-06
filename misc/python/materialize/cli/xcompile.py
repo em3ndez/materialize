@@ -10,6 +10,7 @@
 # xcompile.py — builds Materialize-specific Docker images.
 
 import argparse
+import os
 import sys
 
 from materialize import mzbuild, spawn, xcompile
@@ -29,6 +30,12 @@ def main() -> int:
         choices=mzbuild.Arch,
     )
 
+    parser.add_argument(
+        "--channel",
+        default="nightly" if os.getenv("CI_SANITIZER", "none") else None,
+        help="Rust compiler channel to use",
+    )
+
     subparsers = parser.add_subparsers(
         dest="command", metavar="<command>", required=True
     )
@@ -42,6 +49,7 @@ def main() -> int:
         default=[],
         help="override the default flags to the Rust compiler",
     )
+
     cargo_parser.add_argument("subcommand", help="the cargo subcommand to invoke")
     cargo_parser.add_argument(
         "subargs", nargs=argparse.REMAINDER, help="the arguments to pass to cargo"
@@ -49,6 +57,12 @@ def main() -> int:
 
     tool_parser = subparsers.add_parser(
         "tool", help="run a cross-compiling binutils tool"
+    )
+    tool_parser.add_argument(
+        "--name-target-prefix",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="whether the tool name should be prefixed with the target name",
     )
     tool_parser.add_argument("tool", metavar="TOOL", help="the binutils tool to invoke")
     tool_parser.add_argument(
@@ -59,14 +73,21 @@ def main() -> int:
     if args.command == "cargo":
         spawn.runv(
             [
-                *xcompile.cargo(args.arch, args.subcommand, args.rustflags),
+                *xcompile.cargo(
+                    arch=args.arch,
+                    channel=args.channel,
+                    subcommand=args.subcommand,
+                    rustflags=args.rustflags,
+                ),
                 *args.subargs,
             ]
         )
     elif args.command == "tool":
         spawn.runv(
             [
-                *xcompile.tool(args.arch, args.tool),
+                *xcompile.tool(
+                    args.arch, args.tool, prefix_name=args.name_target_prefix
+                ),
                 *args.subargs,
             ]
         )

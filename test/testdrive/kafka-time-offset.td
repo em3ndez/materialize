@@ -7,7 +7,13 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-# Tests for `kafka_time_offset` configuration which resolves a `start_offset`
+$ set-arg-default default-storage-size=1
+$ set-arg-default single-replica-cluster=quickstart
+
+$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+ALTER SYSTEM SET max_clusters = 20
+
+# Tests for `START TIMESTAMP` configuration which resolves a start offset
 # during creation of the source.
 
 #
@@ -16,29 +22,28 @@
 
 $ kafka-create-topic topic=t0
 
-! CREATE MATERIALIZED SOURCE missing_topic
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'missing_topic'
-  WITH (kafka_time_offset=1)
-  FORMAT TEXT
-topic missing_topic does not exist
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
-! CREATE MATERIALIZED SOURCE pick_one
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t0-${testdrive.seed}'
-  WITH (kafka_time_offset=1, start_offset=1)
-  FORMAT TEXT
-`start_offset` and `kafka_time_offset` cannot be set at the same time.
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
 
-! CREATE MATERIALIZED SOURCE byo
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t0-${testdrive.seed}'
-  WITH (kafka_time_offset=1, consistency_topic="t0")
-  FORMAT TEXT
-`start_offset` is not yet implemented for non-realtime consistency sources.
+! CREATE SOURCE missing_topic
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP=1, TOPIC 'missing_topic')
+contains:Topic does not exist
 
-! CREATE MATERIALIZED SOURCE not_a_number
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t0-${testdrive.seed}'
-  WITH (kafka_time_offset="not_a_number")
-  FORMAT TEXT
-`kafka_time_offset` must be a number
+! CREATE SOURCE pick_one
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP=1, START OFFSET=[1], TOPIC 'testdrive-t0-${testdrive.seed}')
+contains:cannot specify START TIMESTAMP and START OFFSET at same time
+
+
+! CREATE SOURCE not_a_number
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP="not_a_number", TOPIC 'testdrive-t0-${testdrive.seed}')
+contains:invalid START TIMESTAMP: cannot use value as number
 
 #
 # Append-Only
@@ -61,80 +66,119 @@ fig:fig
 $ kafka-ingest format=bytes topic=t1 key-format=bytes key-terminator=: timestamp=4 partition=2
 grape:grape
 
-> CREATE MATERIALIZED SOURCE append_time_offset_0
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t1-${testdrive.seed}'
-  WITH (kafka_time_offset=0)
-  FORMAT TEXT
+> CREATE CLUSTER append_time_offset_0_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE append_time_offset_0
+  IN CLUSTER append_time_offset_0_cluster
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP=0, TOPIC 'testdrive-t1-${testdrive.seed}')
 
-> CREATE MATERIALIZED SOURCE append_time_offset_1
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t1-${testdrive.seed}'
-  WITH (kafka_time_offset=1, topic_metadata_refresh_interval_ms=10)
+> CREATE TABLE append_time_offset_0_tbl FROM SOURCE append_time_offset_0 (REFERENCE "testdrive-t1-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
-> CREATE MATERIALIZED SOURCE append_time_offset_2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t1-${testdrive.seed}'
-  WITH (kafka_time_offset=2, topic_metadata_refresh_interval_ms=10)
+> CREATE CLUSTER append_time_offset_1_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE append_time_offset_1
+  IN CLUSTER append_time_offset_1_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP=1,
+      TOPIC 'testdrive-t1-${testdrive.seed}'
+    )
+
+> CREATE TABLE append_time_offset_1_tbl FROM SOURCE append_time_offset_1 (REFERENCE "testdrive-t1-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
-> CREATE MATERIALIZED SOURCE append_time_offset_3
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t1-${testdrive.seed}'
-  WITH (kafka_time_offset=3, topic_metadata_refresh_interval_ms=10)
+> CREATE CLUSTER append_time_offset_2_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE append_time_offset_2
+  IN CLUSTER append_time_offset_2_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP=2,
+      TOPIC 'testdrive-t1-${testdrive.seed}'
+    )
+
+> CREATE TABLE append_time_offset_2_tbl FROM SOURCE append_time_offset_2 (REFERENCE "testdrive-t1-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
-> CREATE MATERIALIZED SOURCE append_time_offset_4
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t1-${testdrive.seed}'
-  WITH (kafka_time_offset=4, topic_metadata_refresh_interval_ms=10)
+> CREATE CLUSTER append_time_offset_3_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE append_time_offset_3
+  IN CLUSTER append_time_offset_3_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP=3,
+      TOPIC 'testdrive-t1-${testdrive.seed}'
+    )
+
+> CREATE TABLE append_time_offset_3_tbl FROM SOURCE append_time_offset_3 (REFERENCE "testdrive-t1-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
-> CREATE MATERIALIZED SOURCE append_time_offset_5
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t1-${testdrive.seed}'
-  WITH (kafka_time_offset=5, topic_metadata_refresh_interval_ms=10)
+> CREATE CLUSTER append_time_offset_4_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE append_time_offset_4
+  IN CLUSTER append_time_offset_4_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP=4,
+      TOPIC 'testdrive-t1-${testdrive.seed}'
+    )
+
+> CREATE TABLE append_time_offset_4_tbl FROM SOURCE append_time_offset_4 (REFERENCE "testdrive-t1-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
-> SELECT * FROM append_time_offset_0
-text      mz_offset
+> CREATE CLUSTER append_time_offset_5_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE append_time_offset_5
+  IN CLUSTER append_time_offset_5_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP=5,
+      TOPIC 'testdrive-t1-${testdrive.seed}'
+    )
+
+> CREATE TABLE append_time_offset_5_tbl FROM SOURCE append_time_offset_5 (REFERENCE "testdrive-t1-${testdrive.seed}")
+  FORMAT TEXT
+  INCLUDE OFFSET
+
+> SELECT * FROM append_time_offset_0_tbl
+text      offset
 -------------------
-apple     1
-banana    2
-cherry    1
-date      2
-eggfruit  3
-fig       4
-grape     1
+apple     0
+banana    1
+cherry    0
+date      1
+eggfruit  2
+fig       3
+grape     0
 
-> SELECT * FROM append_time_offset_1
-text      mz_offset
+> SELECT * FROM append_time_offset_1_tbl
+text      offset
 -------------------
-apple     1
-banana    2
-cherry    1
-date      2
-eggfruit  3
-fig       4
-grape     1
+apple     0
+banana    1
+cherry    0
+date      1
+eggfruit  2
+fig       3
+grape     0
 
-> SELECT * FROM append_time_offset_2
-text      mz_offset
+> SELECT * FROM append_time_offset_2_tbl
+text      offset
 -------------------
-cherry    1
-date      2
-eggfruit  3
-fig       4
-grape     1
+cherry    0
+date      1
+eggfruit  2
+fig       3
+grape     0
 
-> SELECT * FROM append_time_offset_3
-text      mz_offset
+> SELECT * FROM append_time_offset_3_tbl
+text      offset
 -------------------
-fig       4
-grape     1
+fig       3
+grape     0
 
-> SELECT * FROM append_time_offset_4
-text      mz_offset
+> SELECT * FROM append_time_offset_4_tbl
+text      offset
 -------------------
-grape     1
+grape     0
 
-> SELECT * FROM append_time_offset_5
-text      mz_offset
+> SELECT * FROM append_time_offset_5_tbl
+text      offset
 -------------------
 
 $ kafka-add-partitions topic=t1 total-partitions=4
@@ -144,10 +188,10 @@ hazelnut:hazelnut
 
 $ set-sql-timeout duration=60s
 
-> SELECT * FROM append_time_offset_5
-text      mz_offset
+> SELECT * FROM append_time_offset_5_tbl
+text      offset
 -------------------
-hazelnut  1
+hazelnut  0
 
 #
 # Upsert
@@ -174,81 +218,123 @@ fig:fig
 $ kafka-ingest format=bytes topic=t2 key-format=bytes key-terminator=: timestamp=4 partition=2
 grape:grape
 
-> CREATE MATERIALIZED SOURCE upsert_time_offset_0
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t2-${testdrive.seed}'
-  WITH (kafka_time_offset=0)
-  FORMAT TEXT
+> CREATE CLUSTER upsert_time_offset_0_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE upsert_time_offset_0
+  IN CLUSTER upsert_time_offset_0_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP=0,
+      TOPIC 'testdrive-t2-${testdrive.seed}'
+  )
+
+> CREATE TABLE upsert_time_offset_0_tbl FROM SOURCE upsert_time_offset_0 (REFERENCE "testdrive-t2-${testdrive.seed}")
+  KEY FORMAT TEXT VALUE FORMAT TEXT
+  INCLUDE OFFSET
   ENVELOPE UPSERT
 
-> CREATE MATERIALIZED SOURCE upsert_time_offset_1
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t2-${testdrive.seed}'
-  WITH (kafka_time_offset=1)
-  FORMAT TEXT
+> CREATE CLUSTER upsert_time_offset_1_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE upsert_time_offset_1
+  IN CLUSTER upsert_time_offset_1_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP 1,
+      TOPIC 'testdrive-t2-${testdrive.seed}'
+  )
+
+> CREATE TABLE upsert_time_offset_1_tbl FROM SOURCE upsert_time_offset_1 (REFERENCE "testdrive-t2-${testdrive.seed}")
+  KEY FORMAT TEXT VALUE FORMAT TEXT
+  INCLUDE OFFSET
   ENVELOPE UPSERT
 
-> CREATE MATERIALIZED SOURCE upsert_time_offset_2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t2-${testdrive.seed}'
-  WITH (kafka_time_offset=2)
-  FORMAT TEXT
+> CREATE CLUSTER upsert_time_offset_2_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE upsert_time_offset_2
+  IN CLUSTER upsert_time_offset_2_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP 2,
+      TOPIC 'testdrive-t2-${testdrive.seed}'
+  )
+
+> CREATE TABLE upsert_time_offset_2_tbl FROM SOURCE upsert_time_offset_2 (REFERENCE "testdrive-t2-${testdrive.seed}")
+  KEY FORMAT TEXT VALUE FORMAT TEXT
+  INCLUDE OFFSET
   ENVELOPE UPSERT
 
-> CREATE MATERIALIZED SOURCE upsert_time_offset_3
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t2-${testdrive.seed}'
-  WITH (kafka_time_offset=3)
-  FORMAT TEXT
+> CREATE CLUSTER upsert_time_offset_3_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE upsert_time_offset_3
+  IN CLUSTER upsert_time_offset_3_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP 3,
+      TOPIC 'testdrive-t2-${testdrive.seed}'
+  )
+
+> CREATE TABLE upsert_time_offset_3_tbl FROM SOURCE upsert_time_offset_3 (REFERENCE "testdrive-t2-${testdrive.seed}")
+  KEY FORMAT TEXT VALUE FORMAT TEXT
+  INCLUDE OFFSET
   ENVELOPE UPSERT
 
-> CREATE MATERIALIZED SOURCE upsert_time_offset_4
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t2-${testdrive.seed}'
-  WITH (kafka_time_offset=4)
-  FORMAT TEXT
+> CREATE CLUSTER upsert_time_offset_4_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE upsert_time_offset_4
+  IN CLUSTER upsert_time_offset_4_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP 4,
+      TOPIC 'testdrive-t2-${testdrive.seed}'
+  )
+
+> CREATE TABLE upsert_time_offset_4_tbl FROM SOURCE upsert_time_offset_4 (REFERENCE "testdrive-t2-${testdrive.seed}")
+  KEY FORMAT TEXT VALUE FORMAT TEXT
+  INCLUDE OFFSET
   ENVELOPE UPSERT
 
-> CREATE MATERIALIZED SOURCE upsert_time_offset_5
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t2-${testdrive.seed}'
-  WITH (kafka_time_offset=5, topic_metadata_refresh_interval_ms=10)
-  FORMAT TEXT
+> CREATE CLUSTER upsert_time_offset_5_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE upsert_time_offset_5
+  IN CLUSTER upsert_time_offset_5_cluster
+  FROM KAFKA CONNECTION kafka_conn (
+      START TIMESTAMP 5,
+      TOPIC 'testdrive-t2-${testdrive.seed}'
+  )
+
+> CREATE TABLE upsert_time_offset_5_tbl FROM SOURCE upsert_time_offset_5 (REFERENCE "testdrive-t2-${testdrive.seed}")
+  KEY FORMAT TEXT VALUE FORMAT TEXT
+  INCLUDE OFFSET
   ENVELOPE UPSERT
 
-> SELECT * FROM upsert_time_offset_0
-key0      text      mz_offset
+> SELECT * FROM upsert_time_offset_0_tbl
+key       text      offset
 -----------------------------
-banana    banana    2
-date      date      2
-eggfruit  eggfruit  3
-fig       fig       5
-grape     grape     1
+banana    banana    1
+date      date      1
+eggfruit  eggfruit  2
+fig       fig       4
+grape     grape     0
 
-> SELECT * FROM upsert_time_offset_1
-key0      text      mz_offset
+> SELECT * FROM upsert_time_offset_1_tbl
+key       text      offset
 -----------------------------
-banana    banana    2
-date      date      2
-eggfruit  eggfruit  3
-fig       fig       5
-grape     grape     1
+banana    banana    1
+date      date      1
+eggfruit  eggfruit  2
+fig       fig       4
+grape     grape     0
 
-> SELECT * FROM upsert_time_offset_2
-key0      text      mz_offset
+> SELECT * FROM upsert_time_offset_2_tbl
+key       text      offset
 -----------------------------
-date      date      2
-eggfruit  eggfruit  3
-fig       fig       5
-grape     grape     1
+date      date      1
+eggfruit  eggfruit  2
+fig       fig       4
+grape     grape     0
 
-> SELECT * FROM upsert_time_offset_3
-key0      text      mz_offset
+> SELECT * FROM upsert_time_offset_3_tbl
+key       text      offset
 -----------------------------
-fig       fig       5
-grape     grape     1
+fig       fig       4
+grape     grape     0
 
-> SELECT * FROM upsert_time_offset_4
-key0      text      mz_offset
+> SELECT * FROM upsert_time_offset_4_tbl
+key       text      offset
 -----------------------------
-grape     grape     1
+grape     grape     0
 
-> SELECT * FROM upsert_time_offset_5
-key0      text      mz_offset
+> SELECT * FROM upsert_time_offset_5_tbl
+key       text      offset
 -----------------------------
 
 $ kafka-add-partitions topic=t2 total-partitions=4
@@ -259,10 +345,10 @@ hazelnut:hazelnut
 # It takes a while for new partitions to be consumed...
 $ set-sql-timeout duration=60s
 
-> SELECT * FROM upsert_time_offset_5
-key0      text      mz_offset
+> SELECT * FROM upsert_time_offset_5_tbl
+key       text      offset
 -----------------------------
-hazelnut  hazelnut  1
+hazelnut  hazelnut  0
 
 #
 # Relative timestamps
@@ -284,26 +370,34 @@ banana
 $ kafka-ingest format=bytes topic=t3 timestamp=4084108700000
 cherry
 
-> CREATE MATERIALIZED SOURCE relative_time_offset_30_years_ago
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t3-${testdrive.seed}'
-  WITH (kafka_time_offset=-946100000000)
+> CREATE CLUSTER relative_time_offset_30_years_ago_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE relative_time_offset_30_years_ago
+  IN CLUSTER relative_time_offset_30_years_ago_cluster
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP=-946100000000, TOPIC 'testdrive-t3-${testdrive.seed}')
+
+> CREATE TABLE relative_time_offset_30_years_ago_tbl FROM SOURCE relative_time_offset_30_years_ago (REFERENCE "testdrive-t3-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
-> CREATE MATERIALIZED SOURCE relative_time_offset_today
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t3-${testdrive.seed}'
-  WITH (kafka_time_offset=-1)
+> CREATE CLUSTER relative_time_offset_today_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE relative_time_offset_today
+  IN CLUSTER relative_time_offset_today_cluster
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP=-1, TOPIC 'testdrive-t3-${testdrive.seed}')
+
+> CREATE TABLE relative_time_offset_today_tbl FROM SOURCE relative_time_offset_today (REFERENCE "testdrive-t3-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
-> SELECT * FROM relative_time_offset_30_years_ago
-text      mz_offset
+> SELECT * FROM relative_time_offset_30_years_ago_tbl
+text      offset
 -------------------
-banana    2
-cherry    3
+banana    1
+cherry    2
 
-> SELECT * FROM relative_time_offset_today
-text      mz_offset
+> SELECT * FROM relative_time_offset_today_tbl
+text      offset
 -------------------
-cherry    3
+cherry    2
 
 # Make sure that we don't fetch any messages that we don't want to fetch
 
@@ -315,28 +409,97 @@ pie
 
 # A time offset of -1 specifies that we want to start from the end of the topic
 # (negative offsets are relative from the end).
-> CREATE MATERIALIZED SOURCE verify_no_fetch
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t4-${testdrive.seed}'
-  WITH (kafka_time_offset = -1)
+> CREATE CLUSTER verify_no_fetch_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE verify_no_fetch
+  IN CLUSTER verify_no_fetch_cluster
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP=-1, TOPIC 'testdrive-t4-${testdrive.seed}')
+
+> CREATE TABLE verify_no_fetch_tbl FROM SOURCE verify_no_fetch (REFERENCE "testdrive-t4-${testdrive.seed}")
   FORMAT TEXT
+  INCLUDE OFFSET
 
 
-> SELECT * FROM verify_no_fetch
-text      mz_offset
--------------------
+#
+# UPSERT + AVRO
+#
 
-> SELECT SUM((statistics->'topics'->'testdrive-t4-${testdrive.seed}'->'partitions'->'0'->'msgs')::int) from mz_kafka_source_statistics;
-0
+$ set keyschema={
+    "type": "record",
+    "name": "Key",
+    "fields": [
+        {"name": "id", "type": "long"}
+    ]
+  }
 
-$ kafka-ingest format=bytes topic=t4 timestamp=2
-mud
-pie
+$ set schema={
+    "type" : "record",
+    "name" : "envelope",
+    "fields" : [
+      {
+        "name": "before",
+        "type": [
+          {
+            "name": "row",
+            "type": "record",
+            "fields": [
+              {
+                  "name": "id",
+                  "type": "long"
+              },
+              {
+                "name": "creature",
+                "type": "string"
+              }]
+           },
+           "null"
+         ]
+      },
+      {
+        "name": "after",
+        "type": ["row", "null"]
+      }
+    ]
+  }
 
-> SELECT * FROM verify_no_fetch
-text      mz_offset
--------------------
-mud       3
-pie       4
+$ kafka-create-topic topic=dbzupsert
 
-> SELECT SUM((statistics->'topics'->'testdrive-t4-${testdrive.seed}'->'partitions'->'0'->'msgs')::int) from mz_kafka_source_statistics;
-2
+$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} timestamp=1
+{"id": 1} {"before": {"row": {"id": 1, "creature": "fish"}}, "after": {"row": {"id": 1, "creature": "mudskipper"}}}
+{"id": 1} {"before": {"row": {"id": 1, "creature": "mudskipper"}}, "after": {"row": {"id": 1, "creature": "salamander"}}}
+{"id": 1} {"before": {"row": {"id": 1, "creature": "salamander"}}, "after": {"row": {"id": 1, "creature": "lizard"}}}
+
+$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} timestamp=2
+{"id": 1} {"before": {"row": {"id": 1, "creature": "lizard"}}, "after": {"row": {"id": 1, "creature": "dino"}}}
+
+$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} timestamp=3
+{"id": 2} {"before": null, "after": {"row": {"id": 2, "creature": "archeopteryx"}}}
+{"id": 2} {"before": {"row": {"id": 2, "creature": "archeopteryx"}}, "after": {"row": {"id": 2, "creature": "velociraptor"}}}
+
+# test duplicates
+$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} timestamp=4
+{"id": 3} {"before": {"row": {"id": 3, "creature": "protoceratops"}}, "after": {"row": {"id": 3, "creature": "triceratops"}}}
+{"id": 3} {"before": {"row": {"id": 3, "creature": "protoceratops"}}, "after": {"row": {"id": 3, "creature": "triceratops"}}}
+
+# test removal and reinsertion
+$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} timestamp=5
+{"id": 4} {"before": null, "after": {"row": {"id": 4, "creature": "moros"}}}
+
+$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} timestamp=6
+{"id": 4} {"before": {"row": {"id": 4, "creature": "trex"}}, "after": null}
+
+$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} timestamp=7
+{"id": 4} {"before": {"row": {"id": 4, "creature": "trex"}}, "after": {"row": {"id": 4, "creature": "chicken"}}}
+
+> CREATE CLUSTER upsert_time_skip_cluster SIZE '${arg.default-storage-size}';
+> CREATE SOURCE upsert_time_skip
+  IN CLUSTER upsert_time_skip_cluster
+  FROM KAFKA CONNECTION kafka_conn (START TIMESTAMP=6, TOPIC 'testdrive-dbzupsert-${testdrive.seed}')
+
+> CREATE TABLE upsert_time_skip_tbl FROM SOURCE upsert_time_skip (REFERENCE "testdrive-dbzupsert-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+
+> SELECT * FROM upsert_time_skip_tbl
+id creature
+-----------
+4  chicken

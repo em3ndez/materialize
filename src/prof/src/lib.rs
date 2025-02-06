@@ -1,154 +1,278 @@
 // Copyright Materialize, Inc. and contributors. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License in the LICENSE file at the
+// root of this repository, or online at
 //
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use serde::Serialize;
-use std::{collections::HashMap, ffi::c_void, time::Instant};
+use std::collections::BTreeMap;
+use std::ffi::c_void;
+use std::io::Write;
+use std::sync::atomic::AtomicBool;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use mz_ore::cast::{CastFrom, TryCastFrom};
+use pprof_util::{StackProfile, WeightedStack};
+use prost::Message;
+
+mod pprof_types;
+pub mod time;
 
 #[cfg(feature = "jemalloc")]
 pub mod jemalloc;
-pub mod time;
 
-#[derive(Copy, Clone, Debug)]
-// These constructors are dead on macOS
-#[allow(dead_code)]
-pub enum ProfStartTime {
-    Instant(Instant),
-    TimeImmemorial,
-}
-
-#[derive(Clone, Debug)]
-pub struct WeightedStack {
-    pub addrs: Vec<usize>,
-    pub weight: f64,
-}
-
-#[derive(Default)]
-pub struct StackProfile {
-    annotations: Vec<String>,
-    // The second element is the index in `annotations`, if one exists.
-    stacks: Vec<(WeightedStack, Option<usize>)>,
-}
-
-pub struct StackProfileIter<'a> {
-    inner: &'a StackProfile,
-    idx: usize,
-}
-
-impl<'a> Iterator for StackProfileIter<'a> {
-    type Item = (&'a WeightedStack, Option<&'a str>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (stack, anno) = self.inner.stacks.get(self.idx)?;
-        self.idx += 1;
-        let anno = anno.map(|idx| self.inner.annotations.get(idx).unwrap().as_str());
-        Some((stack, anno))
-    }
-}
-
-impl StackProfile {
-    pub fn push(&mut self, stack: WeightedStack, annotation: Option<&str>) {
-        let anno_idx = if let Some(annotation) = annotation {
-            Some(
-                self.annotations
-                    .iter()
-                    .position(|anno| annotation == anno.as_str())
-                    .unwrap_or_else(|| {
-                        self.annotations.push(annotation.to_string());
-                        self.annotations.len() - 1
-                    }),
-            )
-        } else {
-            None
-        };
-        self.stacks.push((stack, anno_idx))
-    }
-    pub fn iter(&self) -> StackProfileIter<'_> {
-        StackProfileIter {
-            inner: self,
-            idx: 0,
-        }
-    }
-}
-#[derive(Serialize)]
-pub struct SymbolTrieNode {
-    pub name: String,
-    pub weight: f64,
-    links: Vec<usize>,
-}
-
-#[derive(Serialize)]
-pub struct WeightedSymbolTrie {
-    arena: Vec<SymbolTrieNode>,
-}
-
-impl WeightedSymbolTrie {
-    fn new() -> Self {
-        let root = SymbolTrieNode {
-            name: "".to_string(),
-            weight: 0.0,
-            links: vec![],
-        };
-        let arena = vec![root];
-        Self { arena }
-    }
-    pub fn dfs<F: FnMut(&SymbolTrieNode), G: FnMut(&SymbolTrieNode, bool)>(
+pub trait StackProfileExt {
+    /// Writes out the `.mzfg` format, which is fully described in flamegraph.js.
+    fn to_mzfg(&self, symbolize: bool, header_extra: &[(&str, &str)]) -> String;
+    /// Converts the profile into the pprof format.
+    ///
+    /// pprof encodes profiles as gzipped protobuf messages of the Profile message type
+    /// (see `pprof/profile.proto`).
+    fn to_pprof(
         &self,
-        mut pre: F,
-        mut post: G,
-    ) {
-        self.dfs_inner(0, &mut pre, &mut post, true);
-    }
+        sample_type: (&str, &str),
+        period_type: (&str, &str),
+        anno_key: Option<String>,
+    ) -> Vec<u8>;
+}
 
-    fn dfs_inner<F: FnMut(&SymbolTrieNode), G: FnMut(&SymbolTrieNode, bool)>(
-        &self,
-        cur: usize,
-        pre: &mut F,
-        post: &mut G,
-        is_last: bool,
-    ) {
-        let node = &self.arena[cur];
-        pre(node);
-        for &link_idx in node.links.iter() {
-            let is_last = link_idx == *node.links.last().unwrap();
-            self.dfs_inner(link_idx, pre, post, is_last);
+impl StackProfileExt for StackProfile {
+    fn to_mzfg(&self, symbolize: bool, header_extra: &[(&str, &str)]) -> String {
+        // All the unwraps in this function are justified by the fact that
+        // String's fmt::Write impl is infallible.
+        use std::fmt::Write;
+        let mut builder = r#"!!! COMMENT !!!: Open with bin/fgviz /path/to/mzfg
+mz_fg_version: 1
+"#
+        .to_owned();
+        for (k, v) in header_extra {
+            assert!(!(k.contains(':') || k.contains('\n') || v.contains('\n')));
+            writeln!(&mut builder, "{k}: {v}").unwrap();
         }
-        post(node, is_last);
-    }
+        writeln!(&mut builder, "").unwrap();
 
-    fn step(&mut self, node: usize, next_name: &str) -> usize {
-        for &link_idx in self.arena[node].links.iter() {
-            if next_name == self.arena[link_idx].name {
-                return link_idx;
+        for (WeightedStack { addrs, weight }, anno) in &self.stacks {
+            let anno = anno.map(|i| &self.annotations[i]);
+            for &addr in addrs {
+                write!(&mut builder, "{addr:#x};").unwrap();
+            }
+            write!(&mut builder, " {weight}").unwrap();
+            if let Some(anno) = anno {
+                write!(&mut builder, " {anno}").unwrap()
+            }
+            writeln!(&mut builder, "").unwrap();
+        }
+
+        if symbolize {
+            let symbols = crate::symbolize(self);
+            writeln!(&mut builder, "").unwrap();
+
+            for (addr, names) in symbols {
+                if !names.is_empty() {
+                    write!(&mut builder, "{addr:#x} ").unwrap();
+                    for mut name in names {
+                        // The client splits on semicolons, so
+                        // we have to escape them.
+                        name = name.replace('\\', "\\\\");
+                        name = name.replace(';', "\\;");
+                        write!(&mut builder, "{name};").unwrap();
+                    }
+                    writeln!(&mut builder, "").unwrap();
+                }
             }
         }
-        let next = SymbolTrieNode {
-            name: next_name.to_string(),
-            weight: 0.0,
-            links: vec![],
-        };
-        let idx = self.arena.len();
-        self.arena.push(next);
-        self.arena[node].links.push(idx);
-        idx
+
+        builder
     }
 
-    fn node_mut(&mut self, idx: usize) -> &mut SymbolTrieNode {
-        &mut self.arena[idx]
+    fn to_pprof(
+        &self,
+        sample_type: (&str, &str),
+        period_type: (&str, &str),
+        anno_key: Option<String>,
+    ) -> Vec<u8> {
+        use crate::pprof_types as proto;
+
+        let mut profile = proto::Profile::default();
+        let mut strings = StringTable::new();
+
+        let anno_key = anno_key.unwrap_or_else(|| "annotation".into());
+
+        profile.sample_type = vec![proto::ValueType {
+            r#type: strings.insert(sample_type.0),
+            unit: strings.insert(sample_type.1),
+        }];
+        profile.period_type = Some(proto::ValueType {
+            r#type: strings.insert(period_type.0),
+            unit: strings.insert(period_type.1),
+        });
+
+        profile.time_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now is later than UNIX epoch")
+            .as_nanos()
+            .try_into()
+            .expect("the year 2554 is far away");
+
+        for (mapping, mapping_id) in self.mappings.iter().zip(1..) {
+            let pathname = mapping.pathname.to_string_lossy();
+            let filename_idx = strings.insert(&pathname);
+
+            let build_id_idx = match &mapping.build_id {
+                Some(build_id) => strings.insert(&build_id.to_string()),
+                None => 0,
+            };
+
+            profile.mapping.push(proto::Mapping {
+                id: mapping_id,
+                memory_start: u64::cast_from(mapping.memory_start),
+                memory_limit: u64::cast_from(mapping.memory_end),
+                file_offset: mapping.file_offset,
+                filename: filename_idx,
+                build_id: build_id_idx,
+                ..Default::default()
+            });
+
+            // This is a is a Polar Signals-specific extension: For correct offline symbolization
+            // they need access to the memory offset of mappings, but the pprof format only has a
+            // field for the file offset. So we instead encode additional information about
+            // mappings in magic comments. There must be exactly one comment for each mapping.
+
+            // Take a shortcut and assume the ELF type is always `ET_DYN`. This is true for shared
+            // libraries and for position-independent executable, so it should always be true for
+            // any mappings we have.
+            // Getting the actual information is annoying. It's in the ELF header (the `e_type`
+            // field), but there is no guarantee that the full ELF header gets mapped, so we might
+            // not be able to find it in memory. We could try to load it from disk instead, but
+            // then we'd have to worry about blocking disk I/O.
+            let elf_type = 3;
+
+            let comment = format!(
+                "executableInfo={:x};{:x};{:x}",
+                elf_type, mapping.file_offset, mapping.memory_offset
+            );
+            profile.comment.push(strings.insert(&comment));
+        }
+
+        let mut location_ids = BTreeMap::new();
+        for (stack, anno) in self.iter() {
+            let mut sample = proto::Sample::default();
+
+            let value = stack.weight.trunc();
+            let value = i64::try_cast_from(value).expect("no exabyte heap sizes");
+            sample.value.push(value);
+
+            for addr in stack.addrs.iter().rev() {
+                // See the comment
+                // [here](https://github.com/rust-lang/backtrace-rs/blob/036d4909e1fb9c08c2bb0f59ac81994e39489b2f/src/symbolize/mod.rs#L123-L147)
+                // for why we need to subtract one. tl;dr addresses
+                // in stack traces are actually the return address of
+                // the called function, which is one past the call
+                // itself.
+                //
+                // Of course, the `call` instruction can be more than one byte, so after subtracting
+                // one, we might point somewhere in the middle of it, rather
+                // than to the beginning of the instruction. That's fine; symbolization
+                // tools don't seem to get confused by this.
+                let addr = u64::cast_from(*addr) - 1;
+
+                let loc_id = *location_ids.entry(addr).or_insert_with(|| {
+                    // pprof_types.proto says the location id may be the address, but Polar Signals
+                    // insists that location ids are sequential, starting with 1.
+                    let id = u64::cast_from(profile.location.len()) + 1;
+                    let mapping_id = profile
+                        .mapping
+                        .iter()
+                        .find(|m| m.memory_start <= addr && m.memory_limit > addr)
+                        .map_or(0, |m| m.id);
+                    profile.location.push(proto::Location {
+                        id,
+                        mapping_id,
+                        address: addr,
+                        ..Default::default()
+                    });
+                    id
+                });
+
+                sample.location_id.push(loc_id);
+
+                if let Some(anno) = anno {
+                    sample.label.push(proto::Label {
+                        key: strings.insert(&anno_key),
+                        str: strings.insert(anno),
+                        ..Default::default()
+                    })
+                }
+            }
+
+            profile.sample.push(sample);
+        }
+
+        profile.string_table = strings.finish();
+
+        let encoded = profile.encode_to_vec();
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&encoded).unwrap();
+        gz.finish().unwrap()
     }
+}
+
+/// Helper struct to simplify building a `string_table` for the pprof format.
+#[derive(Default)]
+struct StringTable(BTreeMap<String, i64>);
+
+impl StringTable {
+    fn new() -> Self {
+        // Element 0 must always be the emtpy string.
+        let inner = [("".into(), 0)].into();
+        Self(inner)
+    }
+
+    fn insert(&mut self, s: &str) -> i64 {
+        if let Some(idx) = self.0.get(s) {
+            *idx
+        } else {
+            let idx = i64::try_from(self.0.len()).expect("must fit");
+            self.0.insert(s.into(), idx);
+            idx
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        let mut vec: Vec<_> = self.0.into_iter().collect();
+        vec.sort_by_key(|(_, idx)| *idx);
+        vec.into_iter().map(|(s, _)| s).collect()
+    }
+}
+
+static EVER_SYMBOLIZED: AtomicBool = AtomicBool::new(false);
+
+/// Check whether symbolization has ever been run in this process.
+/// This controls whether we display a warning about increasing RAM usage
+/// due to the backtrace cache on the
+/// profiler page. (Because the RAM hit is one-time, we don't need to warn if it's already happened).
+pub fn ever_symbolized() -> bool {
+    EVER_SYMBOLIZED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Given some stack traces, generate a map of addresses to their
 /// corresponding symbols.
 ///
-/// Each address could correspond to more than one symbol, becuase
+/// Each address could correspond to more than one symbol, because
 /// of inlining. (E.g. if 0x1234 comes from "g", which is inlined in "f", the corresponding vec of symbols will be ["f", "g"].)
-pub fn symbolicate(profile: &StackProfile) -> HashMap<usize, Vec<String>> {
+pub fn symbolize(profile: &StackProfile) -> BTreeMap<usize, Vec<String>> {
+    EVER_SYMBOLIZED.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut all_addrs = vec![];
     for (stack, _annotation) in profile.stacks.iter() {
         all_addrs.extend(stack.addrs.iter().cloned());
@@ -162,7 +286,10 @@ pub fn symbolicate(profile: &StackProfile) -> HashMap<usize, Vec<String>> {
         .into_iter()
         .map(|addr| {
             let mut syms = vec![];
-            backtrace::resolve(addr as *mut c_void, |sym| {
+            // No other known way to convert usize to pointer.
+            #[allow(clippy::as_conversions)]
+            let addr_ptr = addr as *mut c_void;
+            backtrace::resolve(addr_ptr, |sym| {
                 let name = sym
                     .name()
                     .map(|sn| sn.to_string())
@@ -173,48 +300,4 @@ pub fn symbolicate(profile: &StackProfile) -> HashMap<usize, Vec<String>> {
             (addr, syms)
         })
         .collect()
-}
-/// Given some stack traces along with their weights,
-/// collate them into a tree structure by function name.
-///
-/// For example: given the following stacks and weights:
-/// ([0x1234, 0xabcd], 100)
-/// ([0x123a, 0xabff, 0x1234], 200)
-/// ([0x1234, 0xffcc], 50)
-/// and assuming that 0x1234 and 0x123a come from the function `f`,
-/// 0xabcd and 0xabff come from `g`, and 0xffcc from `h`, this will produce:
-///
-/// "f" (350) -> "g" 200
-///  |
-///  v
-/// "h" (50)
-pub fn collate_stacks(profile: StackProfile) -> WeightedSymbolTrie {
-    let addr_to_symbols = symbolicate(&profile);
-    let mut trie = WeightedSymbolTrie::new();
-    let StackProfile {
-        annotations,
-        stacks,
-    } = profile;
-    let any_annotation = !annotations.is_empty();
-    for (stack, annotation) in stacks {
-        let mut cur = if any_annotation {
-            let annotation = annotation
-                .map(|idx| annotations[idx].as_str())
-                .unwrap_or("unknown");
-            trie.node_mut(0).weight += stack.weight;
-            trie.step(0, annotation)
-        } else {
-            0
-        };
-        for name in stack
-            .addrs
-            .into_iter()
-            .flat_map(|addr| addr_to_symbols.get(&addr).unwrap().iter())
-        {
-            trie.node_mut(cur).weight += stack.weight;
-            cur = trie.step(cur, name);
-        }
-        trie.node_mut(cur).weight += stack.weight;
-    }
-    trie
 }

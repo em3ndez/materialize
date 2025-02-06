@@ -23,14 +23,9 @@ $ set schema={
         ]
     }
 
-$ kafka-ingest format=avro topic=kafka-counters key-format=avro key-schema=${keyschema} schema=${schema} publish=true
+$ kafka-ingest format=avro topic=kafka-counters key-format=avro key-schema=${keyschema} schema=${schema}
 {"f1": "-1"} {"f2": "-1"}
 
 
-> SELECT COUNT(*) = 10001 FROM kafka_counters;
-true
-
-# We expect the counter to be at 1, that is no data was re-ingested
-# from the Kafka topic post-restart.
-> SELECT SUM(CAST(statistics->'topics'->'testdrive-kafka-counters-${testdrive.seed}'->'partitions'->'0'->'msgs' AS INT)) = 1 FROM mz_kafka_source_statistics;
-true
+> SELECT COUNT(*) FROM kafka_counters_tbl;
+10001

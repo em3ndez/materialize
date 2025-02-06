@@ -14,6 +14,11 @@ SELECT current_database()
 ----
 materialize
 
+query T
+SELECT current_catalog() = current_database()
+----
+true
+
 statement ok
 CREATE DATABASE otherdb
 

@@ -10,49 +10,31 @@
 use std::thread;
 use std::time::Duration;
 
-use ore::result::ResultExt;
+use anyhow::Context;
 use rand::Rng;
 
-use crate::action::{State, SyncAction};
+use crate::action::ControlFlow;
 use crate::parser::BuiltinCommand;
 
-pub struct SleepAction {
-    duration: Duration,
-    random: bool,
+pub fn run_sleep(cmd: BuiltinCommand) -> Result<ControlFlow, anyhow::Error> {
+    run_sleep_inner(cmd, false)
 }
 
-pub fn build_random_sleep(mut cmd: BuiltinCommand) -> Result<SleepAction, String> {
+pub fn run_random_sleep(cmd: BuiltinCommand) -> Result<ControlFlow, anyhow::Error> {
+    run_sleep_inner(cmd, true)
+}
+
+fn run_sleep_inner(mut cmd: BuiltinCommand, random: bool) -> Result<ControlFlow, anyhow::Error> {
     let arg = cmd.args.string("duration")?;
-    let duration = repr::util::parse_duration(&arg).map_err_to_string()?;
-    Ok(SleepAction {
-        duration,
-        random: true,
-    })
-}
-
-pub fn build_sleep(mut cmd: BuiltinCommand) -> Result<SleepAction, String> {
-    let arg = cmd.args.string("duration")?;
-    let duration = repr::util::parse_duration(&arg).map_err_to_string()?;
-    Ok(SleepAction {
-        duration,
-        random: false,
-    })
-}
-
-impl SyncAction for SleepAction {
-    fn undo(&self, _: &mut State) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn redo(&self, _: &mut State) -> Result<(), String> {
-        let sleep = if self.random {
-            let mut rng = rand::thread_rng();
-            rng.gen_range(Duration::from_secs(0)..self.duration)
-        } else {
-            self.duration
-        };
-        println!("Sleeping for {:?}", sleep);
-        thread::sleep(sleep);
-        Ok(())
-    }
+    cmd.args.done()?;
+    let duration = humantime::parse_duration(&arg).context("parsing duration")?;
+    let sleep = if random {
+        let mut rng = rand::thread_rng();
+        rng.gen_range(Duration::from_secs(0)..duration)
+    } else {
+        duration
+    };
+    println!("Sleeping for {:?}", sleep);
+    thread::sleep(sleep);
+    Ok(ControlFlow::Continue)
 }

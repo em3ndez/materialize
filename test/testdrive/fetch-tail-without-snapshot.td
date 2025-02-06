@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Make sure that the SNAPSHOT=FALSE option is observed
 #
@@ -21,19 +23,25 @@ $ kafka-ingest format=avro topic=tail-without-snapshot schema=${int} timestamp=1
 {"f1": 234}
 {"f1": 345}
 
-> CREATE MATERIALIZED SOURCE tail_without_snapshot
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-tail-without-snapshot-${testdrive.seed}'
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE tail_without_snapshot
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-tail-without-snapshot-${testdrive.seed}')
+
+> CREATE TABLE tail_without_snapshot_tbl FROM SOURCE tail_without_snapshot (REFERENCE "testdrive-tail-without-snapshot-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE
 
-> SELECT * FROM tail_without_snapshot;
+> SELECT * FROM tail_without_snapshot_tbl;
 123
 234
 345
 
 > BEGIN
 
-> DECLARE c CURSOR FOR TAIL tail_without_snapshot WITH (SNAPSHOT = FALSE);
+> DECLARE c CURSOR FOR SUBSCRIBE tail_without_snapshot_tbl WITH (SNAPSHOT = FALSE);
 
 > FETCH 1 FROM c WITH (timeout = '2s')
 

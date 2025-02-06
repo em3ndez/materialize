@@ -1,40 +1,38 @@
 ---
 title: "SHOW CREATE SOURCE"
-description: "`SHOW CREATE SOURCE` returns the URL used to create the source."
+description: "`SHOW CREATE SOURCE` returns the statement used to create the source."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`SHOW CREATE SOURCE` returns the URL used to create the source.
+`SHOW CREATE SOURCE` returns the DDL statement used to create the source.
 
 ## Syntax
 
-{{< diagram "show-create-source.svg" >}}
+```sql
+SHOW CREATE SOURCE <source_name>
+```
 
-Field | Use
-------|-----
-_source&lowbar;name_ | The source you want use. You can find available source names through [`SHOW SOURCES`](../show-sources).
-
-## Details
-
-You can determine a source's type by the **Source URL** address prefix.
-
-Prefix | Type
--------|------
-`kafka://` | Streaming
-`file://` | File
+For available source names, see [`SHOW SOURCES`](/sql/show-sources).
 
 ## Examples
 
-```sql
-SHOW CREATE SOURCE my_source;
+```mzsql
+SHOW CREATE SOURCE market_orders_raw;
 ```
+
 ```nofmt
-    Source   |        Source URL
--------------+--------------------------
- my_source   | file:///file-source.csv
+                 name                 |                                      create_sql
+--------------------------------------+--------------------------------------------------------------------------------------------------------------
+ materialize.public.market_orders_raw | CREATE SOURCE "materialize"."public"."market_orders_raw" IN CLUSTER "c" FROM LOAD GENERATOR COUNTER
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `USAGE` privileges on the schema containing the source.
 
 ## Related pages
 

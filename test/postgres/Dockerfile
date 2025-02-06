@@ -9,9 +9,13 @@
 
 MZFROM test-certs as certs
 
-FROM postgres:10
+FROM postgres:17.2
 
 ENV POSTGRES_PASSWORD=postgres
+
+RUN apt update
+
+RUN apt install postgresql-17-cron
 
 COPY --chown=postgres --from=certs /secrets/* /share/secrets/
 COPY pg_hba.conf /share/conf/pg_hba.conf

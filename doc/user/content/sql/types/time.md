@@ -1,5 +1,5 @@
 ---
-title: "time Data Type"
+title: "time type"
 description: "Expresses a time without a specific date"
 menu:
   main:
@@ -58,7 +58,7 @@ Operation | Computes
 
 ## Examples
 
-```sql
+```mzsql
 SELECT TIME '01:23:45' AS t_v;
 ```
 ```nofmt
@@ -69,11 +69,11 @@ SELECT TIME '01:23:45' AS t_v;
 
 <hr/>
 
-```sql
-SELECT DATE '2001-02-03' + TIME '45:53:24' AS d_t;
+```mzsql
+SELECT DATE '2001-02-03' + TIME '12:34:56' AS d_t;
 ```
 ```nofmt
          d_t
 ---------------------
- 2001-02-03 12:34:45
+ 2001-02-03 12:34:56
 ```

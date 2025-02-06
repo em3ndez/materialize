@@ -39,7 +39,7 @@ impl CgroupEntry {
     }
 }
 
-/// Parses /proc/self/cgroup into a Vec<CgroupEntry>, if the file exists.
+/// Parses /proc/self/cgroup into a `Vec<CgroupEntry>`, if the file exists.
 pub fn parse_proc_self_cgroup() -> Option<Vec<CgroupEntry>> {
     let file = File::open("/proc/self/cgroup").ok()?;
     let file = BufReader::new(file);
@@ -131,14 +131,14 @@ fn read_v2_memory_limit(cgroups: &[CgroupEntry], mounts: &[Mountinfo]) -> Option
     }
     let mount_point = &mount.mount_point;
     let controllers = std::fs::read_to_string(mount_point.join("cgroup.controllers")).ok()?;
-    let controllers: Vec<&str> = controllers.trim().split(' ').collect();
-    if controllers.contains(&"memory") {
+    let mut controllers = controllers.trim().split(' ');
+    if controllers.any(|c| c == "memory") {
         let max = read_file_to_usize(mount_point.join("memory.max"));
         // Unlike v1, this is only the swap, not swap + memory.
         let swap_max = read_file_to_usize(mount_point.join("memory.swap.max"));
         return Some(MemoryLimit { max, swap_max });
     }
-    return None;
+    None
 }
 
 /// Finds the cgroup v1 and mountpoint combination containing the memory controller,
@@ -174,10 +174,11 @@ pub fn detect_memory_limit() -> Option<MemoryLimit> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CgroupEntry, Mountinfo};
     use std::path::PathBuf;
 
-    #[test]
+    use super::{CgroupEntry, Mountinfo};
+
+    #[crate::test]
     fn test_cgroup_from_line() {
         // cgroups v2
         assert_eq!(
@@ -205,7 +206,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[crate::test]
     fn test_mountinfo_from_line() {
         // Mount with optional field (master:305)
         assert_eq!(Mountinfo::from_line("863 758 0:63 / / rw,relatime master:305 - overlay overlay rw,seclabel,lowerdir=/var/lib/docker/overlay2/l/SUKWDHL7W7YZCJ6YI66I7Z5PR2:/var/lib/docker/overlay2/l/ORL2I23UNUGM7FYF4BSL5JUCAB:/var/lib/docker/overlay2/l/LLKK3J2EHGPF5IGGDSAQGRFHLV:/var/lib/docker/overlay2/l/JEQIUQIQTVNRBAGCU7SLV4KK4K:/var/lib/docker/overlay2/l/5DS7KSJCA7BHWAYWII7BI5DBC5:/var/lib/docker/overlay2/l/ZAGXZ62GNFPZFLNUDZ3JOZIMYR:/var/lib/docker/overlay2/l/6WVXMD372IA24ZXRWGGTIPEQPA,upperdir=/var/lib/docker/overlay2/5c7734eb769484f3469b234181365466eb30bcd7f31c912f4250c8d701637ee4/diff,workdir=/var/lib/docker/overlay2/5c7734eb769484f3469b234181365466eb30bcd7f31c912f4250c8d701637ee4/work".to_owned()),

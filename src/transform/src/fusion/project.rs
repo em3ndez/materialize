@@ -11,26 +11,38 @@
 
 // TODO(frank): evaluate for redundancy with projection hoisting.
 
-use crate::TransformArgs;
-use expr::MirRelationExpr;
+use mz_expr::MirRelationExpr;
+
+use crate::TransformCtx;
 
 /// Fuses Project operators with parent operators when possible.
 #[derive(Debug)]
 pub struct Project;
 
 impl crate::Transform for Project {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "ProjectFusion"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "project_fusion")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        relation.try_visit_mut_pre(&mut |e| Ok(self.action(e)))
+        relation.visit_pre_mut(Self::action);
+        mz_repr::explain::trace_plan(&*relation);
+        Ok(())
     }
 }
 
 impl Project {
     /// Fuses Project operators with parent operators when possible.
-    pub fn action(&self, relation: &mut MirRelationExpr) {
+    pub fn action(relation: &mut MirRelationExpr) {
         if let MirRelationExpr::Project { input, outputs } = relation {
             while let MirRelationExpr::Project {
                 input: inner,

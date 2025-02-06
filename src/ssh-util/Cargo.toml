@@ -1,0 +1,37 @@
+[package]
+name = "mz-ssh-util"
+description = "SSH utility library."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { version = "1.0.66" }
+mz-ore = { path = "../ore", features = ["test"] }
+openssh = { version = "0.9.8", default-features = false, features = ["native-mux"] }
+openssh-mux-client = "0.15.5"
+openssl = { version = "0.10.48", features = ["vendored"] }
+rand = "0.8.5"
+futures = "0.3.25"
+itertools = "0.12.1"
+scopeguard = "1.1.0"
+serde = { version = "1.0.152", features = ["derive"] }
+serde_json = { version = "1.0.125" }
+ssh-key = { version = "0.4.3" }
+tempfile = "3.14.0"
+thiserror = { version = "1.0.37" }
+tokio = "1.38.0"
+tokio-stream = "0.1.11"
+tracing = "0.1.37"
+zeroize = { version = "1.5.7", features = ["serde"] }
+workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["workspace-hack"]
+
+[features]
+default = ["workspace-hack"]

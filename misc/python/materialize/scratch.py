@@ -14,13 +14,17 @@ import csv
 import datetime
 import os
 import shlex
+import subprocess
 import sys
 from subprocess import CalledProcessError
-from typing import IO, Dict, List, NamedTuple, Optional, Union
+from typing import NamedTuple, cast
 
 import boto3
+from botocore.exceptions import ClientError
+from mypy_boto3_ec2.literals import InstanceTypeType
 from mypy_boto3_ec2.service_resource import Instance
 from mypy_boto3_ec2.type_defs import (
+    FilterTypeDef,
     InstanceNetworkInterfaceSpecificationTypeDef,
     InstanceTypeDef,
     RunInstancesRequestRequestTypeDef,
@@ -28,41 +32,41 @@ from mypy_boto3_ec2.type_defs import (
 from prettytable import PrettyTable
 from pydantic import BaseModel
 
-from materialize import ROOT, git, spawn, ui, util
+from materialize import MZ_ROOT, git, spawn, ui, util
 
 # Sane defaults for internal Materialize use in the scratch account
-DEFAULT_SUBNET_ID = "subnet-00bdfbd2d97eddb86"
-DEFAULT_SECURITY_GROUP_ID = "sg-06f780c8e23c0d944"
+DEFAULT_SECURITY_GROUP_NAME = "scratch-security-group"
 DEFAULT_INSTANCE_PROFILE_NAME = "admin-instance"
 
 SSH_COMMAND = ["mssh", "-o", "StrictHostKeyChecking=off"]
+SFTP_COMMAND = ["msftp", "-o", "StrictHostKeyChecking=off"]
 
 say = ui.speaker("scratch> ")
 
 
-def tags(i: Instance) -> Dict[str, str]:
+def tags(i: Instance) -> dict[str, str]:
     if not i.tags:
         return {}
     return {t["Key"]: t["Value"] for t in i.tags}
 
 
-def instance_typedef_tags(i: InstanceTypeDef) -> Dict[str, str]:
+def instance_typedef_tags(i: InstanceTypeDef) -> dict[str, str]:
     return {t["Key"]: t["Value"] for t in i.get("Tags", [])}
 
 
-def name(tags: Dict[str, str]) -> Optional[str]:
+def name(tags: dict[str, str]) -> str | None:
     return tags.get("Name")
 
 
-def launched_by(tags: Dict[str, str]) -> Optional[str]:
+def launched_by(tags: dict[str, str]) -> str | None:
     return tags.get("LaunchedBy")
 
 
-def ami_user(tags: Dict[str, str]) -> Optional[str]:
+def ami_user(tags: dict[str, str]) -> str | None:
     return tags.get("ami-user", "ubuntu")
 
 
-def delete_after(tags: Dict[str, str]) -> Optional[datetime.datetime]:
+def delete_after(tags: dict[str, str]) -> datetime.datetime | None:
     unix = tags.get("scratch-delete-after")
     if not unix:
         return None
@@ -70,13 +74,13 @@ def delete_after(tags: Dict[str, str]) -> Optional[datetime.datetime]:
     return datetime.datetime.fromtimestamp(unix)
 
 
-def instance_host(instance: Instance, user: Optional[str] = None) -> str:
+def instance_host(instance: Instance, user: str | None = None) -> str:
     if user is None:
         user = ami_user(tags(instance))
     return f"{user}@{instance.id}"
 
 
-def print_instances(ists: List[Instance], format: str) -> None:
+def print_instances(ists: list[Instance], format: str) -> None:
     field_names = [
         "Name",
         "Instance ID",
@@ -113,16 +117,15 @@ def print_instances(ists: List[Instance], format: str) -> None:
 
 def launch(
     *,
-    key_name: Optional[str],
+    key_name: str | None,
     instance_type: str,
     ami: str,
     ami_user: str,
-    tags: Dict[str, str],
-    display_name: Optional[str] = None,
-    subnet_id: Optional[str] = None,
+    tags: dict[str, str],
+    display_name: str | None = None,
     size_gb: int,
-    security_group_id: str,
-    instance_profile: Optional[str],
+    security_group_name: str,
+    instance_profile: str | None,
     nonce: str,
     delete_after: datetime.datetime,
 ) -> Instance:
@@ -135,22 +138,52 @@ def launch(
     tags["git_ref"] = git.describe()
     tags["ami-user"] = ami_user
 
+    ec2 = boto3.client("ec2")
+    groups = ec2.describe_security_groups()
+    security_group_id = None
+    for group in groups["SecurityGroups"]:
+        if group["GroupName"] == security_group_name:
+            security_group_id = group["GroupId"]
+            break
+
+    if security_group_id is None:
+        vpcs = ec2.describe_vpcs()
+        vpc_id = None
+        for vpc in vpcs["Vpcs"]:
+            if vpc["IsDefault"] == True:
+                vpc_id = vpc["VpcId"]
+                break
+        if vpc_id is None:
+            default_vpc = ec2.create_default_vpc()
+            vpc_id = default_vpc["Vpc"]["VpcId"]
+        securitygroup = ec2.create_security_group(
+            GroupName=security_group_name,
+            Description="Allows all.",
+            VpcId=vpc_id,
+        )
+        security_group_id = securitygroup["GroupId"]
+        ec2.authorize_security_group_ingress(
+            GroupId=security_group_id,
+            CidrIp="0.0.0.0/0",
+            IpProtocol="tcp",
+            FromPort=22,
+            ToPort=22,
+        )
+
     network_interface: InstanceNetworkInterfaceSpecificationTypeDef = {
         "AssociatePublicIpAddress": True,
         "DeviceIndex": 0,
         "Groups": [security_group_id],
     }
-    if subnet_id:
-        network_interface["SubnetId"] = subnet_id
 
     say(f"launching instance {display_name or '(unnamed)'}")
-    with open(ROOT / "misc" / "scratch" / "provision.bash") as f:
+    with open(MZ_ROOT / "misc" / "scratch" / "provision.bash") as f:
         provisioning_script = f.read()
     kwargs: RunInstancesRequestRequestTypeDef = {
         "MinCount": 1,
         "MaxCount": 1,
         "ImageId": ami,
-        "InstanceType": instance_type,  # type: ignore
+        "InstanceType": cast(InstanceTypeType, instance_type),
         "UserData": provisioning_script,
         "TagSpecifications": [
             {
@@ -199,21 +232,24 @@ async def setup(
 
     done = False
     async for remaining in ui.async_timeout_loop(60, 5):
-        say(f"Waiting for instance to become ready: {remaining}s remaining")
-        i.reload()
-        if is_ready(i):
-            done = True
-            break
+        say(f"Waiting for instance to become ready: {remaining:0.0f}s remaining")
+        try:
+            i.reload()
+            if is_ready(i):
+                done = True
+                break
+        except ClientError:
+            pass
     if not done:
         raise RuntimeError(
             f"Instance {i} did not become ready in a reasonable amount of time"
         )
 
     done = False
-    async for remaining in ui.async_timeout_loop(180, 5):
-        say(f"Checking whether setup has completed: {remaining}s remaining")
+    async for remaining in ui.async_timeout_loop(300, 5):
+        say(f"Checking whether setup has completed: {remaining:0.0f}s remaining")
         try:
-            mssh(i, "[[ -f /opt/provision/docker-installed ]]")
+            mssh(i, "[[ -f /opt/provision/done ]]")
             done = True
             break
         except CalledProcessError:
@@ -226,52 +262,59 @@ async def setup(
     mkrepo(i, git_rev)
 
 
-def mkrepo(i: Instance, rev: str) -> None:
-    mssh(i, "git init --bare materialize/.git")
+def mkrepo(i: Instance, rev: str, init: bool = True, force: bool = False) -> None:
+    if init:
+        mssh(i, "git clone https://github.com/MaterializeInc/materialize.git")
+
+    rev = git.rev_parse(rev)
+
+    cmd: list[str] = [
+        "git",
+        "push",
+        "--no-verify",
+        f"{instance_host(i)}:materialize/.git",
+        # Explicit refspec is required if the host repository is in detached
+        # HEAD mode.
+        f"{rev}:refs/heads/scratch",
+        "--no-recurse-submodules",
+    ]
+    if force:
+        cmd.append("--force")
+
     spawn.runv(
-        [
-            "git",
-            "push",
-            "--no-verify",
-            f"{instance_host(i)}:materialize/.git",
-            # Explicit refspec is required if the host repository is in detached
-            # HEAD mode.
-            "HEAD:refs/heads/scratch",
-        ],
-        cwd=ROOT,
+        cmd,
+        cwd=MZ_ROOT,
         env=dict(os.environ, GIT_SSH_COMMAND=" ".join(SSH_COMMAND)),
     )
-    rev = git.rev_parse(rev)
     mssh(
         i,
-        f"cd materialize && git config core.bare false && git checkout {rev}",
+        f"cd materialize && git config core.bare false && git checkout {rev} && git submodule sync --recursive && git submodule update --recursive",
     )
 
 
 class MachineDesc(BaseModel):
     name: str
-    launch_script: Optional[str]
+    launch_script: str | None
     instance_type: str
     ami: str
-    tags: Dict[str, str] = {}
+    tags: dict[str, str] = {}
     size_gb: int
     checkout: bool = True
     ami_user: str = "ubuntu"
 
 
 def launch_cluster(
-    descs: List[MachineDesc],
+    descs: list[MachineDesc],
     *,
-    nonce: Optional[str] = None,
-    subnet_id: str = DEFAULT_SUBNET_ID,
-    key_name: Optional[str] = None,
-    security_group_id: str = DEFAULT_SECURITY_GROUP_ID,
-    instance_profile: Optional[str] = DEFAULT_INSTANCE_PROFILE_NAME,
-    extra_tags: Dict[str, str] = {},
+    nonce: str | None = None,
+    key_name: str | None = None,
+    security_group_name: str = DEFAULT_SECURITY_GROUP_NAME,
+    instance_profile: str | None = DEFAULT_INSTANCE_PROFILE_NAME,
+    extra_tags: dict[str, str] = {},
     delete_after: datetime.datetime,
     git_rev: str = "HEAD",
-    extra_env: Dict[str, str] = {},
-) -> List[Instance]:
+    extra_env: dict[str, str] = {},
+) -> list[Instance]:
     """Launch a cluster of instances with a given nonce"""
 
     if not nonce:
@@ -286,8 +329,7 @@ def launch_cluster(
             tags={**d.tags, **extra_tags},
             display_name=f"{nonce}-{d.name}",
             size_gb=d.size_gb,
-            subnet_id=subnet_id,
-            security_group_id=security_group_id,
+            security_group_name=security_group_name,
             instance_profile=instance_profile,
             nonce=nonce,
             delete_after=delete_after,
@@ -306,13 +348,13 @@ def launch_cluster(
     )
 
     hosts_str = "".join(
-        (f"{i.private_ip_address}\t{d.name}\n" for (i, d) in zip(instances, descs))
+        f"{i.private_ip_address}\t{d.name}\n" for (i, d) in zip(instances, descs)
     )
     for i in instances:
-        mssh(i, "sudo tee -a /etc/hosts", stdin=hosts_str.encode())
+        mssh(i, "sudo tee -a /etc/hosts", input=hosts_str.encode())
 
     env = " ".join(f"{k}={shlex.quote(v)}" for k, v in extra_env.items())
-    for (i, d) in zip(instances, descs):
+    for i, d in zip(instances, descs):
         if d.launch_script:
             mssh(
                 i,
@@ -326,7 +368,33 @@ def whoami() -> str:
     return boto3.client("sts").get_caller_identity()["UserId"].split(":")[1]
 
 
-def get_instances_by_tag(k: str, v: str) -> List[InstanceTypeDef]:
+def get_instance(name: str) -> Instance:
+    """
+    Get an instance by instance id. The special name 'mine' resolves to a
+    unique running owned instance, if there is one; otherwise the name is
+    assumed to be an instance id.
+    :param name: The instance id or the special case 'mine'.
+    :return: The instance to which the name refers.
+    """
+    if name == "mine":
+        filters: list[FilterTypeDef] = [
+            {"Name": "tag:LaunchedBy", "Values": [whoami()]},
+            {"Name": "instance-state-name", "Values": ["pending", "running"]},
+        ]
+        instances = [i for i in boto3.resource("ec2").instances.filter(Filters=filters)]
+        if not instances:
+            raise RuntimeError("can't understand 'mine': no owned instance?")
+        if len(instances) > 1:
+            raise RuntimeError(
+                f"can't understand 'mine': too many owned instances ({', '.join(i.id for i in instances)})"
+            )
+        instance = instances[0]
+        say(f"understanding 'mine' as unique owned instance {instance.id}")
+        return instance
+    return boto3.resource("ec2").Instance(name)
+
+
+def get_instances_by_tag(k: str, v: str) -> list[InstanceTypeDef]:
     return [
         i
         for r in boto3.client("ec2").describe_instances()["Reservations"]
@@ -335,9 +403,9 @@ def get_instances_by_tag(k: str, v: str) -> List[InstanceTypeDef]:
     ]
 
 
-def get_old_instances() -> List[InstanceTypeDef]:
-    def is_running(i: InstanceTypeDef) -> bool:
-        return i["State"]["Name"] == "running"
+def get_old_instances() -> list[InstanceTypeDef]:
+    def exists(i: InstanceTypeDef) -> bool:
+        return i["State"]["Name"] != "terminated"
 
     def is_old(i: InstanceTypeDef) -> bool:
         delete_after = instance_typedef_tags(i).get("scratch-delete-after")
@@ -350,7 +418,7 @@ def get_old_instances() -> List[InstanceTypeDef]:
         i
         for r in boto3.client("ec2").describe_instances()["Reservations"]
         for i in r["Instances"]
-        if is_running(i) and is_old(i)
+        if exists(i) and is_old(i)
     ]
 
 
@@ -358,13 +426,11 @@ def mssh(
     instance: Instance,
     command: str,
     *,
-    stdin: Union[None, int, IO[bytes], bytes] = None,
+    extra_ssh_args: list[str] = [],
+    input: bytes | None = None,
 ) -> None:
     """Runs a command over SSH via EC2 Instance Connect."""
     host = instance_host(instance)
-    # The actual invocation of SSH that `spawn.runv` wants to print is
-    # unreadable quoted garbage, so we do our own printing here before the shell
-    # quoting.
     if command:
         print(f"{host}$ {command}", file=sys.stderr)
         # Quote to work around:
@@ -372,12 +438,22 @@ def mssh(
         command = shlex.quote(command)
     else:
         print(f"$ mssh {host}")
-    spawn.runv(
+
+    subprocess.run(
         [
             *SSH_COMMAND,
-            f"{host}",
+            *extra_ssh_args,
+            host,
             command,
         ],
-        stdin=stdin,
-        print_to=open(os.devnull, "w"),
+        check=True,
+        input=input,
     )
+
+
+def msftp(
+    instance: Instance,
+) -> None:
+    """Connects over SFTP via EC2 Instance Connect."""
+    host = instance_host(instance)
+    spawn.runv([*SFTP_COMMAND, host])

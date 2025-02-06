@@ -17,54 +17,55 @@
 // The original source code is subject to the terms of the MIT license, a copy
 // of which can be found in the LICENSE file at the root of this repository.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
+use std::fmt::Debug;
 
-use mz_avro::types::AvroMap;
-use ore::result::ResultExt;
-use regex::Regex;
-
-use serde_json::Value as JsonValue;
-
+use anyhow::{anyhow, bail, Context};
+use byteorder::{BigEndian, ByteOrder};
+use chrono::NaiveDate;
 // Re-export components from the various other Avro libraries, so that other
 // testdrive modules can import just this one.
-
-pub use interchange::avro::parse_schema;
-use mz_avro::schema::SchemaKind;
-pub use mz_avro::schema::{Schema, SchemaNode, SchemaPiece, SchemaPieceOrNamed};
+pub use mz_avro::schema::{Schema, SchemaKind, SchemaNode, SchemaPiece, SchemaPieceOrNamed};
 pub use mz_avro::types::{DecimalValue, ToAvro, Value};
-pub use mz_avro::{from_avro_datum, to_avro_datum, Codec, Reader, Writer};
+pub use mz_avro::{from_avro_datum, to_avro_datum};
+pub use mz_interchange::avro::parse_schema;
+use serde_json::Value as JsonValue;
 
 // This function is derived from code in the avro_rs project. Update the license
 // header on this file accordingly if you move it to a new home.
-pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> {
+pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, anyhow::Error> {
     match (json, schema.inner) {
         (JsonValue::Null, SchemaPiece::Null) => Ok(Value::Null),
         (JsonValue::Bool(b), SchemaPiece::Boolean) => Ok(Value::Boolean(*b)),
-        (JsonValue::Number(ref n), SchemaPiece::Int) => Ok(Value::Int(
-            n.as_i64().unwrap().try_into().map_err_to_string()?,
-        )),
+        (JsonValue::Number(ref n), SchemaPiece::Int) => {
+            Ok(Value::Int(n.as_i64().unwrap().try_into()?))
+        }
         (JsonValue::Number(ref n), SchemaPiece::Long) => Ok(Value::Long(n.as_i64().unwrap())),
         (JsonValue::Number(ref n), SchemaPiece::Float) => {
+            // No other known way to cast an `f64` to an `f32`.
+            #[allow(clippy::as_conversions)]
             Ok(Value::Float(n.as_f64().unwrap() as f32))
         }
         (JsonValue::Number(ref n), SchemaPiece::Double) => Ok(Value::Double(n.as_f64().unwrap())),
-        (JsonValue::Number(ref n), SchemaPiece::Date) => Ok(Value::Date(
-            chrono::NaiveDate::from_ymd(1970, 1, 1) + chrono::Duration::days(n.as_i64().unwrap()),
-        )),
+        (JsonValue::Number(ref n), SchemaPiece::Date) => {
+            Ok(Value::Date(i32::try_from(n.as_i64().unwrap())?))
+        }
         (JsonValue::Number(ref n), SchemaPiece::TimestampMilli) => {
             let ts = n.as_i64().unwrap();
-            Ok(Value::Timestamp(chrono::NaiveDateTime::from_timestamp(
-                ts / 1_000,
-                ((ts % 1_000) * 1_000_000) as u32,
-            )))
+            Ok(Value::Timestamp(
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .ok_or(anyhow!("timestamp out of bounds"))?
+                    .naive_utc(),
+            ))
         }
         (JsonValue::Number(ref n), SchemaPiece::TimestampMicro) => {
             let ts = n.as_i64().unwrap();
-            Ok(Value::Timestamp(chrono::NaiveDateTime::from_timestamp(
-                ts / 1_000_000,
-                ((ts % 1_000_000) * 1_000) as u32,
-            )))
+            Ok(Value::Timestamp(
+                chrono::DateTime::from_timestamp_micros(ts)
+                    .ok_or(anyhow!("timestamp out of bounds"))?
+                    .naive_utc(),
+            ))
         }
         (JsonValue::Array(items), SchemaPiece::Array(inner)) => Ok(Value::Array(
             items
@@ -85,7 +86,7 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
                 .collect::<Option<Vec<u8>>>()
             {
                 Some(bytes) => bytes,
-                None => return Err("decimal was not represented by byte array".into()),
+                None => bail!("decimal was not represented by byte array"),
             };
             Ok(Value::Decimal(DecimalValue {
                 unscaled: bytes,
@@ -100,31 +101,27 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
                 .collect::<Option<Vec<u8>>>()
             {
                 Some(bytes) => bytes,
-                None => return Err("fixed was not represented by byte array".into()),
+                None => bail!("fixed was not represented by byte array"),
             };
             if *size != bytes.len() {
-                Err(format!(
-                    "expected fixed size {}, got {}",
-                    *size,
-                    bytes.len()
-                ))
+                bail!("expected fixed size {}, got {}", *size, bytes.len())
             } else {
                 Ok(Value::Fixed(*size, bytes))
             }
         }
         (JsonValue::String(s), SchemaPiece::Json) => {
-            let j = serde_json::from_str(s).map_err_to_string()?;
+            let j = serde_json::from_str(s)?;
             Ok(Value::Json(j))
         }
         (JsonValue::String(s), SchemaPiece::Uuid) => {
-            let u = uuid::Uuid::parse_str(&s).map_err_to_string()?;
+            let u = uuid::Uuid::parse_str(s)?;
             Ok(Value::Uuid(u))
         }
         (JsonValue::String(s), SchemaPiece::Enum { symbols, .. }) => {
             if symbols.contains(s) {
                 Ok(Value::String(s.clone()))
             } else {
-                Err(format!("Unrecognized enum variant: {}", s))
+                bail!("Unrecognized enum variant: {}", s)
             }
         }
         (JsonValue::Object(items), SchemaPiece::Record { .. }) => {
@@ -133,14 +130,14 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
             for (key, val) in items {
                 let field = builder
                     .field_by_name(key)
-                    .ok_or_else(|| format!("No such key in record: {}", key))?;
+                    .ok_or_else(|| anyhow!("No such field {} in record: {}", key, val))?;
                 let val = from_json(val, schema.step(&field.schema))?;
                 builder.put(key, val);
             }
             Ok(builder.avro())
         }
         (JsonValue::Object(items), SchemaPiece::Map(m)) => {
-            let mut map = HashMap::new();
+            let mut map = BTreeMap::new();
             for (k, v) in items {
                 let (inner, name) = m.get_piece_and_name(schema.root);
                 map.insert(
@@ -155,7 +152,7 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
                     )?,
                 );
             }
-            Ok(Value::Map(AvroMap(map)))
+            Ok(Value::Map(map))
         }
         (val, SchemaPiece::Union(us)) => {
             let variants = us.variants();
@@ -171,20 +168,21 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
                         null_variant,
                     })
                 } else {
-                    Err("No `null` value in union schema.".to_string())
+                    bail!("No `null` value in union schema.")
                 };
             }
             let items = match val {
                 JsonValue::Object(items) => items,
-                _ => return Err(format!("Union schema element must be `null` or a map from type name to value; found {:?}", val))
+                _ => bail!("Union schema element must be `null` or a map from type name to value; found {:?}", val),
             };
             let (name, val) = if items.len() == 1 {
                 (items.keys().next().unwrap(), items.values().next().unwrap())
             } else {
-                return Err(format!(
+                bail!(
                     "Expected one-element object to match union schema: {:?} vs {:?}",
-                    json, schema
-                ));
+                    json,
+                    schema
+                );
             };
             for (i, variant) in variants.iter().enumerate() {
                 let name_matches = match variant {
@@ -192,7 +190,11 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
                     SchemaPieceOrNamed::Named(idx) => {
                         let schema_name = &schema.root.lookup(*idx).name;
                         if name.chars().any(|ch| ch == '.') {
-                            name == &schema_name.to_string()
+                            name == &format!(
+                                "{}.{}",
+                                schema_name.namespace(),
+                                schema_name.base_name()
+                            )
                         } else {
                             name == schema_name.base_name()
                         }
@@ -212,87 +214,96 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
                     }
                 }
             }
-            Err(format!(
+            bail!(
                 "Type not found in union: {}. variants: {:#?}",
-                name, variants
-            ))
+                name,
+                variants
+            )
         }
-        _ => Err(format!(
+        _ => bail!(
             "unable to match JSON value to schema: {:?} vs {:?}",
-            json, schema
-        )),
+            json,
+            schema
+        ),
     }
 }
 
-pub fn validate_sink<I>(
-    key_schema: Option<&Schema>,
-    value_schema: &Schema,
-    expected: I,
-    actual: &[(Option<Value>, Option<Value>)],
-    regex: &Option<Regex>,
-    regex_replacement: &String,
-) -> Result<(), String>
-where
-    I: IntoIterator,
-    I::Item: AsRef<str>,
-{
-    let expected = expected
-        .into_iter()
-        .map(|v| {
-            let mut deserializer = serde_json::Deserializer::from_str(v.as_ref()).into_iter();
-            let key = if let Some(key_schema) = key_schema {
-                let key: serde_json::Value = match deserializer.next() {
-                    None => Err("key missing in input line".to_string()),
-                    Some(r) => r.map_err(|e| format!("parsing json: {}", e)),
-                }?;
-                Some(from_json(&key, key_schema.top_node())?)
-            } else {
-                None
-            };
-            let value = match deserializer.next() {
-                None => None,
-                Some(r) => {
-                    let value = r.map_err(|e| format!("parsing json: {}", e))?;
-                    Some(from_json(&value, value_schema.top_node())?)
-                }
-            };
-            Ok((key, value))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut expected = expected.iter();
-    let mut actual = actual.iter();
-    let mut index = 0..;
-    loop {
-        let i = index.next().expect("known to exist");
-        match (expected.next(), actual.next()) {
-            (Some(e), Some(a)) => {
-                let e_str = format!("{:#?}", e);
-                let a_str = match &regex {
-                    Some(regex) => regex
-                        .replace_all(&format!("{:#?}", a).to_string(), regex_replacement.as_str())
-                        .to_string(),
-                    _ => format!("{:#?}", a),
-                };
-
-                if e_str != a_str {
-                    return Err(format!(
-                        "record {} did not match\nexpected:\n{}\n\nactual:\n{}",
-                        i, e_str, a_str
-                    ));
-                }
-            }
-            (Some(e), None) => return Err(format!("missing record {}: {:#?}", i, e)),
-            (None, Some(a)) => return Err(format!("extra record {}: {:#?}", i, a)),
-            (None, None) => break,
-        }
+/// Decodes an Avro datum from its Confluent-formatted byte representation.
+///
+/// The Confluent format includes a verbsion byte, followed by a 32-bit schema
+/// ID, followed by the encoded Avro value. This function validates the version
+/// byte but ignores the schema ID.
+pub fn from_confluent_bytes(schema: &Schema, mut bytes: &[u8]) -> Result<Value, anyhow::Error> {
+    if bytes.len() < 5 {
+        bail!(
+            "avro datum is too few bytes: expected at least 5 bytes, got {}",
+            bytes.len()
+        );
     }
-    let expected: Vec<_> = expected.map(|e| format!("{:#?}", e)).collect();
-    let actual: Vec<_> = actual.map(|a| format!("{:#?}", a)).collect();
-    if !expected.is_empty() {
-        Err(format!("missing records:\n{}", expected.join("\n")))
-    } else if !actual.is_empty() {
-        Err(format!("extra records:\n{}", actual.join("\n")))
-    } else {
-        Ok(())
+    let magic = bytes[0];
+    let _schema_id = BigEndian::read_i32(&bytes[1..5]);
+    bytes = &bytes[5..];
+
+    if magic != 0 {
+        bail!(
+            "wrong avro serialization magic: expected 0, got {}",
+            bytes[0]
+        );
+    }
+
+    let datum = from_avro_datum(schema, &mut bytes).context("decoding avro datum")?;
+    Ok(datum)
+}
+
+/// A struct to enhance the debug output of various Avro types.
+///
+/// Testdrive scripts, for example, specify timestamps in micros, but debug
+/// output happens in Y-M-D format, which can be very difficult to map back to
+/// the correct input number. Similarly, dates are represented in Avro as
+/// `i32`s, but we would like to see the Y-M-D format as well.
+#[derive(Clone)]
+pub struct DebugValue(pub Value);
+
+impl Debug for DebugValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Value::Timestamp(t) => write!(
+                f,
+                "Timestamp(\"{:?}\", {} micros, {} millis)",
+                t,
+                t.and_utc().timestamp_micros(),
+                t.and_utc().timestamp_millis()
+            ),
+            Value::Date(d) => write!(
+                f,
+                "Date({:?}, \"{}\")",
+                d,
+                NaiveDate::from_num_days_from_ce_opt(*d).unwrap()
+            ),
+
+            // Re-wrap types that contain a Value.
+            Value::Record(r) => f
+                .debug_set()
+                .entries(r.iter().map(|(s, v)| (s, DebugValue(v.clone()))))
+                .finish(),
+            Value::Array(a) => f
+                .debug_set()
+                .entries(a.iter().map(|v| DebugValue(v.clone())))
+                .finish(),
+            Value::Union {
+                index,
+                inner,
+                n_variants,
+                null_variant,
+            } => f
+                .debug_struct("Union")
+                .field("index", index)
+                .field("inner", &DebugValue(*inner.clone()))
+                .field("n_variants", n_variants)
+                .field("null_variant", null_variant)
+                .finish(),
+
+            _ => write!(f, "{:?}", self.0),
+        }
     }
 }

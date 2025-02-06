@@ -1,0 +1,36 @@
+[package]
+name = "mz-timely-util"
+description = "Utilities for working with Timely."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ahash = { version = "0.8.11", default-features = false }
+bincode = "1.3.3"
+bytemuck = "1.21.0"
+columnar = "0.2.2"
+columnation = "0.1.0"
+differential-dataflow = "0.13.5"
+either = "1"
+futures-util = "0.3.25"
+lgalloc = "0.4"
+mz-ore = { path = "../ore", features = ["async", "process", "tracing_", "test"] }
+num-traits = "0.2"
+proptest = { version = "1.6.0", default-features = false, features = ["std"] }
+serde = { version = "1.0.152", features = ["derive"] }
+timely = "0.17.1"
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1.37"
+uuid = { version = "1.7.0", features = ["serde", "v4"] }
+workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }
+
+[features]
+default = ["workspace-hack"]
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["workspace-hack"]

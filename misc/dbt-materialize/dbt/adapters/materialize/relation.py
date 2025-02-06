@@ -1,3 +1,4 @@
+# Copyright 2020 Josh Wills. All rights reserved.
 # Copyright Materialize, Inc. and contributors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,45 +15,63 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import Optional
+from typing import Optional, Type
 
-from dbt.adapters.postgres import PostgresRelation
-from mashumaro.types import SerializableType
+from dbt_common.dataclass_schema import StrEnum
 
-
-# Stolen from https://github.com/dbt-labs/dbt/blob/develop/core/dbt/dataclass_schema.py ,
-# which is not importable.
-class StrEnum(str, SerializableType, Enum):
-    def __str__(self):
-        return self.value
-
-    # https://docs.python.org/3.6/library/enum.html#using-automatic-values
-    def _generate_next_value_(name, *_):
-        return name
-
-    def _serialize(self) -> str:
-        return self.value
-
-    @classmethod
-    def _deserialize(cls, value: str):
-        return cls(value)
+from dbt.adapters.postgres.relation import PostgresRelation
+from dbt.adapters.utils import classproperty
 
 
-# Override RelationType to add Materialize-specifc materializatiton types:
-#   - source
-#   - index
-#   - sink
+# types in ./misc/dbt-materialize need to import generic types from typing
 class MaterializeRelationType(StrEnum):
-    Source = "source"
-    View = "view"
-    MaterializedView = "materializedview"
+    # Built-in materialization types.
     Table = "table"
-    Index = "index"
-    Sink = "sink"
+    View = "view"
     CTE = "cte"
+    External = "external"
+    MaterializedView = "materialized_view"
+
+    # Materialize-specific materialization types.
+    Source = "source"
+    SourceTable = "source_table"
+    Sink = "sink"
+    # NOTE(morsapaes): dbt supports materialized views as a built-in
+    # materialization since v1.6.0, so we deprecate the legacy materialization
+    # name but keep it around for backwards compatibility.
+    MaterializedViewLegacy = "materializedview"
 
 
 @dataclass(frozen=True, eq=False, repr=False)
 class MaterializeRelation(PostgresRelation):
     type: Optional[MaterializeRelationType] = None
+    require_alias: bool = False
+
+    # Materialize does not have a 63-character limit for relation names, unlike
+    # PostgreSQL (see dbt-core #2727). Instead, we set 255 as the maximum
+    # identifier length (see database-issues#6303).
+    def relation_max_name_length(self):
+        return 255
+
+    @classproperty
+    def get_relation_type(cls) -> Type[MaterializeRelationType]:
+        return MaterializeRelationType
+
+    @property
+    def is_materialized_view(self) -> bool:
+        return self.type in [
+            MaterializeRelationType.MaterializedView,
+            MaterializeRelationType.MaterializedViewLegacy,
+        ]
+
+    @property
+    def is_source(self) -> bool:
+        return self.type == MaterializeRelationType.Source
+
+    @property
+    def is_source_table(self) -> bool:
+        return self.type == MaterializeRelationType.SourceTable
+
+    @property
+    def is_sink(self) -> bool:
+        return self.type == MaterializeRelationType.Sink

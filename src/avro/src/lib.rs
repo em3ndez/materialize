@@ -327,13 +327,17 @@
 //! [Materialize](https://github.com/MaterializeInc/materialize/blob/main/src/interchange/src/avro.rs)
 //! furnishes the most complete example.
 
+// TODO(benesch): remove this once this crate no longer makes use of potentially
+// dangerous `as` conversions.
+#![allow(clippy::as_conversions)]
+
 mod codec;
 mod decode;
-pub mod encode;
 mod reader;
 mod util;
 mod writer;
 
+pub mod encode;
 pub mod error;
 pub mod schema;
 pub mod types;
@@ -349,20 +353,23 @@ pub use crate::encode::encode as encode_unchecked;
 pub use crate::reader::{from_avro_datum, Block, BlockIter, Reader};
 pub use crate::schema::{ParseSchemaError, Schema};
 pub use crate::types::SchemaResolutionError;
-pub use crate::util::max_allocation_bytes;
 pub use crate::writer::{to_avro_datum, write_avro_datum, ValidationError, Writer};
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
-    use super::*;
+    use mz_ore::{assert_err, assert_none};
+
     use crate::reader::Reader;
     use crate::schema::Schema;
     use crate::types::{Record, Value};
 
+    use super::*;
+
     //TODO: move where it fits better
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: inline assembly is not supported
     fn test_enum_default() {
         let writer_raw_schema = r#"
             {
@@ -411,11 +418,12 @@ mod tests {
                 ("c".to_string(), Value::Enum(1, "spades".to_string())),
             ])
         );
-        assert!(reader.next().is_none());
+        assert_none!(reader.next());
     }
 
     //TODO: move where it fits better
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: inline assembly is not supported
     fn test_enum_string_value() {
         let raw_schema = r#"
             {
@@ -454,11 +462,12 @@ mod tests {
                 ("c".to_string(), Value::Enum(2, "clubs".to_string())),
             ])
         );
-        assert!(reader.next().is_none());
+        assert_none!(reader.next());
     }
 
     //TODO: move where it fits better
-    #[test]
+    #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // unsupported operation: inline assembly is not supported
     fn test_enum_resolution() {
         let writer_raw_schema = r#"
             {
@@ -509,12 +518,12 @@ mod tests {
         writer.flush().unwrap();
         let input = writer.into_inner();
         let mut reader = Reader::with_schema(&reader_schema, &input[..]).unwrap();
-        assert!(reader.next().unwrap().is_err());
-        assert!(reader.next().is_none());
+        assert_err!(reader.next().unwrap());
+        assert_none!(reader.next());
     }
 
     //TODO: move where it fits better
-    #[test]
+    #[mz_ore::test]
     fn test_enum_no_reader_schema() {
         let writer_raw_schema = r#"
             {
@@ -554,7 +563,7 @@ mod tests {
             ])
         );
     }
-    #[test]
+    #[mz_ore::test]
     fn test_datetime_value() {
         let writer_raw_schema = r#"{
         "type": "record",
@@ -571,7 +580,9 @@ mod tests {
         let writer_schema = Schema::from_str(writer_raw_schema).unwrap();
         let mut writer = Writer::with_codec(writer_schema.clone(), Vec::new(), Codec::Null);
         let mut record = Record::new(writer_schema.top_node()).unwrap();
-        let dt = chrono::NaiveDateTime::from_timestamp(1_000, 995_000_000);
+        let dt = chrono::DateTime::from_timestamp(1_000, 995_000_000)
+            .unwrap()
+            .naive_utc();
         record.put("a", types::Value::Timestamp(dt));
         writer.append(record).unwrap();
         writer.flush().unwrap();
@@ -583,8 +594,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_illformed_length() {
+    #[mz_ore::test]
+    fn test_malformed_length() {
         let raw_schema = r#"
             {
                 "type": "record",
@@ -599,9 +610,9 @@ mod tests {
         let schema = Schema::from_str(raw_schema).unwrap();
 
         // Would allocated 18446744073709551605 bytes
-        let illformed: &[u8] = &[0x3e, 0x15, 0xff, 0x1f, 0x15, 0xff];
+        let malformed: &[u8] = &[0x3e, 0x15, 0xff, 0x1f, 0x15, 0xff];
 
-        let value = from_avro_datum(&schema, &mut &illformed[..]);
-        assert!(value.is_err());
+        let value = from_avro_datum(&schema, &mut &malformed[..]);
+        assert_err!(value);
     }
 }

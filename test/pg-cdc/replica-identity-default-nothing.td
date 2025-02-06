@@ -14,6 +14,18 @@
 # IDENTITY DEFAULT is the same as USING INDEX (t1_pkey)
 #
 
+# TODO: Reenable when database-issues#4231 is fixed
+$ skip-if
+SELECT true
+
+> CREATE SECRET pgpass AS 'postgres'
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass
+  )
+
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 ALTER USER postgres WITH replication;
 DROP SCHEMA IF EXISTS public CASCADE;
@@ -35,14 +47,17 @@ ALTER TABLE identity_nothing REPLICA IDENTITY NOTHING;
 
 CREATE PUBLICATION mz_source FOR ALL TABLES;
 
-> CREATE MATERIALIZED SOURCE mz_source
-  FROM POSTGRES CONNECTION 'host=postgres port=5432 user=postgres password=postgres sslmode=require dbname=postgres'
-  PUBLICATION 'mz_source';
+> CREATE SOURCE mz_source FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
+
+> CREATE TABLE identity_default_key_update FROM SOURCE mz_source (REFERENCE identity_default_key_update);
+> CREATE TABLE identity_default_nokey_update FROM SOURCE mz_source (REFERENCE identity_default_nokey_update);
+> CREATE TABLE identity_default_delete FROM SOURCE mz_source (REFERENCE identity_default_delete);
+> CREATE TABLE identity_nothing FROM SOURCE mz_source (REFERENCE identity_nothing);
 
 # Make sure that the above sources are fully instantiated so that the DML statements below
 # are sent as actual replication events post-snapshot.
 
-> SELECT COUNT(*) FROM mz_source AS OF NOW();
+> SELECT COUNT(*) FROM identity_default_key_update;
 0
 
 $ postgres-execute connection=postgres://postgres:postgres@postgres
@@ -57,16 +72,19 @@ DELETE FROM identity_default_delete;
 
 INSERT INTO identity_nothing VALUES (1, 1);
 
-> CREATE VIEWS FROM SOURCE mz_source;
+> CREATE DEFAULT INDEX ON identity_default_key_update;
+> CREATE DEFAULT INDEX ON identity_default_nokey_update;
+> CREATE DEFAULT INDEX ON identity_default_delete;
+> CREATE DEFAULT INDEX ON identity_nothing;
 
 ! SELECT * FROM identity_default_key_update;
-Old row missing from replication stream for table with OID
+contains:Old row missing from replication stream for table with OID
 
 ! SELECT * FROM identity_default_nokey_update;
-Old row missing from replication stream for table with OID
+contains:Old row missing from replication stream for table with OID
 
 ! SELECT * FROM identity_default_delete;
-Old row missing from replication stream for table with OID
+contains:Old row missing from replication stream for table with OID
 
 ! SELECT * FROM identity_nothing;
-Old row missing from replication stream for table with OID
+contains:Old row missing from replication stream for table with OID

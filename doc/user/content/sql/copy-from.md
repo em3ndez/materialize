@@ -3,7 +3,7 @@ title: "COPY FROM"
 description: "`COPY FROM` copies data into a table using the COPY protocol."
 menu:
     main:
-        parent: "sql"
+        parent: "commands"
 ---
 
 `COPY FROM` copies data into a table using the [Postgres `COPY` protocol][pg-copy-from].
@@ -16,10 +16,14 @@ Field | Use
 ------|-----
 _table_name_ | Copy values to this table.
 **(**_column_...**)** | Correlate the inserted rows' columns to _table_name_'s columns by ordinal position, i.e. the first column of the row to insert is correlated to the first named column. <br/><br/>Without a column list, all columns must have data provided, and will be referenced using their order in the table. With a partial column list, all unreferenced columns will receive their default value.
+_field_ | The name of the option you want to set.
+_val_ | The value for the option.
 
-Supported `option` values:
+### `WITH` options
 
-Name | Permitted values| Default value | Description
+The following options are valid within the `WITH` clause.
+
+Name | Value type | Default value | Description
 -----|-----------------|---------------|------------
 `FORMAT` | `TEXT`, `CSV` | `TEXT` | Sets the input formatting method. For more information see [Text formatting](#text-formatting), [CSV formatting](#csv-formatting).
 `DELIMITER` | Single-quoted one-byte character | Format-dependent | Overrides the format's default column delimiter.
@@ -42,10 +46,9 @@ As described in the **CSV Format** section of [PostgreSQL's documentation][pg-co
 except that:
 
 - More than one layer of escaped quote characters returns the wrong result.
-  {{% gh 9074 %}}
 
 - Quote characters must immediately follow a delimiter to be treated as
-  expected. {{% gh 9075 %}}
+  expected.
 
 - Single-column rows containing quoted end-of-data markers (e.g. `"\."`) will be
   treated as end-of-data markers despite being quoted. In PostgreSQL, this data
@@ -63,16 +66,27 @@ except that:
 
 ## Example
 
-```sql
-COPY t FROM STDIN WITH (DELIMITER '|')
+```mzsql
+COPY t FROM STDIN WITH (DELIMITER '|');
 ```
 
-```sql
-COPY t FROM STDIN (FORMAT CSV)
+```mzsql
+COPY t FROM STDIN (FORMAT CSV);
 ```
 
-```sql
-COPY t FROM STDIN (DELIMITER '|')
+```mzsql
+COPY t FROM STDIN (DELIMITER '|');
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `USAGE` privileges on the schema containing the table.
+- `INSERT` privileges on the table.
 
 [pg-copy-from]: https://www.postgresql.org/docs/14/sql-copy.html
+
+## Limits
+
+You can only copy up to 1 GiB of data at a time. If you need this limit increased, please [chat with our team](http://materialize.com/convert-account/).

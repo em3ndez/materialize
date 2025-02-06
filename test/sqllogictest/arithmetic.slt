@@ -466,13 +466,13 @@ SELECT round((SELECT * FROM nums));
 ----
 NULL
 
-query error Cannot call function round\(double precision, integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(double precision, integer\) does not exist
 SELECT round((SELECT * FROM nums), 2)
 
-query error Cannot call function round\(double precision, double precision\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(double precision, double precision\) does not exist
 SELECT round((SELECT * FROM nums), (SELECT * FROM nums))
 
-query error Cannot call function round\(numeric, double precision\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(numeric, double precision\) does not exist
 SELECT round(5.0, (SELECT * FROM nums))
 
 query R
@@ -480,23 +480,101 @@ SELECT round(5.0, CAST ((SELECT * FROM nums) AS integer))
 ----
 NULL
 
-query error Cannot call function round\(double precision, integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(double precision, integer\) does not exist
 SELECT round(CAST (5.0 AS double precision), 3)
 
-query error Cannot call function round\(double precision, integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(double precision, integer\) does not exist
 SELECT round(CAST (5.0 AS float), 3)
 
-query error Cannot call function round\(boolean, integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(boolean, integer\) does not exist
 SELECT round(true, 3)
 
 query error
 SELECT round(true)
 
-query error Cannot call function round\(double precision, numeric\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(double precision, numeric\) does not exist
 SELECT round(CAST (5.0 AS float), 3.0)
 
-query error Cannot call function round\(double precision, double precision\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error db error: ERROR: function round\(double precision, double precision\) does not exist
 SELECT round(CAST (5.0 AS float), CAST (3.0 AS float))
+
+query R
+SELECT trunc(CAST (1.5678 AS float))
+----
+1
+
+query R
+SELECT trunc(CAST (-1.4678 AS float))
+----
+-1
+
+query R
+SELECT trunc(CAST (1.5678 AS double precision))
+----
+1
+
+query R
+SELECT trunc(CAST (-1.4678 AS double precision))
+----
+-1
+
+query R
+SELECT trunc(1.5678)
+----
+1
+
+query R
+SELECT trunc(-1.5678)
+----
+-1
+
+query RRRRR
+SELECT trunc(1.1), trunc(1.111), trunc(100.1), trunc(100.11), trunc(-4.1)
+----
+1  1  100  100  -4
+
+# postgres converts ints to floats on trunc
+query R
+SELECT trunc(1)
+----
+1
+
+query R
+SELECT trunc(NULL)
+----
+NULL
+
+query R
+SELECT trunc(NULL::decimal)
+----
+NULL
+
+query R
+SELECT trunc((SELECT * FROM nums))
+----
+NULL
+
+query RRRR
+SELECT trunc('NaN'::decimal), trunc('Inf'::float), trunc(0), trunc(-0)
+----
+NaN  inf  0  0
+
+statement ok
+DELETE FROM nums
+
+statement ok
+INSERT INTO nums VALUES (1.5678)
+
+query R
+SELECT trunc(1.5678)
+----
+1
+
+statement ok
+DROP TABLE nums
+
+query error db error: ERROR: function trunc\(boolean\) does not exist
+SELECT trunc(true)
 
 query I
 SELECT 2147483646+1
@@ -873,15 +951,19 @@ SELECT
 1 1 5
 
 query T multiline
-EXPLAIN SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   x1 >> x2 << x3 as r1,
   y1 << y2 >> y3 as r2
 FROM nums
 ----
-%0 =
-| Get materialize.public.nums (u5)
-| Map ((#0 >> i16toi32(#1)) << i16toi32(#2)), ((#3 << #4) >> #5)
-| Project (#9, #10)
+Explained Query:
+  Project (#9, #10) // { arity: 2 }
+    Map (((#0 >> smallint_to_integer(#1)) << smallint_to_integer(#2)), ((#3 << #4) >> #5)) // { arity: 11 }
+      ReadStorage materialize.public.nums // { arity: 9 }
+
+Source materialize.public.nums
+
+Target cluster: quickstart
 
 EOF
 
@@ -904,15 +986,19 @@ SELECT
 8 8 5
 
 query T multiline
-EXPLAIN SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   x1 >> x2 & x3 as r1,
   y1 << y2 & y3 as r2
 FROM nums
 ----
-%0 =
-| Get materialize.public.nums (u5)
-| Map ((#0 >> i16toi32(#1)) & #2), ((#3 << #4) & #5)
-| Project (#9, #10)
+Explained Query:
+  Project (#9, #10) // { arity: 2 }
+    Map (((#0 >> smallint_to_integer(#1)) & #2), ((#3 << #4) & #5)) // { arity: 11 }
+      ReadStorage materialize.public.nums // { arity: 9 }
+
+Source materialize.public.nums
+
+Target cluster: quickstart
 
 EOF
 
@@ -935,17 +1021,21 @@ SELECT
 0 0 1
 
 query T multiline
-EXPLAIN SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   x1 & x2 | x3 as r1,
   y1 & y2 | y3 as r2,
   z1 & z2 | z3 as r3,
   x1 & y2 | z3 as r4
 FROM nums
 ----
-%0 =
-| Get materialize.public.nums (u5)
-| Map ((#0 & #1) | #2), ((#3 & #4) | #5), ((#6 & #7) | #8), (i32toi64((i16toi32(#0) & #4)) | #8)
-| Project (#9..#12)
+Explained Query:
+  Project (#9..=#12) // { arity: 4 }
+    Map (((#0 & #1) | #2), ((#3 & #4) | #5), ((#6 & #7) | #8), (integer_to_bigint((smallint_to_integer(#0) & #4)) | #8)) // { arity: 13 }
+      ReadStorage materialize.public.nums // { arity: 9 }
+
+Source materialize.public.nums
+
+Target cluster: quickstart
 
 EOF
 
@@ -968,17 +1058,21 @@ SELECT
 0 0 1
 
 query T multiline
-EXPLAIN SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   x1 # x2 & x3 as r1,
   y1 # y2 & y3 as r2,
   z1 # z2 & z3 as r3,
   x1 # y2 & z3 as r4
 FROM nums
 ----
-%0 =
-| Get materialize.public.nums (u5)
-| Map ((#0 # #1) & #2), ((#3 # #4) & #5), ((#6 # #7) & #8), (i32toi64((i16toi32(#0) # #4)) & #8)
-| Project (#9..#12)
+Explained Query:
+  Project (#9..=#12) // { arity: 4 }
+    Map (((#0 # #1) & #2), ((#3 # #4) & #5), ((#6 # #7) & #8), (integer_to_bigint((smallint_to_integer(#0) # #4)) & #8)) // { arity: 13 }
+      ReadStorage materialize.public.nums // { arity: 9 }
+
+Source materialize.public.nums
+
+Target cluster: quickstart
 
 EOF
 
@@ -1001,17 +1095,21 @@ SELECT
 1 1 0
 
 query T multiline
-EXPLAIN SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
   x1 # x2 | x3 as r1,
   y1 # y2 | y3 as r2,
   z1 # z2 | z3 as r3,
   x1 # y2 | z3 as r4
 FROM nums
 ----
-%0 =
-| Get materialize.public.nums (u5)
-| Map ((#0 # #1) | #2), ((#3 # #4) | #5), ((#6 # #7) | #8), (i32toi64((i16toi32(#0) # #4)) | #8)
-| Project (#9..#12)
+Explained Query:
+  Project (#9..=#12) // { arity: 4 }
+    Map (((#0 # #1) | #2), ((#3 # #4) | #5), ((#6 # #7) | #8), (integer_to_bigint((smallint_to_integer(#0) # #4)) | #8)) // { arity: 13 }
+      ReadStorage materialize.public.nums // { arity: 9 }
+
+Source materialize.public.nums
+
+Target cluster: quickstart
 
 EOF
 
@@ -1032,3 +1130,47 @@ SELECT
    ~1 - 2  as def_sub, ~(1 - 2)  as l_prec_sub, (~1) - 2  as h_prec_sub
 ----
 -3 -3 -1 0 0 -4
+
+# overflow for negating minimum integers
+
+query error "-32768" smallint out of range
+SELECT - '-32768'::int2
+
+query error "-32768" smallint out of range
+SELECT  ABS('-32768'::int2)
+
+query error "-2147483648" integer out of range
+SELECT - '-2147483648'::int4
+
+query error "-2147483648" integer out of range
+SELECT  ABS('-2147483648'::int4)
+
+query error "-9223372036854775808" bigint out of range
+SELECT - '-9223372036854775808'::int8
+
+query error "-9223372036854775808" bigint out of range
+SELECT  ABS('-9223372036854775808'::int8)
+
+query error "-32768 / -1" smallint out of range
+SELECT '-32768'::int2 / '-1'::int2
+
+query error "-2147483648 / -1" integer out of range
+SELECT '-2147483648'::int4 / '-1'::int4
+
+query error "-9223372036854775808 / -1" bigint out of range
+SELECT '-9223372036854775808'::int8 / '-1'::int8
+
+query I
+SELECT '-32768'::int2 % '-1'::int2
+----
+0
+
+query I
+SELECT '-2147483648'::int4 % '-1'::int4
+----
+0
+
+query I
+SELECT '-9223372036854775808'::int8 % '-1'::int8
+----
+0

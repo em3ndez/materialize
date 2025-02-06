@@ -14,11 +14,11 @@ use std::env::{self, VarError};
 use std::io::Write;
 use std::mem::size_of;
 
-use ore::cast::CastFrom;
+use mz_ore::cast::CastFrom;
+use mz_persist_types::Codec64;
 
-use crate::error::Error;
 use crate::indexed::columnar::{ColumnarRecords, ColumnarRecordsBuilder};
-use crate::indexed::runtime::StreamWriteHandle;
+use crate::metrics::ColumnarMetrics;
 
 /// A configurable data generator for benchmarking.
 #[derive(Clone, Debug)]
@@ -34,9 +34,13 @@ pub struct DataGenerator {
     val_buf: Vec<u8>,
 }
 
-const RECORD_SIZE_BYTES_KEY: &'static str = "MZ_PERSIST_RECORD_SIZE_BYTES";
-const RECORD_COUNT_KEY: &'static str = "MZ_PERSIST_RECORD_COUNT";
-const BATCH_MAX_COUNT_KEY: &'static str = "MZ_PERSIST_BATCH_MAX_COUNT";
+const RECORD_SIZE_BYTES_KEY: &str = "MZ_PERSIST_RECORD_SIZE_BYTES";
+const RECORD_COUNT_KEY: &str = "MZ_PERSIST_RECORD_COUNT";
+const BATCH_MAX_COUNT_KEY: &str = "MZ_PERSIST_BATCH_MAX_COUNT";
+
+const RECORD_SIZE_BYTES_KEY_SMALL: &str = "MZ_PERSIST_RECORD_SIZE_BYTES_SMALL";
+const RECORD_COUNT_KEY_SMALL: &str = "MZ_PERSIST_RECORD_COUNT_SMALL";
+const BATCH_MAX_COUNT_KEY_SMALL: &str = "MZ_PERSIST_BATCH_MAX_COUNT_SMALL";
 
 // Selected arbitrarily as representative of production record sizes.
 const DEFAULT_RECORD_SIZE_BYTES: usize = 64;
@@ -47,7 +51,14 @@ const DEFAULT_BATCH_MAX_COUNT: usize = (8 * 1024 * 1024) / DEFAULT_RECORD_SIZE_B
 // round-ish number.
 const DEFAULT_RECORD_COUNT: usize = 819_200;
 
-const TS_DIFF_GOODPUT_SIZE: usize = size_of::<u64>() + size_of::<isize>();
+// Selected arbitrarily as representative of production record sizes.
+const DEFAULT_RECORD_SIZE_BYTES_SMALL: usize = 1024;
+// Selected to produce a small number of batches with default settings.
+const DEFAULT_BATCH_MAX_COUNT_SMALL: usize = DEFAULT_RECORD_COUNT_SMALL / 8;
+// Selected arbitrarily to make ~64KiB of data.
+const DEFAULT_RECORD_COUNT_SMALL: usize = (64 * 1024) / DEFAULT_RECORD_SIZE_BYTES_SMALL;
+
+const TS_DIFF_GOODPUT_SIZE: usize = size_of::<u64>() + size_of::<i64>();
 
 fn read_env_usize(key: &str, default: usize) -> usize {
     match env::var(key) {
@@ -94,6 +105,30 @@ impl DataGenerator {
         }
     }
 
+    /// Returns a new [DataGenerator] specifically for testing small data volumes.
+    pub fn small() -> Self {
+        let record_count_small = read_env_usize(RECORD_COUNT_KEY_SMALL, DEFAULT_RECORD_COUNT_SMALL);
+        let record_size_bytes_small =
+            read_env_usize(RECORD_SIZE_BYTES_KEY_SMALL, DEFAULT_RECORD_SIZE_BYTES_SMALL);
+        let batch_max_count_small =
+            read_env_usize(BATCH_MAX_COUNT_KEY_SMALL, DEFAULT_BATCH_MAX_COUNT_SMALL);
+
+        eprintln!(
+            "{}={} {}={} {}={}",
+            RECORD_COUNT_KEY_SMALL,
+            record_count_small,
+            RECORD_SIZE_BYTES_KEY_SMALL,
+            record_size_bytes_small,
+            BATCH_MAX_COUNT_KEY_SMALL,
+            batch_max_count_small,
+        );
+        DataGenerator::new(
+            record_count_small,
+            record_size_bytes_small,
+            batch_max_count_small,
+        )
+    }
+
     /// Returns the number of "goodput" bytes represented by the entire dataset
     /// produced by this generator.
     pub fn goodput_bytes(&self) -> u64 {
@@ -124,19 +159,23 @@ impl DataGenerator {
         if batch_start >= batch_end {
             return None;
         }
-        let mut batch = ColumnarRecordsBuilder::default();
-        batch.reserve(
-            batch_end - batch_start,
-            self.record_size_bytes - TS_DIFF_GOODPUT_SIZE,
+        let items = batch_end - batch_start;
+        let mut batch = ColumnarRecordsBuilder::with_capacity(
+            items,
+            (self.record_size_bytes - TS_DIFF_GOODPUT_SIZE) * items,
             0,
         );
         for record_idx in batch_start..batch_end {
-            batch.push(self.gen_record(record_idx));
+            let (kv, t, d) = self.gen_record(record_idx);
+            assert!(
+                batch.push((kv, Codec64::encode(&t), Codec64::encode(&d))),
+                "generator exceeded batch size; smaller batches needed"
+            );
         }
-        Some(batch.finish())
+        Some(batch.finish(&ColumnarMetrics::disconnected()))
     }
 
-    fn gen_record(&mut self, record_idx: usize) -> ((&[u8], &[u8]), u64, isize) {
+    fn gen_record(&mut self, record_idx: usize) -> ((&[u8], &[u8]), u64, i64) {
         assert!(record_idx < self.record_count);
         assert!(self.record_size_bytes > TS_DIFF_GOODPUT_SIZE);
 
@@ -168,7 +207,7 @@ impl DataGenerator {
     }
 
     /// Returns an [Iterator] of all records.
-    pub fn records(&self) -> impl Iterator<Item = ((Vec<u8>, Vec<u8>), u64, isize)> {
+    pub fn records(&self) -> impl Iterator<Item = ((Vec<u8>, Vec<u8>), u64, i64)> {
         let mut config = self.clone();
         (0..self.record_count).map(move |record_idx| {
             let ((k, v), t, d) = config.gen_record(record_idx);
@@ -194,48 +233,27 @@ impl Iterator for DataGeneratorBatchIter {
     }
 }
 
-/// Load the dataset into a persist collection.
-///
-/// The data is loaded with one concurrent write call per generated data batch.
-/// If `do_seals` is true, data is sealed as it's loaded.
-///
-/// The "goodput" bytes represented by this data load are returned on success.
-pub fn load(
-    handle: &StreamWriteHandle<Vec<u8>, Vec<u8>>,
-    data: &DataGenerator,
-    do_seals: bool,
-) -> Result<u64, Error> {
-    let mut writes = Vec::new();
-    let mut seals = Vec::new();
+/// Encodes the given data into a flat buffer that is exactly
+/// `data.goodput_bytes()` long.
+pub fn flat_blob(data: &DataGenerator) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(usize::cast_from(data.goodput_bytes()));
     for batch in data.batches() {
-        // It's unfortunate to turn this into a Vec just to turn it back into a
-        // columnar batch.
-        let batch = batch
-            .iter()
-            .map(|((k, v), t, d)| ((k.to_vec(), v.to_vec()), t, d))
-            .collect::<Vec<_>>();
-        writes.push(handle.write(&batch));
-        if let Some((_, batch_largest_ts, _)) = batch.get(batch.len() - 1) {
-            if do_seals {
-                let seal_ts = batch_largest_ts + 1;
-                seals.push(handle.seal(seal_ts));
-            }
+        for ((k, v), t, d) in batch.iter() {
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(v);
+            buf.extend_from_slice(&t);
+            buf.extend_from_slice(&d);
         }
     }
-    for write in writes {
-        write.recv()?;
-    }
-    for seal in seals {
-        seal.recv()?;
-    }
-    Ok(data.goodput_bytes())
+    assert_eq!(buf.len(), usize::cast_from(data.goodput_bytes()));
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
+    #[mz_ore::test]
     fn size_invariants() {
         fn testcase(c: DataGenerator) {
             let (mut actual_len, mut actual_goodput_bytes) = (0, 0);
@@ -255,7 +273,7 @@ mod tests {
         testcase(DataGenerator::new(1000, 32, 100));
     }
 
-    #[test]
+    #[mz_ore::test]
     fn goodput_pretty() {
         fn testcase(bytes: usize) -> String {
             DataGenerator::new(1, bytes, 1).goodput_pretty()

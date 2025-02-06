@@ -19,27 +19,39 @@
 
 use std::mem;
 
-use crate::TransformArgs;
-use expr::MirRelationExpr;
+use mz_expr::MirRelationExpr;
+
+use crate::TransformCtx;
 
 /// Fuses a sequence of `Map` operators in to one `Map` operator.
 #[derive(Debug)]
 pub struct Map;
 
 impl crate::Transform for Map {
-    fn transform(
+    fn name(&self) -> &'static str {
+        "MapFusion"
+    }
+
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
+        fields(path.segment = "map_fusion")
+    )]
+    fn actually_perform_transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        relation.try_visit_mut_pre(&mut |e| Ok(self.action(e)))
+        relation.visit_pre_mut(Self::action);
+        mz_repr::explain::trace_plan(&*relation);
+        Ok(())
     }
 }
 
 impl Map {
     /// Fuses a sequence of `Map` operators into one `Map` operator.
     /// Remove the map operator if it is empty.
-    pub fn action(&self, relation: &mut MirRelationExpr) {
+    pub fn action(relation: &mut MirRelationExpr) {
         if let MirRelationExpr::Map { input, scalars } = relation {
             while let MirRelationExpr::Map {
                 input: inner_input,

@@ -7,6 +7,13 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+// Convenience macro for generating `inverse` values.
+macro_rules! to_unary {
+    ($f:expr) => {
+        Some(crate::UnaryFunc::from($f))
+    };
+}
+
 macro_rules! sqlfunc {
     // Expand the function name into an attribute if it was omitted
     (
@@ -18,7 +25,7 @@ macro_rules! sqlfunc {
         );
     };
 
-    // Add the uniqueness attribute if it was omitted
+    // Add both uniqueness + inverse attributes if they were omitted
     (
         #[sqlname = $name:expr]
         fn $fn_name:ident $($tail:tt)*
@@ -26,6 +33,64 @@ macro_rules! sqlfunc {
         sqlfunc!(
             #[sqlname = $name]
             #[preserves_uniqueness = false]
+            #[inverse = None]
+            fn $fn_name $($tail)*
+        );
+    };
+
+    (
+        #[sqlname = $name:expr]
+        #[is_monotone = $is_monotone:expr]
+        fn $fn_name:ident $($tail:tt)*
+    ) => {
+        sqlfunc!(
+            #[sqlname = $name]
+            #[preserves_uniqueness = false]
+#[is_monotone = $is_monotone]            fn $fn_name $($tail)*
+        );
+    };
+
+    // Add the inverse attribute if it was omitted
+    (
+        #[sqlname = $name:expr]
+        #[preserves_uniqueness = $preserves_uniqueness:expr]
+        fn $fn_name:ident $($tail:tt)*
+    ) => {
+        sqlfunc!(
+            #[sqlname = $name]
+            #[preserves_uniqueness = $preserves_uniqueness]
+            #[inverse = None]
+            fn $fn_name $($tail)*
+        );
+    };
+
+    (
+        #[sqlname = $name:expr]
+        #[preserves_uniqueness = $preserves_uniqueness:expr]
+        #[is_monotone = $is_monotone:expr]
+        fn $fn_name:ident $($tail:tt)*
+    ) => {
+        sqlfunc!(
+            #[sqlname = $name]
+            #[preserves_uniqueness = $preserves_uniqueness]
+            #[inverse = None]
+            #[is_monotone = $is_monotone]
+            fn $fn_name $($tail)*
+        );
+    };
+
+    // Add the monotone attribute if it was omitted
+    (
+        #[sqlname = $name:expr]
+        #[preserves_uniqueness = $preserves_uniqueness:expr]
+        #[inverse = $inverse:expr]
+        fn $fn_name:ident $($tail:tt)*
+    ) => {
+        sqlfunc!(
+            #[sqlname = $name]
+            #[preserves_uniqueness = $preserves_uniqueness]
+            #[inverse = $inverse]
+            #[is_monotone = false]
             fn $fn_name $($tail)*
         );
     };
@@ -34,11 +99,15 @@ macro_rules! sqlfunc {
     (
         #[sqlname = $name:expr]
         #[preserves_uniqueness = $preserves_uniqueness:expr]
+        #[inverse = $inverse:expr]
+        #[is_monotone = $is_monotone:expr]
         fn $fn_name:ident ($($params:tt)*) $($tail:tt)*
     ) => {
         sqlfunc!(
             #[sqlname = $name]
             #[preserves_uniqueness = $preserves_uniqueness]
+            #[inverse = $inverse]
+            #[is_monotone = $is_monotone]
             fn $fn_name<'a>($($params)*) $($tail)*
         );
     };
@@ -47,12 +116,16 @@ macro_rules! sqlfunc {
     (
         #[sqlname = $name:expr]
         #[preserves_uniqueness = $preserves_uniqueness:expr]
-        fn $fn_name:ident<$lt:lifetime>(mut $param_name:ident: $input_ty:ty) -> $output_ty:ty
+        #[inverse = $inverse:expr]
+        #[is_monotone = $is_monotone:expr]
+        fn $fn_name:ident<$lt:lifetime>(mut $param_name:ident: $input_ty:ty $(,)?) -> $output_ty:ty
             $body:block
     ) => {
         sqlfunc!(
             #[sqlname = $name]
             #[preserves_uniqueness = $preserves_uniqueness]
+            #[inverse = $inverse]
+            #[is_monotone = $is_monotone]
             fn $fn_name<$lt>($param_name: $input_ty) -> $output_ty {
                 let mut $param_name = $param_name;
                 $body
@@ -63,11 +136,13 @@ macro_rules! sqlfunc {
     (
         #[sqlname = $name:expr]
         #[preserves_uniqueness = $preserves_uniqueness:expr]
-        fn $fn_name:ident<$lt:lifetime>($param_name:ident: $input_ty:ty) -> $output_ty:ty
+        #[inverse = $inverse:expr]
+        #[is_monotone = $is_monotone:expr]
+        fn $fn_name:ident<$lt:lifetime>($param_name:ident: $input_ty:ty $(,)?) -> $output_ty:ty
             $body:block
     ) => {
         paste::paste! {
-            #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Hash, lowertest::MzStructReflect)]
+            #[derive(proptest_derive::Arbitrary, Ord, PartialOrd, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Hash, mz_lowertest::MzReflect)]
             pub struct [<$fn_name:camel>];
 
             impl<'a> crate::func::EagerUnaryFunc<'a> for [<$fn_name:camel>] {
@@ -78,8 +153,8 @@ macro_rules! sqlfunc {
                     $fn_name(a)
                 }
 
-                fn output_type(&self, input_type: repr::ColumnType) -> repr::ColumnType {
-                    use repr::AsColumnType;
+                fn output_type(&self, input_type: mz_repr::ColumnType) -> mz_repr::ColumnType {
+                    use mz_repr::AsColumnType;
                     let output = Self::Output::as_column_type();
                     let propagates_nulls = crate::func::EagerUnaryFunc::propagates_nulls(self);
                     let nullable = output.nullable;
@@ -91,6 +166,14 @@ macro_rules! sqlfunc {
                 fn preserves_uniqueness(&self) -> bool {
                     $preserves_uniqueness
                 }
+
+                fn inverse(&self) -> Option<crate::UnaryFunc> {
+                    $inverse
+                }
+
+                fn is_monotone(&self) -> bool {
+                    $is_monotone
+                }
             }
 
             impl std::fmt::Display for [<$fn_name:camel>] {
@@ -99,6 +182,7 @@ macro_rules! sqlfunc {
                 }
             }
 
+            #[allow(clippy::extra_unused_lifetimes)]
             pub fn $fn_name<$lt>($param_name: $input_ty) -> $output_ty {
                 $body
             }
@@ -108,9 +192,10 @@ macro_rules! sqlfunc {
 
 #[cfg(test)]
 mod test {
+    use mz_repr::ScalarType;
+
     use crate::scalar::func::LazyUnaryFunc;
     use crate::EvalError;
-    use repr::ScalarType;
 
     sqlfunc!(
         #[sqlname = "INFALLIBLE"]
@@ -131,7 +216,7 @@ mod test {
         }
     );
 
-    #[test]
+    #[mz_ore::test]
     fn elision_rules_infallible() {
         assert_eq!(format!("{}", Infallible1), "INFALLIBLE");
         assert!(Infallible1.propagates_nulls());
@@ -144,7 +229,7 @@ mod test {
         assert!(Infallible3.introduces_nulls());
     }
 
-    #[test]
+    #[mz_ore::test]
     fn output_types_infallible() {
         assert_eq!(
             Infallible1.output_type(ScalarType::Float32.nullable(true)),
@@ -192,7 +277,7 @@ mod test {
         }
     );
 
-    #[test]
+    #[mz_ore::test]
     fn elision_rules_fallible() {
         assert!(Fallible1.propagates_nulls());
         assert!(!Fallible1.introduces_nulls());
@@ -204,7 +289,7 @@ mod test {
         assert!(Fallible3.introduces_nulls());
     }
 
-    #[test]
+    #[mz_ore::test]
     fn output_types_fallible() {
         assert_eq!(
             Fallible1.output_type(ScalarType::Float32.nullable(true)),
@@ -242,6 +327,11 @@ mod test {
 /// Once everything is handled by this macro we can remove it and replace it with `enum_dispatch`
 macro_rules! derive_unary {
     ($($name:ident),*) => {
+        #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Hash, mz_lowertest::MzReflect)]
+        pub enum UnaryFunc {
+            $($name($name),)*
+        }
+
         impl UnaryFunc {
             pub fn eval<'a>(
                 &'a self,
@@ -251,32 +341,42 @@ macro_rules! derive_unary {
             ) -> Result<Datum<'a>, EvalError> {
                 match self {
                     $(Self::$name(f) => f.eval(datums, temp_storage, a),)*
-                    _ => self.eval_manual(datums, temp_storage, a),
                 }
             }
 
             pub fn output_type(&self, input_type: ColumnType) -> ColumnType {
                 match self {
                     $(Self::$name(f) => LazyUnaryFunc::output_type(f, input_type),)*
-                    _ => self.output_type_manual(input_type),
                 }
             }
             pub fn propagates_nulls(&self) -> bool {
                 match self {
                     $(Self::$name(f) => LazyUnaryFunc::propagates_nulls(f),)*
-                    _ => self.propagates_nulls_manual(),
                 }
             }
             pub fn introduces_nulls(&self) -> bool {
                 match self {
                     $(Self::$name(f) => LazyUnaryFunc::introduces_nulls(f),)*
-                    _ => self.introduces_nulls_manual(),
                 }
             }
             pub fn preserves_uniqueness(&self) -> bool {
                 match self {
                     $(Self::$name(f) => LazyUnaryFunc::preserves_uniqueness(f),)*
-                    _ => self.preserves_uniqueness_manual(),
+                }
+            }
+            pub fn inverse(&self) -> Option<UnaryFunc> {
+                match self {
+                    $(Self::$name(f) => LazyUnaryFunc::inverse(f),)*
+                }
+            }
+            pub fn is_monotone(&self) -> bool {
+                match self {
+                    $(Self::$name(f) => LazyUnaryFunc::is_monotone(f),)*
+                }
+            }
+            pub fn could_error(&self) -> bool {
+                match self {
+                    $(Self::$name(f) => LazyUnaryFunc::could_error(f),)*
                 }
             }
         }
@@ -285,7 +385,6 @@ macro_rules! derive_unary {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 match self {
                     $(Self::$name(func) => func.fmt(f),)*
-                    _ => self.fmt_manual(f),
                 }
             }
         }

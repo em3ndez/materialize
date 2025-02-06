@@ -7,246 +7,157 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Test various errors that can happen at CREATE SINK time and check how they are reported to the user
 #
 
-> CREATE VIEW v1 (f1) AS VALUES (1);
+> CREATE MATERIALIZED VIEW v1 (f1) AS VALUES (1);
 
-! CREATE SINK invalid_port FROM v1
-  INTO KAFKA BROKER '123:123:123'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-invalid port: invalid digit found in string
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
-! CREATE SINK invalid_broker FROM v1
-  INTO KAFKA BROKER 'localhost:1234'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Meta data fetch error: BrokerTransportFailure (Local: Broker transport failure): BrokerTransportFailure (Local: Broker transport failure)
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
 
-! CREATE SINK invalid_schema_registry FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'foo'
-relative URL without a base
-
-! CREATE SINK invalid_schema_registry_host FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://localhost:1234'
-tcp connect error
-
-! CREATE SINK invalid_partition_count FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (partition_count = a)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-partition count for sink topics must be an integer
-
-! CREATE SINK invalid_partition_count FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (partition_count = -2)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-partition count for sink topics must be a positive integer or -1 for broker default
-
-! CREATE SINK invalid_replication_factor FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (replication_factor = a)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-replication factor for sink topics must be an integer
-
-! CREATE SINK invalid_replication_factor FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (replication_factor = -2)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-replication factor for sink topics must be a positive integer or -1 for broker default
-
-! CREATE SINK invalid_consistency FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (consistency_topic = -2)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-consistency_topic must be a string
-
-! CREATE SINK invalid_acks FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (acks = foo)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Invalid value for configuration property "request.required.acks" acks foo
-
-! CREATE SINK invalid_key FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
+! CREATE SINK invalid_key
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}')
   KEY(f2)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-No such column: f2
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:column referenced in KEY does not exist: f2
 
-#
-# Retention options
-#
-! CREATE SINK invalid_retention_ms FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (retention_ms = a)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-retention ms for sink topics must be an integer
-
-! CREATE SINK invalid_retention_ms FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (retention_ms = -2)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-retention ms for sink topics must be greater than or equal to -1
-
-! CREATE SINK invalid_retention_bytes FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (retention_bytes = a)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-retention bytes for sink topics must be an integer
-
-! CREATE SINK invalid_retention_bytes FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (retention_bytes = -2)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-retention bytes for sink topics must be greater than or equal to -1
+! CREATE SINK invalid_legacy_ids
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}', LEGACY IDS)
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:LEGACY IDs option is not supported
 
 #
 # Sink dependencies
 #
 
-> CREATE SINK s1 FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE SINK s1
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
 
-! CREATE SINK s2 FROM s1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
+! CREATE SINK s2
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM s1
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
 
 ! CREATE VIEW v2 AS SELECT * FROM s1
-catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
+contains:catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
 
 ! SELECT * FROM s1
-catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
+contains:catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
 
 > DROP SINK s1
 
-#
-# SSL-related options
-#
-
-! CREATE SINK invalid_security_protocol FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (security_protocol = 'FOO')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-creating admin client failed: Client config error: Invalid value "FOO" for configuration property "security.protocol" security.protocol FOO
-
-! CREATE SINK ssl_on_non_ssl_broker FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (security_protocol = 'SSL')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Meta data fetch error: BrokerTransportFailure (Local: Broker transport failure)
-
-! CREATE SINK invalid_ssl_certificate_location FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (security_protocol = SSL , ssl_certificate_location = 'foo')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Invalid WITH option ssl_certificate_location='foo': file does not exist
-
-! CREATE SINK invalid_ssl_key_location FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (security_protocol = SSL , ssl_key_location = 'foo')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Invalid WITH option ssl_key_location='foo': file does not exist
-
-! CREATE SINK invalid_ssl_ca_location FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH (security_protocol = SSL , ssl_ca_location = 'foo')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Invalid WITH option ssl_ca_location='foo': file does not exist
-
-#
-# Kerberos options
-#
-
-! CREATE SINK invalid_sasl_mechanisms FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH  (security_protocol = SASL_SSL, sasl_mechanisms = foo)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Unsupported SASL mechanism: FOO
-
-! CREATE SINK invalid_sasl_kerberos_keytab FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH  (security_protocol = SASL_SSL, sasl_kerberos_keytab = foo)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-Invalid WITH option sasl_kerberos_keytab='foo': file does not exist
-
 $ file-append path=invalid-keytab
 nonsense
-
-! CREATE SINK invalid_sasl_kerberos_keytab FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH  (security_protocol = SASL_SSL, sasl_kerberos_keytab = '${testdrive.temp-dir}/invalid-keytab')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-error registering kafka topic for sink
-
-! CREATE SINK missing_required_sasl_username FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH  (security_protocol = SASL_SSL, sasl_mechanisms = plain)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-creating admin client failed: Client creation error: sasl.username and sasl.password must be set
-
-! CREATE SINK missing_required_sasl_password FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH  (security_protocol = SASL_SSL, sasl_mechanisms = plain, sasl_username = foo)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-creating admin client failed: Client creation error: sasl.username and sasl.password must be set
-
-! CREATE SINK missing_required_sasl_kerberos_keytab FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH  (security_protocol = SASL_SSL, sasl_mechanisms = gssapi)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-creating admin client failed: Client creation error: Invalid sasl.kerberos.kinit.cmd value: Property not available: "sasl.kerberos.keytab"
-
-! CREATE SINK invalid_sasl_kerberos_kinit_cmd FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}'
-  TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-  WITH  (security_protocol = SASL_SSL, sasl_mechanisms = gssapi, sasl_kerberos_kinit_cmd = '/bin/false')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-error registering kafka topic for sink
 
 #
 # FORMAT
 #
 
-! CREATE SINK invalid_format FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
-sink without format not yet supported
+! CREATE SINK invalid_format
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}')
+  ENVELOPE DEBEZIUM
+contains:sink without format not yet supported
 
-! CREATE SINK invalid_format FROM v1
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}'
+! CREATE SINK invalid_format
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}')
   FORMAT NO_SUCH_FORMAT
-found identifier "no_such_format"
+  ENVELOPE DEBEZIUM
+contains:found identifier "no_such_format"
+
+! CREATE SINK invalid_envelope
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}')
+  FORMAT JSON
+contains:ENVELOPE clause is required
+
+#
+# Topic Options
+#
+
+! CREATE SINK invalid_topic_options
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (
+    TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}',
+    TOPIC REPLICATION FACTOR -5
+  )
+  KEY(f1)
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:TOPIC REPLICATION FACTOR must be a positive integer
+
+! CREATE SINK invalid_topic_options
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (
+    TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}',
+    TOPIC PARTITION COUNT 'two'
+  )
+  KEY(f1)
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:invalid TOPIC PARTITION COUNT: cannot use value as number
+
+! CREATE SINK invalid_topic_options
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (
+    TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}',
+    TOPIC CONFIG 123
+  )
+  KEY(f1)
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:invalid TOPIC CONFIG: cannot use value as map
+
+! CREATE SINK invalid_topic_options
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (
+    TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}',
+    TOPIC CONFIG MAP['x' => 1]
+  )
+  KEY(f1)
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:invalid TOPIC CONFIG: cannot use value as string
+
+! CREATE SINK invalid_topic_options
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM v1
+  INTO KAFKA CONNECTION kafka_conn (
+    TOPIC 'testdrive-kafka-sink-errors-${testdrive.seed}',
+    TOPIC CONFIG MAP[1 => 'x']
+  )
+  KEY(f1)
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:Expected string, found number
 
 # Expect empty output
 > SHOW SINKS

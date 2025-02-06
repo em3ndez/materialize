@@ -23,17 +23,21 @@
 # Exotic types
 #
 
-> CREATE TYPE int4_list AS LIST (element_type = int4);
+> CREATE TYPE int4_list AS LIST (ELEMENT TYPE = int4);
 
-> CREATE TYPE int4_list_list AS LIST (element_type = int4_list);
+> CREATE TYPE int4_list_list AS LIST (ELEMENT TYPE = int4_list);
 
-> CREATE TYPE int4_map AS MAP (key_type=text, value_type=int4);
+> CREATE TYPE int4_map AS MAP (KEY TYPE = text, VALUE TYPE = int4);
 
-> CREATE TYPE int4_map_map AS MAP (key_type=text, value_type=int4_map);
+> CREATE TYPE int4_map_map AS MAP (KEY TYPE = text, VALUE TYPE = int4_map);
 
 > CREATE TABLE exotic_types (int4_list int4_list, int4_list_list int4_list_list, int4_map int4_map, int4_map_map int4_map_map);
 
 > INSERT INTO exotic_types VALUES ('{1,2}'::int4_list, '{{1,2}}'::int4_list_list, '{a=>1}'::int4_map, '{a=>{a=>1}}'::int4_map_map);
+
+> CREATE TABLE char_type_quoted (f1 "char");
+
+> INSERT INTO char_type_quoted VALUES ('a');
 
 #
 # Make sure dropping a table does not break persistence of other tables

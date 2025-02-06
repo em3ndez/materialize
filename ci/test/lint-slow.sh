@@ -15,14 +15,20 @@ set -euo pipefail
 
 . misc/shlib/shlib.bash
 
-ci_init
+try cargo clippy --all-targets -- -D warnings
 
-ci_try bin/xcompile cargo test --locked --doc
-# Intentionally run check last, since otherwise it won't use the cache.
-# https://github.com/rust-lang/rust-clippy/issues/3840
-ci_try bin/check
+try bin/doc
+try bin/doc --document-private-items
 
-ci_try bin/doc
-ci_try bin/doc --document-private-items
+try bin/xcompile cargo test --locked --doc
 
-ci_status_report
+try bin/ci-closed-issues-detect --changed-lines-only
+
+# Smoke out failures in generating the license metadata page, even though we
+# don't care about its output in the test pipeline, so that we don't only
+# discover the failures after a merge to main.
+try cargo --locked about generate ci/deploy/licenses.hbs > /dev/null
+
+try helm unittest misc/helm-charts/operator
+
+try_status_report

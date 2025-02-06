@@ -1,0 +1,35 @@
+[package]
+name = "mz-alloc"
+description = "Chooses a global memory allocator based on Cargo features."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mz-ore = { path = "../ore", default-features = false }
+mz-prof = { path = "../prof", default-features = false, features = ["jemalloc"], optional = true }
+mz-prof-http = { path = "../prof-http", default-features = false }
+# According to jemalloc developers, `background_threads` should always be
+# enabled, except in "esoteric" situations that don't apply to Materialize
+# (namely, if the application relies on new threads not being created for
+# whatever reason).
+#
+# See: https://github.com/jemalloc/jemalloc/issues/956#issuecomment-316224733
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"], optional = true }
+workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }
+
+[features]
+default = ["workspace-hack"]
+# Whether to use jemalloc instead of the system allocator.
+jemalloc = ["tikv-jemallocator", "mz-prof", "mz-prof-http/jemalloc"]
+
+[package.metadata.cargo-udeps.ignore]
+# The only reason we depend on mz-prof-http from this package is so that we can
+# force its `jemalloc` option to be enabled when this package's is, which makes
+# all the Materialize binaries correctly serve heap profiling tools at the
+# `/prof` endpoints.
+normal = ["workspace-hack", "mz-prof-http"]

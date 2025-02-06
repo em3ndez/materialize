@@ -1,5 +1,5 @@
 ---
-title: "date_bin Function"
+title: "date_bin function"
 description: "Bins a timestamp into a specified interval"
 menu:
   main:
@@ -33,8 +33,6 @@ strides, rather than only unit times.
 
 ## Signatures
 
-### Stable
-
 {{< diagram "func-date-bin.svg" >}}
 
 Parameter | Type | Description
@@ -42,20 +40,6 @@ Parameter | Type | Description
 _stride_ | [`interval`] | Define bins of this width.
 _source_ | [`timestamp`], [`timestamp with time zone`] | Determine this value's bin.
 _origin_ | Must be the same as _source_ | Align bins to this value.
-
-### Experimental
-
-{{< experimental v0.9.11 >}}
-The binary implementation of `date_bin`
-{{< /experimental >}}
-
-{{< diagram "func-date-bin-experimental.svg" >}}
-
-Parameter | Type | Description
-----------|------|------------
-_stride_ | [`interval`] | Define bins of this width.
-_source_ | [`timestamp`], [`timestamp with time zone`] | Determine this value's bin.
-_origin_ | Must be the same as _source_ | Align bins to this value. If not provided, defaults to the Unix epoch.
 
 ### Return value
 
@@ -69,7 +53,7 @@ _origin_ | Must be the same as _source_ | Align bins to this value. If not provi
 
 ## Examples
 
-```sql
+```mzsql
 SELECT
   date_bin(
     '15 minutes',
@@ -83,7 +67,7 @@ SELECT
  2001-02-16 20:35:00
 ```
 
-```sql
+```mzsql
 SELECT
   str,
   "interval",

@@ -23,45 +23,50 @@
 #![warn(missing_debug_implementations)]
 
 mod datum_vec;
+mod diff;
 mod relation;
+mod relation_and_scalar;
 mod row;
 mod scalar;
 
 pub mod adt;
+pub mod antichain;
+pub mod bytes;
+pub mod catalog_item_id;
+pub mod explain;
+pub mod fixed_length;
+pub mod global_id;
+pub mod namespaces;
+pub mod network_policy_id;
+pub mod optimize;
+pub mod refresh_schedule;
+pub mod role_id;
+pub mod stats;
+pub mod stats2;
 pub mod strconv;
-pub mod util;
+pub mod timestamp;
+pub mod url;
+pub mod user;
 
-pub use datum_vec::{DatumVec, DatumVecBorrow};
-pub use relation::{ColumnName, ColumnType, NotNullViolation, RelationDesc, RelationType};
-pub use row::{
-    datum_list_size, datum_size, datums_size, row_size, DatumList, DatumMap, Row, RowArena, RowRef,
+pub use crate::catalog_item_id::CatalogItemId;
+pub use crate::datum_vec::{DatumVec, DatumVecBorrow};
+pub use crate::diff::Diff;
+pub use crate::global_id::GlobalId;
+pub use crate::relation::{
+    arb_relation_desc_diff, arb_relation_desc_projection, arb_row_for_relation, ColumnIndex,
+    ColumnName, ColumnType, NotNullViolation, PropRelationDescDiff, ProtoColumnName,
+    ProtoColumnType, ProtoRelationDesc, ProtoRelationType, RelationDesc, RelationDescBuilder,
+    RelationType, RelationVersion, RelationVersionSelector, VersionedRelationDesc,
 };
-pub use scalar::{AsColumnType, Datum, DatumType, ScalarBaseType, ScalarType};
-
-// Concrete types used throughout Materialize for the generic parameters in Timely/Differential Dataflow.
-/// System-wide timestamp type.
-pub type Timestamp = u64;
-/// System-wide record count difference type.
-pub type Diff = isize;
-
-use serde::{Deserialize, Serialize};
-// This probably logically belongs in `dataflow`, but source caching looks at it,
-// so put it in `repr` instead.
-/// The payload delivered by a source connector; either bytes or an EOF marker.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd)]
-pub enum MessagePayload {
-    /// Data from the source connector
-    Data(Vec<u8>),
-    /// Forces the decoder to consider this a delimiter.
-    ///
-    /// For example, CSV records are normally terminated by a newline,
-    /// but files might not be newline-terminated; thus we need
-    /// the decoder to emit a CSV record when the end of a file is seen.
-    EOF,
-}
-
-impl Default for MessagePayload {
-    fn default() -> Self {
-        Self::Data(vec![])
-    }
-}
+pub use crate::row::encode::{preserves_order, RowColumnarDecoder, RowColumnarEncoder};
+pub use crate::row::iter::{IntoRowIterator, RowIterator};
+pub use crate::row::{
+    datum_list_size, datum_size, datums_size, read_datum, row_size, DatumList, DatumMap,
+    ProtoNumeric, ProtoRow, Row, RowArena, RowPacker, RowRef, SharedRow,
+};
+pub use crate::scalar::{
+    arb_datum, arb_datum_for_column, arb_datum_for_scalar, arb_range_type, ArrayRustType,
+    AsColumnType, Datum, DatumType, PropArray, PropDatum, PropDict, PropList, ProtoScalarType,
+    ScalarBaseType, ScalarType,
+};
+pub use crate::timestamp::{Timestamp, TimestampManipulation};

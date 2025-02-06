@@ -7,6 +7,9 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default default-replica-size=1
+$ set-arg-default single-replica-cluster=quickstart
+
 # Test creating and dropping various views and sources that depend upon
 # on another, and indices on those views and sources.
 
@@ -21,34 +24,38 @@ $ set schema={
 
 $ kafka-create-topic topic=data
 
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
 > CREATE SOURCE data
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+
+> CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
 
-! SELECT * FROM data
-unable to automatically determine a query timestamp
+> SELECT * FROM data_tbl
 
-> CREATE VIEW data_view as SELECT * from data
+> CREATE VIEW data_view as SELECT * from data_tbl
 
-! SELECT * FROM data_view
-unable to automatically determine a query timestamp
+> SELECT * FROM data_view
 
 > CREATE MATERIALIZED VIEW test1 AS
-  SELECT b, sum(a) FROM data GROUP BY b
+  SELECT b, sum(a) FROM data_tbl GROUP BY b
 
-> SHOW FULL VIEWS
-name        type     materialized  volatility
----------------------------------------------
-data_view   user     false         unknown
-test1       user     true          unknown
+> SHOW VIEWS
+name       comment
+------------------
+data_view  ""
 
 > SHOW MATERIALIZED VIEWS
-test1
-
-> SHOW FULL MATERIALIZED VIEWS
-name     type  volatility
--------------------------
-test1    user  unknown
+name    cluster     comment
+---------------------------
+test1   quickstart  ""
 
 > SELECT * FROM test1
 b  sum
@@ -67,18 +74,18 @@ b  sum
 2  1
 
 > SHOW COLUMNS FROM test1
-name nullable type
--------------------
-b     false   bigint
-sum   false   numeric
+name nullable type     comment
+------------------------------
+b     false   bigint   ""
+sum   false   numeric  ""
 
 > SHOW VIEWS LIKE '%data%'
-data_view
+data_view  ""
 
-> SHOW CREATE VIEW test1
-View                      "Create View"
+> SHOW CREATE MATERIALIZED VIEW test1
+name                      create_sql
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-materialize.public.test1  "CREATE VIEW \"materialize\".\"public\".\"test1\" AS SELECT \"b\", \"pg_catalog\".\"sum\"(\"a\") FROM \"materialize\".\"public\".\"data\" GROUP BY \"b\""
+materialize.public.test1  "CREATE MATERIALIZED VIEW \"materialize\".\"public\".\"test1\" IN CLUSTER \"quickstart\" WITH (REFRESH = ON COMMIT) AS SELECT \"b\", \"pg_catalog\".\"sum\"(\"a\") FROM \"materialize\".\"public\".\"data_tbl\" GROUP BY \"b\""
 
 # Materialized view can be built on a not-materialized view.
 > CREATE MATERIALIZED VIEW test2 AS
@@ -134,18 +141,47 @@ b  max
 ------
 2  1
 
-# Cannot select from unmaterialized view.
-! SELECT * from data_view
-unable to automatically determine a query timestamp
+> SELECT * from data_view
+a  b
+----
+1  1
+2  1
+3  1
+1  2
 
-# Can create sink from unmaterialized view.
-> CREATE SINK not_mat_sink2 FROM data_view
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'data-view2-sink'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+# Cannot create sink from unmaterialized view.
+! CREATE SINK not_mat_sink2
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM data_view
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-view2-sink-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:data_view is a view, which cannot be exported as a sink
 
-# Can create materialized view from unmaterialized view.
-> CREATE MATERIALIZED VIEW test5 AS
+# Can create indexed view from unmaterialized view.
+> CREATE VIEW test5 AS
   SELECT b, max(a) AS c FROM data_view GROUP BY b
+> CREATE DEFAULT INDEX ON test5
+
+# or from an indexed unmaterialized view
+! CREATE SINK not_mat_sink2
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM test5
+  INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-view2-sink-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE DEBEZIUM
+contains:test5 is a view, which cannot be exported as a sink
+
+$ set-regex match=(\s\(u\d+\)) replacement=
+
+? EXPLAIN SELECT * FROM test5;
+Explained Query (fast path):
+  ReadIndex on=materialize.public.test5 test5_primary_idx=[*** full scan ***]
+
+Used Indexes:
+  - materialize.public.test5_primary_idx (*** full scan ***)
+
+Target cluster: quickstart
 
 > SELECT * FROM test5
 b  c
@@ -160,16 +196,21 @@ b  c
 > CREATE INDEX idx1 ON test5(c)
 
 ! SELECT * FROM idx1
-catalog item 'materialize.public.idx1' is an index and so cannot be depended upon
+contains:catalog item 'materialize.public.idx1' is an index and so cannot be depended upon
 
 # If there exists a second primary index, dropping one primary index will not
 # unmaterialize the view.
 > DROP INDEX test5_primary_idx
 
-> SHOW FULL VIEWS LIKE 'test5'
-name        type     materialized  volatility
----------------------------------------------
-test5       user     true          unknown
+? EXPLAIN SELECT * FROM test5
+Explained Query (fast path):
+  Project (#1, #0)
+    ReadIndex on=materialize.public.test5 idx1=[*** full scan ***]
+
+Used Indexes:
+  - materialize.public.idx1 (*** full scan ***)
+
+Target cluster: quickstart
 
 > SELECT * from test5
 b  c
@@ -184,13 +225,12 @@ b  c
 # Unmaterialize test5.
 > DROP INDEX idx1
 
-! SELECT * from test5
-unable to automatically determine a query timestamp
-
-> SHOW FULL VIEWS LIKE 'test5'
-name        type     materialized  volatility
----------------------------------------------
-test5       user     false         unknown
+# Still works.
+> SELECT * from test5
+b  c
+------
+1  3
+2  1
 
 # Test that materialized views can be even if it requires multiple layers of
 # recursing through the AST to find a source.
@@ -202,13 +242,21 @@ d
 -1
 3
 
-# Dependencies have not re-materialized as a result of creating a dependent
+# Dependencies are still queryable after creating a dependent
 # materialized view.
-! SELECT * from test5
-unable to automatically determine a query timestamp
+> SELECT * from test5
+b  c
+------
+1  3
+2  1
 
-! SELECT * from data_view
-unable to automatically determine a query timestamp
+> SELECT * from data_view
+a  b
+----
+1  1
+2  1
+3  1
+1  2
 
 # Rematerialize data_view creating an index on it.
 > CREATE INDEX data_view_idx on data_view(a)
@@ -287,11 +335,16 @@ b  c
 
 $ kafka-create-topic topic=mat
 
-> CREATE MATERIALIZED SOURCE mat_data
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-mat-${testdrive.seed}'
+> CREATE SOURCE mat_data
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-mat-${testdrive.seed}')
+
+> CREATE TABLE mat_data_tbl FROM SOURCE mat_data (REFERENCE "testdrive-mat-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
 
-> SELECT * from mat_data
+> CREATE DEFAULT INDEX ON mat_data
+
+> SELECT * from mat_data_tbl
 
 $ kafka-ingest format=avro topic=mat schema=${schema} timestamp=1
 {"a": -1, "b": 0}
@@ -299,7 +352,7 @@ $ kafka-ingest format=avro topic=mat schema=${schema} timestamp=1
 {"a": 3, "b": 4}
 {"a": 1, "b": 2}
 
-> SELECT * from mat_data
+> SELECT * from mat_data_tbl
 a  b
 ----
 -1 0
@@ -308,26 +361,12 @@ a  b
 1  2
 
 > SHOW SOURCES
-name
---------
-data
-mat_data
-
-> SHOW MATERIALIZED SOURCES
-name
-----
-mat_data
-
-> SHOW FULL SOURCES
-name     type materialized  volatility connector_type
------------------------------------------------------
-data     user false         unknown    kafka
-mat_data user true          unknown    kafka
-
-> SHOW FULL MATERIALIZED SOURCES
-name     type  volatility connector_type
-----------------------------------------
-mat_data user  unknown    kafka
+name              type    cluster                          comment
+-------------------------------------------------------------------
+data              kafka     ${arg.single-replica-cluster}  ""
+data_progress     progress  <null>                         ""
+mat_data          kafka     ${arg.single-replica-cluster}  ""
+mat_data_progress progress  <null>                         ""
 
 # If there exists another index, dropping the primary index will not #
 # unmaterialize the source. This also tests creating a default index when the
@@ -337,7 +376,7 @@ mat_data user  unknown    kafka
 
 > DROP INDEX mat_data_primary_idx
 
-> SELECT a+b from mat_data
+> SELECT a+b from mat_data_tbl
 -1
 0
 7
@@ -345,14 +384,14 @@ mat_data user  unknown    kafka
 
 # Can create both materialized and unmaterialized views from materialized
 # source.
-> CREATE MATERIALIZED VIEW test7 as SELECT count(*) from mat_data
+> CREATE MATERIALIZED VIEW test7 as SELECT count(*) from mat_data_tbl
 
 > SELECT * from test7
 count
 -----
 4
 
-> CREATE VIEW test8 as SELECT -b as c, -a as d from mat_data
+> CREATE VIEW test8 as SELECT -b as c, -a as d from mat_data_tbl
 
 > SELECT * from test8
 c  d
@@ -365,16 +404,27 @@ c  d
 # Unmaterialize source.
 > DROP INDEX mat_data_primary_idx1
 
-! SELECT * from mat_data
-unable to automatically determine a query timestamp
+# Still works.
+> SELECT * from mat_data_tbl
+a  b
+----
+-1 0
+-1 1
+3  4
+1  2
 
 > SELECT * from test7
 count
 -----
 4
 
-! SELECT * from test8
-unable to automatically determine a query timestamp
+> SELECT * from test8
+c  d
+-----
+0  1
+-1 1
+-4 -3
+-2 -1
 
 $ kafka-ingest format=avro topic=mat schema=${schema} timestamp=2
 {"a": -3, "b": 0}
@@ -383,9 +433,9 @@ $ kafka-ingest format=avro topic=mat schema=${schema} timestamp=2
 {"a": 1, "b": 2}
 
 # Rematerialize source.
-> CREATE INDEX mat_data_idx3 on mat_data(b)
+> CREATE INDEX mat_data_idx3 on mat_data_tbl(b)
 
-> SELECT * from mat_data
+> SELECT * from mat_data_tbl
 a  b
 ----
 -1 0
@@ -413,3 +463,60 @@ c    d
 0    1
 -4   0
 -2  -1
+
+# Check arrangements, seeing new arrangements can mean a significant increase
+# in memory consumptions and should be understood before adapting the values.
+> SET cluster_replica = r1
+
+> SELECT mdod.dataflow_name, mdod.name
+  FROM mz_introspection.mz_arrangement_sharing mash
+  JOIN mz_introspection.mz_dataflow_operator_dataflows mdod ON mash.operator_id = mdod.id
+  JOIN mz_introspection.mz_compute_exports USING (dataflow_id)
+  WHERE export_id LIKE 'u%'
+"Dataflow: materialize.public.test4" "Arrange ReduceMinsMaxes"
+"Dataflow: materialize.public.test4" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test4" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test4" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test4" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test4" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test4" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test4" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test4" ReduceMinsMaxes
+"Dataflow: materialize.public.test4" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test4" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test4" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test4" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test4" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test4" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test4" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test6" "Arrange ReduceMinsMaxes"
+"Dataflow: materialize.public.test6" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test6" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test6" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test6" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test6" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test6" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test6" "Arranged MinsMaxesHierarchical input"
+"Dataflow: materialize.public.test6" ReduceMinsMaxes
+"Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
+"Dataflow: materialize.public.data_view_idx" ArrangeBy[[Column(0)]]
+"Dataflow: materialize.public.data_view_idx" ArrangeBy[[Column(0)]]-errors
+"Dataflow: materialize.public.data_view_primary_idx" "ArrangeBy[[Column(0), Column(1)]]"
+"Dataflow: materialize.public.data_view_primary_idx" "ArrangeBy[[Column(0), Column(1)]]-errors"
+"Dataflow: materialize.public.mat_data_idx3" ArrangeBy[[Column(1)]]
+"Dataflow: materialize.public.mat_data_idx3" ArrangeBy[[Column(1)]]-errors
+"Dataflow: materialize.public.test1" AccumulableErrorCheck
+"Dataflow: materialize.public.test1" "ArrangeAccumulable [val: empty]"
+"Dataflow: materialize.public.test1" ReduceAccumulable
+"Dataflow: materialize.public.test2" AccumulableErrorCheck
+"Dataflow: materialize.public.test2" "ArrangeAccumulable [val: empty]"
+"Dataflow: materialize.public.test2" ReduceAccumulable
+"Dataflow: materialize.public.test7" AccumulableErrorCheck
+"Dataflow: materialize.public.test7" "ArrangeAccumulable [val: empty]"
+"Dataflow: materialize.public.test7" ReduceAccumulable

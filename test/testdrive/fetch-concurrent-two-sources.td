@@ -7,31 +7,43 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Make sure that FETCH-ing using multiple cursors from different sources works as expected
 #
 
-$ set-regex match=\d{13} replacement=<TIMESTAMP>
+$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+ALTER SYSTEM SET min_timestamp_interval = '100ms'
 
 $ set int={"type": "record", "name": "field_int", "fields": [ {"name": "f1", "type": "int"} ] }
 
 $ kafka-create-topic topic=fetch-concurrent-two-sources
 
-> CREATE MATERIALIZED SOURCE fetch_concurrent_two_sources1
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-fetch-concurrent-two-sources-${testdrive.seed}'
-  WITH( timestamp_frequency_ms = 100 )
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE fetch_concurrent_two_sources1
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-fetch-concurrent-two-sources-${testdrive.seed}')
+  WITH (TIMESTAMP INTERVAL '100ms')
+
+> CREATE TABLE fetch_concurrent_two_sources1_tbl FROM SOURCE fetch_concurrent_two_sources1 (REFERENCE "testdrive-fetch-concurrent-two-sources-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE
 
-> CREATE MATERIALIZED SOURCE fetch_concurrent_two_sources2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-fetch-concurrent-two-sources-${testdrive.seed}'
-  WITH( timestamp_frequency_ms = 100 )
+> CREATE SOURCE fetch_concurrent_two_sources2
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-fetch-concurrent-two-sources-${testdrive.seed}')
+  WITH (TIMESTAMP INTERVAL '100ms')
+
+> CREATE TABLE fetch_concurrent_two_sources2_tbl FROM SOURCE fetch_concurrent_two_sources2 (REFERENCE "testdrive-fetch-concurrent-two-sources-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE
 
-> CREATE MATERIALIZED VIEW fetch_concurrent_two_sources1_view AS SELECT * FROM fetch_concurrent_two_sources1 ORDER BY f1;
+> CREATE MATERIALIZED VIEW fetch_concurrent_two_sources1_view AS SELECT * FROM fetch_concurrent_two_sources1_tbl ORDER BY f1;
 
-> CREATE MATERIALIZED VIEW fetch_concurrent_two_sources2_view AS SELECT * FROM fetch_concurrent_two_sources2 ORDER BY f1;
+> CREATE MATERIALIZED VIEW fetch_concurrent_two_sources2_view AS SELECT * FROM fetch_concurrent_two_sources2_tbl ORDER BY f1;
 
 
 $ kafka-ingest format=avro topic=fetch-concurrent-two-sources schema=${int} timestamp=1
@@ -43,11 +55,11 @@ $ kafka-ingest format=avro topic=fetch-concurrent-two-sources schema=${int} time
 $ kafka-ingest format=avro topic=fetch-concurrent-two-sources schema=${int} timestamp=3
 {"f1": 34}
 
-> SELECT COUNT(*) = 3 FROM fetch_concurrent_two_sources1_view;
-true
+> SELECT COUNT(*) FROM fetch_concurrent_two_sources1_view;
+3
 
-> SELECT COUNT(*) = 3 FROM fetch_concurrent_two_sources2_view;
-true
+> SELECT COUNT(*) FROM fetch_concurrent_two_sources2_view;
+3
 
 > BEGIN
 

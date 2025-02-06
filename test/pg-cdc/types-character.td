@@ -11,6 +11,14 @@
 # Test the various character data types
 #
 
+> CREATE SECRET pgpass AS 'postgres'
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass
+  )
+
 # Insert data pre-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 ALTER USER postgres WITH replication;
@@ -27,14 +35,12 @@ INSERT INTO t1 VALUES ('abc ', 'abc ', 'abc ', 'abc ');
 
 CREATE PUBLICATION mz_source FOR ALL TABLES;
 
-> CREATE MATERIALIZED SOURCE mz_source
-  FROM POSTGRES CONNECTION 'host=postgres port=5432 user=postgres password=postgres sslmode=require dbname=postgres'
-  PUBLICATION 'mz_source';
+> CREATE SOURCE mz_source FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
 
-> SELECT COUNT(*) > 0 FROM mz_source;
+> CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE t1);
+
+> SELECT COUNT(*) > 0 FROM t1;
 true
-
-> CREATE VIEWS FROM SOURCE mz_source;
 
 # Insert the same data post-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres

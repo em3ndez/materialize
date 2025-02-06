@@ -9,6 +9,11 @@
 
 mode cockroach
 
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET enable_mz_join_core = true;
+----
+COMPLETE 0
+
 statement ok
 CREATE TABLE l (la int, lb text)
 
@@ -29,7 +34,7 @@ SELECT * FROM l LEFT JOIN r ON l.la = r.ra
 3  l3  3     r3
 
 # This test may look the same as the last, but listing out the columns
-# explicitly checks for regressions of #1314.
+# explicitly checks for regressions of database-issues#472.
 query ITIT rowsort
 SELECT l.la, l.lb, r.ra, r.rb FROM l LEFT JOIN r ON l.la = r.ra
 ----
@@ -45,7 +50,7 @@ NULL  NULL  4  r4
 3     l3    3  r3
 
 # This test may look the same as the last, but listing out the columns
-# explicitly checks for regressions of #1314.
+# explicitly checks for regressions of database-issues#472.
 query ITIT rowsort
 SELECT l.la, l.lb, r.ra, r.rb FROM l RIGHT JOIN r ON l.la = r.ra
 ----
@@ -54,21 +59,21 @@ NULL  NULL  4  r4
 3     l3    3  r3
 
 # Test that columns detected to be equivalent retain the names that the user
-# asks for. Protects against regression of #1217.
+# asks for. Protects against regression of database-issues#429.
 query II colnames,rowsort
 SELECT ra, r.ra FROM l JOIN r ON l.la = r.ra LIMIT 0
 ----
 ra  ra
 
 # Test that columns detected to be equivalent retain the names that the user
-# asks for. Protects against regression of #1217.
+# asks for. Protects against regression of database-issues#429.
 query ITIT colnames,rowsort
 SELECT * FROM l JOIN r ON l.la = r.ra LIMIT 0
 ----
 la  lb  ra  rb
 
 # Test that columns detected to be equivalent do not interfere with qualified
-# wildcard expansion. Protects against regression of #4477.
+# wildcard expansion. Protects against regression of database-issues#1389.
 query ITIT colnames
 SELECT l.*, r.* FROM l JOIN r ON l.la = r.ra LIMIT 0
 ----
@@ -105,27 +110,36 @@ WHERE l1.la IN (
 
 # Test that scalar expressions are introduced to join plans.
 query T multiline
-EXPLAIN PLAN FOR
+EXPLAIN WITH(arity, join implementations)
 SELECT l1.la, l2.lb, l3.lb
 FROM l as l1, l as l2, l as l3
 WHERE l1.la + 1 = l2.la AND l3.la = l1.la + l2.la
 ----
-%0 = Let l0 =
-| Get materialize.public.l (u1)
-| Filter !(isnull(#0))
+Explained Query:
+  With
+    cte l0 =
+      Filter (#0) IS NOT NULL // { arity: 2 }
+        ReadStorage materialize.public.l // { arity: 2 }
+    cte l1 =
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        Get l0 // { arity: 2 }
+  Return // { arity: 3 }
+    Project (#0, #2, #4) // { arity: 3 }
+      Join on=(#1 = (#0 + 1) AND #3 = (#0 + #1)) type=delta // { arity: 5 }
+        implementation
+          %0:l0 » %1:l1[#0]K » %2:l1[#0]K
+          %1:l1 » %0:l0[(#0 + 1)]K » %2:l1[#0]K
+          %2:l1 » %0:l0[×] » %1:l1[#0]K
+        ArrangeBy keys=[[], [(#0 + 1)]] // { arity: 1 }
+          Project (#0) // { arity: 1 }
+            Get l0 // { arity: 2 }
+        Get l1 // { arity: 2 }
+        Get l1 // { arity: 2 }
 
-%1 = Let l1 =
-| Get %0 (l0)
-| ArrangeBy (#0)
+Source materialize.public.l
+  filter=((#0) IS NOT NULL)
 
-%2 =
-| Get %0 (l0)
-| Project (#0)
-
-%3 =
-| Join %2 %1 %1 (= #1 (#0 + 1)) (= #3 (#0 + #1))
-| | implementation = Differential %2 %1.(#0) %1.(#0)
-| Project (#0, #2, #4)
+Target cluster: quickstart
 
 EOF
 
@@ -136,7 +150,7 @@ EOF
 # if it improves (i.e. the cross join is removed).
 
 query T multiline
-EXPLAIN PLAN FOR
+EXPLAIN WITH(arity, join implementations)
 SELECT l1.la, l1.lb
 FROM l as l1
 WHERE l1.la IN (
@@ -148,56 +162,57 @@ WHERE l1.la IN (
     )
 )
 ----
-%0 = Let l0 =
-| Get materialize.public.l (u1)
-| Project (#0)
+Explained Query:
+  With
+    cte l0 =
+      Project (#0) // { arity: 1 }
+        ReadStorage materialize.public.l // { arity: 2 }
+    cte l1 =
+      CrossJoin type=differential // { arity: 2 }
+        implementation
+          %0[×] » %1:l0[×]
+        ArrangeBy keys=[[]] // { arity: 1 }
+          Distinct project=[#0] // { arity: 1 }
+            Get l0 // { arity: 1 }
+        ArrangeBy keys=[[]] // { arity: 1 }
+          Get l0 // { arity: 1 }
+  Return // { arity: 2 }
+    Project (#0, #1) // { arity: 2 }
+      Join on=(#0 = #2) type=differential // { arity: 3 }
+        implementation
+          %1[#0]UKA » %0:l[#0]K
+        ArrangeBy keys=[[#0]] // { arity: 2 }
+          ReadStorage materialize.public.l // { arity: 2 }
+        ArrangeBy keys=[[#0]] // { arity: 1 }
+          Distinct project=[#0] // { arity: 1 }
+            Project (#0) // { arity: 1 }
+              Join on=(#1 = #2 = #3) type=delta // { arity: 4 }
+                implementation
+                  %0:l1 » %1[#0]UKA » %2[#0]UKA
+                  %1 » %2[#0]UKA » %0:l1[#1]Kf
+                  %2 » %1[#0]UKA » %0:l1[#1]Kf
+                ArrangeBy keys=[[#1]] // { arity: 2 }
+                  Filter (#0 = (#1 + 1)) // { arity: 2 }
+                    Get l1 // { arity: 2 }
+                ArrangeBy keys=[[#0]] // { arity: 1 }
+                  Distinct project=[#0] // { arity: 1 }
+                    Project (#1) // { arity: 1 }
+                      Filter (#1) IS NOT NULL // { arity: 2 }
+                        Get l1 // { arity: 2 }
+                ArrangeBy keys=[[#0]] // { arity: 1 }
+                  Distinct project=[(#0 + 1)] // { arity: 1 }
+                    Project (#0) // { arity: 1 }
+                      Filter (#0) IS NOT NULL // { arity: 2 }
+                        ReadStorage materialize.public.l // { arity: 2 }
 
-%1 =
-| Get %0 (l0)
-| Distinct group=(#0)
-| ArrangeBy ()
+Source materialize.public.l
 
-%2 = Let l1 =
-| Join %1 %0
-| | implementation = Differential %0 %1.()
-
-%3 =
-| Get materialize.public.l (u1)
-
-%4 =
-| Get %2 (l1)
-| Filter (#0 = (#1 + 1))
-
-%5 =
-| Get %2 (l1)
-| Filter !(isnull(#1))
-| Project (#1)
-| Distinct group=(#0)
-| ArrangeBy (#0)
-
-%6 =
-| Get materialize.public.l (u1)
-| Filter !(isnull(#0))
-| Project (#0)
-| Distinct group=((#0 + 1))
-| ArrangeBy (#0)
-
-%7 =
-| Join %4 %5 %6 (= #1 #2 #3)
-| | implementation = Differential %4 %5.(#0) %6.(#0)
-| Project (#0)
-| Distinct group=(#0)
-| ArrangeBy (#0)
-
-%8 =
-| Join %3 %7 (= #0 #2)
-| | implementation = Differential %3 %7.(#0)
-| Project (#0, #1)
+Target cluster: quickstart
 
 EOF
 
 # Test that multiplicities in outer joins are preserved.
-# Fixed in #2724.
+# Fixed in database-issues#931.
 statement ok
 CREATE TABLE l2 (la int, lb text)
 
@@ -227,7 +242,7 @@ NULL  NULL  4  r4
 3     l3    3  r3
 
 
-# Test that outer joins work correctly in correlated subqueries (#3047)
+# Test that outer joins work correctly in correlated subqueries (database-issues#1007)
 
 query IT rowsort
 SELECT * FROM l WHERE EXISTS (SELECT * from l as l2 LEFT JOIN r ON l.la = r.ra)
@@ -250,7 +265,7 @@ SELECT * FROM r WHERE EXISTS (SELECT * from l RIGHT JOIN r as r2 ON l.la = r.ra)
 1  r1
 3  r3
 
-# Regression test for #3426.
+# Regression test for database-issues#1089.
 query III colnames
 SELECT * FROM
     (SELECT 1 AS baz) t1
@@ -289,7 +304,7 @@ SELECT * FROM
 1  NULL  NULL
 1  NULL  NULL
 
-# Regression test for #3914. The gist is that we want to exercise the
+# Regression test for database-issues#1218. The gist is that we want to exercise the
 # redundant join optimization on a join whose inputs contain projections. This
 # turns out to be extremely hard to accomplish because the projection lifting
 # optimization is very good at eliminating all but the top-level projection.
@@ -310,167 +325,152 @@ foo  true  1
 
 # Test for outer join planning.
 query T multiline
-EXPLAIN PLAN FOR
+EXPLAIN WITH(arity, join implementations)
 SELECT * FROM l LEFT JOIN r ON l.la = r.ra
 ----
-%0 =
-| Get materialize.public.l (u1)
-| Filter !(isnull(#0))
-| ArrangeBy (#0)
+Explained Query:
+  With
+    cte l0 =
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        Filter (#0) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.l // { arity: 2 }
+    cte l1 =
+      Project (#0, #1, #3) // { arity: 3 }
+        Join on=(#0 = #2) type=differential // { arity: 4 }
+          implementation
+            %0:l0[#0]K » %1:r[#0]K
+          Get l0 // { arity: 2 }
+          ArrangeBy keys=[[#0]] // { arity: 2 }
+            Filter (#0) IS NOT NULL // { arity: 2 }
+              ReadStorage materialize.public.r // { arity: 2 }
+  Return // { arity: 4 }
+    Union // { arity: 4 }
+      Map (null, null) // { arity: 4 }
+        Union // { arity: 2 }
+          Negate // { arity: 2 }
+            Project (#0, #1) // { arity: 2 }
+              Join on=(#0 = #2) type=differential // { arity: 3 }
+                implementation
+                  %1[#0]UKA » %0:l0[#0]K
+                Get l0 // { arity: 2 }
+                ArrangeBy keys=[[#0]] // { arity: 1 }
+                  Distinct project=[#0] // { arity: 1 }
+                    Project (#0) // { arity: 1 }
+                      Get l1 // { arity: 3 }
+          ReadStorage materialize.public.l // { arity: 2 }
+      Project (#0, #1, #0, #2) // { arity: 4 }
+        Get l1 // { arity: 3 }
 
-%1 =
-| Get materialize.public.r (u3)
-| Filter !(isnull(#0))
+Source materialize.public.l
+Source materialize.public.r
+  filter=((#0) IS NOT NULL)
 
-%2 = Let l0 =
-| Join %0 %1 (= #0 #2)
-| | implementation = Differential %1 %0.(#0)
-| Project (#0, #1, #3)
-
-%3 =
-| Get materialize.public.l (u1)
-
-%4 =
-| Get %2 (l0)
-| Project (#0)
-| Distinct group=(#0)
-| ArrangeBy (#0)
-
-%5 =
-| Join %3 %4 (= #0 #2)
-| | implementation = Differential %3 %4.(#0)
-| Project (#0, #1)
-| Negate
-
-%6 =
-| Get materialize.public.l (u1)
-
-%7 =
-| Union %5 %6
-| Map null, null
-
-%8 =
-| Get %2 (l0)
-| Project (#0, #1, #0, #2)
-
-%9 =
-| Union %7 %8
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR
+EXPLAIN WITH(arity, join implementations)
 SELECT * FROM l RIGHT JOIN r ON l.la = r.ra
 ----
-%0 =
-| Get materialize.public.l (u1)
-| Filter !(isnull(#0))
-| ArrangeBy (#0)
+Explained Query:
+  With
+    cte l0 =
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        Filter (#0) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.r // { arity: 2 }
+    cte l1 =
+      Project (#0, #1, #3) // { arity: 3 }
+        Join on=(#0 = #2) type=differential // { arity: 4 }
+          implementation
+            %0:l[#0]K » %1:l0[#0]K
+          ArrangeBy keys=[[#0]] // { arity: 2 }
+            Filter (#0) IS NOT NULL // { arity: 2 }
+              ReadStorage materialize.public.l // { arity: 2 }
+          Get l0 // { arity: 2 }
+  Return // { arity: 4 }
+    Union // { arity: 4 }
+      Project (#2, #3, #0, #1) // { arity: 4 }
+        Map (null, null) // { arity: 4 }
+          Union // { arity: 2 }
+            Negate // { arity: 2 }
+              Project (#0, #1) // { arity: 2 }
+                Join on=(#0 = #2) type=differential // { arity: 3 }
+                  implementation
+                    %1[#0]UKA » %0:l0[#0]K
+                  Get l0 // { arity: 2 }
+                  ArrangeBy keys=[[#0]] // { arity: 1 }
+                    Distinct project=[#0] // { arity: 1 }
+                      Project (#0) // { arity: 1 }
+                        Get l1 // { arity: 3 }
+            ReadStorage materialize.public.r // { arity: 2 }
+      Project (#0, #1, #0, #2) // { arity: 4 }
+        Get l1 // { arity: 3 }
 
-%1 =
-| Get materialize.public.r (u3)
-| Filter !(isnull(#0))
+Source materialize.public.l
+  filter=((#0) IS NOT NULL)
+Source materialize.public.r
 
-%2 = Let l0 =
-| Join %0 %1 (= #0 #2)
-| | implementation = Differential %1 %0.(#0)
-| Project (#0, #1, #3)
-
-%3 =
-| Get materialize.public.r (u3)
-
-%4 =
-| Get %2 (l0)
-| Project (#0)
-| Distinct group=(#0)
-| ArrangeBy (#0)
-
-%5 =
-| Join %3 %4 (= #0 #2)
-| | implementation = Differential %3 %4.(#0)
-| Project (#0, #1)
-| Negate
-
-%6 =
-| Get materialize.public.r (u3)
-
-%7 =
-| Union %5 %6
-| Map null, null
-| Project (#2, #3, #0, #1)
-
-%8 =
-| Get %2 (l0)
-| Project (#0, #1, #0, #2)
-
-%9 =
-| Union %7 %8
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR
+EXPLAIN WITH(arity, join implementations)
 SELECT * FROM l FULL JOIN r ON l.la = r.ra
 ----
-%0 =
-| Get materialize.public.l (u1)
-| Filter !(isnull(#0))
-| ArrangeBy (#0)
+Explained Query:
+  With
+    cte l0 =
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        Filter (#0) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.l // { arity: 2 }
+    cte l1 =
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        Filter (#0) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.r // { arity: 2 }
+    cte l2 =
+      Project (#0, #1, #3) // { arity: 3 }
+        Join on=(#0 = #2) type=differential // { arity: 4 }
+          implementation
+            %0:l0[#0]K » %1:l1[#0]K
+          Get l0 // { arity: 2 }
+          Get l1 // { arity: 2 }
+    cte l3 =
+      ArrangeBy keys=[[#0]] // { arity: 1 }
+        Distinct project=[#0] // { arity: 1 }
+          Project (#0) // { arity: 1 }
+            Get l2 // { arity: 3 }
+  Return // { arity: 4 }
+    Union // { arity: 4 }
+      Project (#2, #3, #0, #1) // { arity: 4 }
+        Map (null, null) // { arity: 4 }
+          Union // { arity: 2 }
+            Negate // { arity: 2 }
+              Project (#0, #1) // { arity: 2 }
+                Join on=(#0 = #2) type=differential // { arity: 3 }
+                  implementation
+                    %1:l3[#0]UKA » %0:l1[#0]K
+                  Get l1 // { arity: 2 }
+                  Get l3 // { arity: 1 }
+            ReadStorage materialize.public.r // { arity: 2 }
+      Map (null, null) // { arity: 4 }
+        Union // { arity: 2 }
+          Negate // { arity: 2 }
+            Project (#0, #1) // { arity: 2 }
+              Join on=(#0 = #2) type=differential // { arity: 3 }
+                implementation
+                  %1:l3[#0]UKA » %0:l0[#0]K
+                Get l0 // { arity: 2 }
+                Get l3 // { arity: 1 }
+          ReadStorage materialize.public.l // { arity: 2 }
+      Project (#0, #1, #0, #2) // { arity: 4 }
+        Get l2 // { arity: 3 }
 
-%1 =
-| Get materialize.public.r (u3)
-| Filter !(isnull(#0))
+Source materialize.public.l
+Source materialize.public.r
 
-%2 = Let l0 =
-| Join %0 %1 (= #0 #2)
-| | implementation = Differential %1 %0.(#0)
-| Project (#0, #1, #3)
-
-%3 = Let l1 =
-| Get %2 (l0)
-| Project (#0)
-| Distinct group=(#0)
-| ArrangeBy (#0)
-
-%4 =
-| Get materialize.public.r (u3)
-
-%5 =
-| Join %4 %3 (= #0 #2)
-| | implementation = Differential %4 %3.(#0)
-| Project (#0, #1)
-| Negate
-
-%6 =
-| Get materialize.public.r (u3)
-
-%7 =
-| Union %5 %6
-| Map null, null
-| Project (#2, #3, #0, #1)
-
-%8 =
-| Get materialize.public.l (u1)
-
-%9 =
-| Join %8 %3 (= #0 #2)
-| | implementation = Differential %8 %3.(#0)
-| Project (#0, #1)
-| Negate
-
-%10 =
-| Get materialize.public.l (u1)
-
-%11 =
-| Union %9 %10
-| Map null, null
-
-%12 =
-| Get %2 (l0)
-| Project (#0, #1, #0, #2)
-
-%13 =
-| Union %7 %11 %12
+Target cluster: quickstart
 
 EOF
 
@@ -484,26 +484,31 @@ SELECT * FROM l INNER JOIN r ON mod(l.la, 2) = mod(r.ra, 2)
 3 l3 3 r3
 
 # Test that when both keys are expressions, the join is not planned as a cross
-# join. Protects against regression of #4170.
+# join. Protects against regression of database-issues#1290.
 query T multiline
-EXPLAIN PLAN FOR SELECT * FROM l INNER JOIN r ON mod(l.la, 2) = mod(r.ra, 2)
+EXPLAIN WITH(arity, join implementations) SELECT * FROM l INNER JOIN r ON mod(l.la, 2) = mod(r.ra, 2)
 ----
-%0 =
-| Get materialize.public.l (u1)
-| Filter !(isnull(#0))
-| ArrangeBy ((#0 % 2))
+Explained Query:
+  Join on=((#0 % 2) = (#2 % 2)) type=differential // { arity: 4 }
+    implementation
+      %0:l[(#0 % 2)]K » %1:r[(#0 % 2)]K
+    ArrangeBy keys=[[(#0 % 2)]] // { arity: 2 }
+      Filter (#0) IS NOT NULL // { arity: 2 }
+        ReadStorage materialize.public.l // { arity: 2 }
+    ArrangeBy keys=[[(#0 % 2)]] // { arity: 2 }
+      Filter (#0) IS NOT NULL // { arity: 2 }
+        ReadStorage materialize.public.r // { arity: 2 }
 
-%1 =
-| Get materialize.public.r (u3)
-| Filter !(isnull(#0))
+Source materialize.public.l
+  filter=((#0) IS NOT NULL)
+Source materialize.public.r
+  filter=((#0) IS NOT NULL)
 
-%2 =
-| Join %0 %1 (= (#0 % 2) (#2 % 2))
-| | implementation = Differential %1 %0.((#0 % 2))
+Target cluster: quickstart
 
 EOF
 
-# Regression test for #4361, in which inter-view predicate pushdown would cause
+# Regression test for database-issues#1355, in which inter-view predicate pushdown would cause
 # misoptimizations. Specifically, a predicate that was applied to only one use
 # of a view could be incorrectly applied to all uses of that view.
 #
@@ -539,36 +544,34 @@ mode standard
 # below, likely the test is no longer testing for the bug.
 
 query T multiline
-EXPLAIN SELECT name, id FROM v4362 WHERE name = (SELECT name FROM v4362 WHERE id = 1)
+EXPLAIN WITH(arity, join implementations) SELECT name, id FROM v4362 WHERE name = (SELECT name FROM v4362 WHERE id = 1)
 ----
-%0 = Let l0 =
-| Get materialize.public.t4362 (u10)
-| Filter (#1 = 1)
+Explained Query:
+  With
+    cte l0 =
+      Filter (#1 = 1) // { arity: 2 }
+        ReadStorage materialize.public.t4362 // { arity: 2 }
+  Return // { arity: 2 }
+    Project (#0, #1) // { arity: 2 }
+      Join on=(#0 = #2) type=differential // { arity: 3 }
+        implementation
+          %0:t4362[#0]K » %1[#0]K
+        ArrangeBy keys=[[#0]] // { arity: 2 }
+          ReadStorage materialize.public.t4362 // { arity: 2 }
+        ArrangeBy keys=[[#0]] // { arity: 1 }
+          Union // { arity: 1 }
+            Project (#0) // { arity: 1 }
+              Get l0 // { arity: 2 }
+            Map (error("more than one record produced in subquery")) // { arity: 1 }
+              Project () // { arity: 0 }
+                Filter (#0 > 1) // { arity: 1 }
+                  Reduce aggregates=[count(*)] // { arity: 1 }
+                    Project () // { arity: 0 }
+                      Get l0 // { arity: 2 }
 
-%1 =
-| Get materialize.public.t4362 (u10)
-| ArrangeBy (#0)
+Source materialize.public.t4362
 
-%2 =
-| Get %0 (l0)
-| Project (#0)
-
-%3 =
-| Get %0 (l0)
-| Project ()
-| Reduce group=()
-| | agg count(true)
-| Filter (#0 > 1)
-| Project ()
-| Map (err: more than one record produced in subquery)
-
-%4 =
-| Union %2 %3
-
-%5 =
-| Join %1 %4 (= #0 #2)
-| | implementation = Differential %4 %1.(#0)
-| Project (#0, #1)
+Target cluster: quickstart
 
 EOF
 
@@ -590,22 +593,19 @@ SELECT la, l.lb, big_l.lb FROM l JOIN big_l USING (la)
 query T multiline
 EXPLAIN RAW PLAN FOR SELECT la, l.lb, big_l.lb FROM l JOIN big_l USING (la)
 ----
-%0 =
-| Get materialize.public.l (u1)
+Project (#0, #1, #3)
+  InnerJoin (integer_to_bigint(#0) = #2)
+    Get materialize.public.l
+    Get materialize.public.big_l
 
-%1 =
-| Get materialize.public.big_l (u13)
-
-%2 =
-| InnerJoin %0 %1 on (true && (i32toi64(#0) = #2))
-| Project (#0, #1, #3)
+Target cluster: quickstart
 
 EOF
 
 statement ok
 CREATE TABLE join_fail (la date);
 
-query error NATURAL/USING join column "la" cannot be cast to uniform type: integer vs date
+query error NATURAL/USING join column "la" types integer and date cannot be matched
 SELECT la FROM l JOIN join_fail USING (la)
 
 # test that joins properly handle null keys
@@ -622,21 +622,26 @@ statement ok
 INSERT INTO r3 VALUES (1, 'r1'), (3, 'r3'), (4, 'r4'), (NULL, 'r5')
 
 query T multiline
-EXPLAIN SELECT lb, rb FROM l3 INNER JOIN r3 ON la = ra
+EXPLAIN WITH(arity, join implementations) SELECT lb, rb FROM l3 INNER JOIN r3 ON la = ra
 ----
-%0 =
-| Get materialize.public.l3 (u17)
-| Filter !(isnull(#0))
-| ArrangeBy (#0)
+Explained Query:
+  Project (#1, #3) // { arity: 2 }
+    Join on=(#0 = #2) type=differential // { arity: 4 }
+      implementation
+        %0:l3[#0]K » %1:r3[#0]K
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        Filter (#0) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.l3 // { arity: 2 }
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        Filter (#0) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.r3 // { arity: 2 }
 
-%1 =
-| Get materialize.public.r3 (u19)
-| Filter !(isnull(#0))
+Source materialize.public.l3
+  filter=((#0) IS NOT NULL)
+Source materialize.public.r3
+  filter=((#0) IS NOT NULL)
 
-%2 =
-| Join %0 %1 (= #0 #2)
-| | implementation = Differential %1 %0.(#0)
-| Project (#1, #3)
+Target cluster: quickstart
 
 EOF
 
@@ -647,19 +652,22 @@ l1  r1
 l3  r3
 
 query T multiline
-EXPLAIN SELECT lb, rb FROM l3 INNER JOIN r3 ON la = ra OR (ra IS NULL AND la IS NULL)
+EXPLAIN WITH(arity, join implementations) SELECT lb, rb FROM l3 INNER JOIN r3 ON la = ra OR (ra IS NULL AND la IS NULL)
 ----
-%0 =
-| Get materialize.public.l3 (u17)
-| ArrangeBy (#0)
+Explained Query:
+  Project (#1, #3) // { arity: 2 }
+    Join on=(#0 = #2) type=differential // { arity: 4 }
+      implementation
+        %0:l3[#0]K » %1:r3[#0]K
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        ReadStorage materialize.public.l3 // { arity: 2 }
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        ReadStorage materialize.public.r3 // { arity: 2 }
 
-%1 =
-| Get materialize.public.r3 (u19)
+Source materialize.public.l3
+Source materialize.public.r3
 
-%2 =
-| Join %0 %1 (= #0 #2)
-| | implementation = Differential %1 %0.(#0)
-| Project (#1, #3)
+Target cluster: quickstart
 
 EOF
 
@@ -671,19 +679,22 @@ l3  r3
 l4  r5
 
 query T multiline
-EXPLAIN SELECT lb, rb FROM l3 INNER JOIN r3 ON (la IS NULL AND ra IS NULL) OR la = ra
+EXPLAIN WITH(arity, join implementations) SELECT lb, rb FROM l3 INNER JOIN r3 ON (la IS NULL AND ra IS NULL) OR la = ra
 ----
-%0 =
-| Get materialize.public.l3 (u17)
-| ArrangeBy (#0)
+Explained Query:
+  Project (#1, #3) // { arity: 2 }
+    Join on=(#0 = #2) type=differential // { arity: 4 }
+      implementation
+        %0:l3[#0]K » %1:r3[#0]K
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        ReadStorage materialize.public.l3 // { arity: 2 }
+      ArrangeBy keys=[[#0]] // { arity: 2 }
+        ReadStorage materialize.public.r3 // { arity: 2 }
 
-%1 =
-| Get materialize.public.r3 (u19)
+Source materialize.public.l3
+Source materialize.public.r3
 
-%2 =
-| Join %0 %1 (= #0 #2)
-| | implementation = Differential %1 %0.(#0)
-| Project (#1, #3)
+Target cluster: quickstart
 
 EOF
 
@@ -694,7 +705,7 @@ l1  r1
 l3  r3
 l4  r5
 
-# Regression test for https://github.com/MaterializeInc/materialize/issues/7618
+# Regression test for https://github.com/MaterializeInc/database-issues/issues/2364
 
 statement ok
 CREATE TABLE t1 (f1 int, f2 int);
@@ -761,6 +772,101 @@ statement ok
 INSERT INTO t4 VALUES
     (4, 3),
     (9, 10);
+
+# Test join using aliases
+# Adapted from: https://github.com/postgres/postgres/blob/master/src/test/regress/sql/join.sql
+
+query T
+SELECT * FROM t1 JOIN t2 USING (f1) AS x WHERE t1.f2 = 1;
+----
+
+query III colnames
+SELECT * FROM t1 JOIN t2 USING (f1) AS x WHERE t1.f1 = 3;
+----
+f1  f2  f2
+3   4   4
+
+query III colnames
+SELECT * FROM t1 JOIN t2 USING (f1) AS x;
+----
+f1  f2  f2
+3   4   4
+
+query II colnames
+SELECT * FROM t1 JOIN t2 USING (f1, f2) AS x;
+----
+f1  f2
+3   4
+
+query II colnames
+SELECT * FROM (SELECT x.f2 AS f3 FROM t1 JOIN t2 USING (f2) AS x) t5 JOIN t3 USING (f3) AS x;
+----
+f3  f1
+4   3
+
+query error table name "x" specified more than once
+SELECT * FROM t1 JOIN t2 USING (f1) AS x JOIN t3 USING (f1) AS x;
+
+query IIII colnames
+SELECT * FROM t1 JOIN t2 USING (f1) AS x JOIN t3 USING (f1) AS y;
+----
+f1  f2  f2  f3
+3   4   4   4
+
+query error column "t1.f1" does not exist
+SELECT * FROM (t1 JOIN t2 USING (f1)) AS x WHERE t1.f1 = 1;
+
+query error column "x.f5" does not exist
+SELECT * FROM t1 JOIN t2 USING (f1) AS x WHERE x.f5 = 'one';
+
+query error column "x.f4" does not exist
+SELECT * FROM (t3 JOIN t4 USING (f3) AS x) AS xx WHERE x.f4 = 1;
+
+query error table name "a1" specified more than once
+SELECT * FROM t1 a1 JOIN t2 a2 USING (f1) AS a1
+
+query I colnames
+SELECT x.* FROM t3 JOIN t4 USING (f3) AS x WHERE t3.f3 = 4;
+----
+f3
+4
+
+query II colnames
+SELECT x.* FROM t1 JOIN t2 USING (f1, f2) AS x;
+----
+f1  f2
+3   4
+
+query T colnames
+SELECT ROW(x.*) FROM t1 JOIN t2 USING (f1) AS x;
+----
+row
+("(3)")
+
+statement ok
+CREATE VIEW v1 AS SELECT x.* FROM t1 JOIN t2 USING (f1) AS x WHERE x.f1 = 3;
+
+query T colnames
+SELECT * FROM v1;
+----
+f1
+3
+
+# Ensure the output from `SHOW CREATE VIEW` contains a correctly-formed `AS` part
+
+mode standard
+
+query TT
+SHOW CREATE VIEW v1;
+----
+materialize.public.v1
+CREATE VIEW "materialize"."public"."v1" AS SELECT "x".* FROM "materialize"."public"."t1" JOIN "materialize"."public"."t2" USING ("f1") AS "x" WHERE "x"."f1" = 3
+
+mode cockroach
+
+statement ok
+DROP VIEW v1;
+
 
 # Left
 
@@ -1032,3 +1138,151 @@ SELECT (SELECT * FROM (SELECT 1 a) s1 JOIN (SELECT 2 b) s2 USING (c)) FROM (SELE
 # USING column missing from the right table only but existing in the outer scope.
 query error column "a" specified in USING clause does not exist in right table
 SELECT (SELECT * FROM (SELECT 1 a) s1 JOIN (SELECT 2 b) s2 USING (a)) FROM (SELECT 3 a) s3
+
+query II colnames
+SELECT * FROM l NATURAL JOIN l AS a LIMIT 0
+----
+la  lb
+
+# Regression test for https://github.com/MaterializeInc/database-issues/issues/5220
+# This query fails if JoinImplementation is not in the same fixpoint loop with LiteralLifting.
+
+statement ok
+CREATE TABLE IF NOT EXISTS a (a boolean, b boolean);
+
+statement ok
+CREATE VIEW IF NOT EXISTS b AS SELECT 2 + 2;
+
+statement ok
+CREATE TABLE IF NOT EXISTS c (data jsonb);
+
+query T multiline
+EXPLAIN WITH(arity, join implementations)
+SELECT (SELECT NULL FROM a) AS c1, ref_0."?column?" AS c4 FROM b AS ref_0
+WHERE EXISTS (SELECT FROM c AS ref_7 WHERE EXISTS (SELECT ref_0."?column?" AS c2)) OR ref_0."?column?" IS NOT NULL;
+----
+Explained Query:
+  With
+    cte l0 =
+      Distinct project=[] // { arity: 0 }
+        Project () // { arity: 0 }
+          ReadStorage materialize.public.c // { arity: 1 }
+    cte l1 =
+      Union // { arity: 1 }
+        Project (#2) // { arity: 1 }
+          Map (null) // { arity: 3 }
+            ReadStorage materialize.public.a // { arity: 2 }
+        Map (error("more than one record produced in subquery")) // { arity: 1 }
+          Project () // { arity: 0 }
+            Filter (#0 > 1) // { arity: 1 }
+              Reduce aggregates=[count(*)] // { arity: 1 }
+                Project () // { arity: 0 }
+                  ReadStorage materialize.public.a // { arity: 2 }
+  Return // { arity: 2 }
+    Map (4) // { arity: 2 }
+      CrossJoin type=differential // { arity: 1 }
+        implementation
+          %0[×] » %1[×]
+        ArrangeBy keys=[[]] // { arity: 0 }
+          Union // { arity: 0 }
+            Get l0 // { arity: 0 }
+            Negate // { arity: 0 }
+              Get l0 // { arity: 0 }
+            Constant // { arity: 0 }
+              - ()
+        ArrangeBy keys=[[]] // { arity: 1 }
+          Union // { arity: 1 }
+            Get l1 // { arity: 1 }
+            Map (null) // { arity: 1 }
+              Union // { arity: 0 }
+                Negate // { arity: 0 }
+                  Distinct project=[] // { arity: 0 }
+                    Project () // { arity: 0 }
+                      Get l1 // { arity: 1 }
+                Constant // { arity: 0 }
+                  - ()
+
+Source materialize.public.a
+Source materialize.public.c
+
+Target cluster: quickstart
+
+EOF
+
+# Verify that the fueling logic of the linear join implementation is correct
+# by running a large cross-join that exhausts the avaible fuel (currently
+# 1 million output records) at least once.
+
+statement ok
+CREATE TABLE fuel_test_1 (a int)
+
+statement ok
+CREATE TABLE fuel_test_2 (b int)
+
+statement ok
+INSERT INTO fuel_test_1 SELECT generate_series(1, 2000)
+
+statement ok
+INSERT INTO fuel_test_2 SELECT generate_series(2001, 4000)
+
+query T multiline
+EXPLAIN SELECT sum(a + b) FROM fuel_test_1, fuel_test_2
+----
+Explained Query:
+  With
+    cte l0 =
+      Reduce aggregates=[sum((#0 + #1))]
+        CrossJoin type=differential
+          ArrangeBy keys=[[]]
+            ReadStorage materialize.public.fuel_test_1
+          ArrangeBy keys=[[]]
+            ReadStorage materialize.public.fuel_test_2
+  Return
+    Union
+      Get l0
+      Map (null)
+        Union
+          Negate
+            Project ()
+              Get l0
+          Constant
+            - ()
+
+Source materialize.public.fuel_test_1
+Source materialize.public.fuel_test_2
+
+Target cluster: quickstart
+
+EOF
+
+query I
+SELECT sum(a + b) FROM fuel_test_1, fuel_test_2
+----
+16004000000
+
+# Test the code path for producing errors from joins.
+statement ok
+CREATE TABLE error_test (a int)
+
+statement ok
+INSERT INTO error_test VALUES (0)
+
+query error division by zero
+SELECT t1.a / t2.a FROM error_test t1, error_test t2
+
+# Regression test for https://github.com/MaterializeInc/database-issues/issues/5998
+query
+select
+  from
+    (select
+          ref_4."schema_id" as c0
+        from
+          mz_catalog.mz_default_privileges as ref_4
+        where current_schemas(
+            CAST((select max(atthasdef) from pg_attribute)
+               as bool)) = mz_internal.mz_normalize_object_name(
+            CAST(ref_4."schema_id" as text))
+               ) as subq_7
+  where (select "id" from mz_internal.mz_comments limit 1)
+       = subq_7."c0";
+----

@@ -1,12 +1,12 @@
 ---
 title: "DROP VIEW"
-description: "`DROP VIEW` removes a view from your Materialize instances."
+description: "`DROP VIEW` removes a view from Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`DROP VIEW` removes a view from your Materialize instances. This works on both materialized and non-materialized views.
+`DROP VIEW` removes a view from Materialize.
 
 ## Conceptual framework
 
@@ -29,21 +29,31 @@ _view&lowbar;name_ | The view you want to drop. You can find available view name
 
 ## Examples
 
-```sql
+```mzsql
 SHOW VIEWS;
 ```
 ```nofmt
-my_view
+  name
+---------
+ my_view
 ```
-```sql
+```mzsql
 DROP VIEW my_view;
 ```
 ```nofmt
 DROP VIEW
 ```
 
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of the dropped view.
+- `USAGE` privileges on the containing schema.
+
 ## Related pages
 
 - [`CREATE VIEW`](../create-view)
 - [`SHOW VIEWS`](../show-views)
 - [`SHOW CREATE VIEW`](../show-create-view)
+- [DROP OWNED](../drop-owned)

@@ -16,6 +16,16 @@
 
 mode cockroach
 
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_table_keys = true
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET enable_repeat_row = true
+----
+COMPLETE 0
+
 statement ok
 CREATE TABLE y (a JSONB)
 
@@ -72,7 +82,7 @@ query I
 SELECT generate_series FROM generate_series(1, null)
 ----
 
-query error unable to determine which implementation to use
+query error db error: ERROR: function generate_series\(unknown, unknown\) is not unique
 SELECT generate_series FROM generate_series(null, null)
 ----
 
@@ -82,22 +92,30 @@ SELECT generate_series FROM generate_series('foo', 2)
 statement error invalid input syntax for type integer: invalid digit found in string: "foo"
 SELECT generate_series FROM generate_series(1, 'foo')
 
-statement error arguments cannot be implicitly cast to any implementation's parameters
+statement error db error: ERROR: function generate_series\(integer\) does not exist
 SELECT generate_series FROM generate_series(2)
 
 query T multiline
 EXPLAIN RAW PLAN FOR SELECT generate_series FROM generate_series(-2, 2)
 ----
-%0 =
-| CallTable generate_series(-2, 2, 1)
+CallTable generate_series(-2, 2, 1)
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT generate_series FROM generate_series(-2, 2)
+EXPLAIN WITH(arity, join implementations) SELECT generate_series FROM generate_series(-2, 2)
 ----
-%0 =
-| Constant (0) (1) (2) (-2) (-1)
+Explained Query (fast path):
+  Constant
+    - (0)
+    - (-1)
+    - (1)
+    - (2)
+    - (-2)
+
+Target cluster: quickstart
 
 EOF
 
@@ -157,7 +175,7 @@ SELECT * FROM x x1, x x2, generate_series(x1.a, x2.a) WHERE x1.b = x2.b
 2  3  2  3  2
 3  4  3  4  3
 
-# Regression test for #3877: a table function as the first FROM item inside of
+# Regression test for database-issues#1206: a table function as the first FROM item inside of
 # a LATERAL subquery should not miscount outer scope depth.
 query II
 SELECT x.a, generate_series FROM x, LATERAL (SELECT * FROM generate_series(1, x.a))
@@ -169,7 +187,7 @@ SELECT x.a, generate_series FROM x, LATERAL (SELECT * FROM generate_series(1, x.
 3  2
 3  3
 
-# Regression test for #5520: crash when a filter references an output column of
+# Regression test for database-issues#1700: crash when a filter references an output column of
 # a table function
 query IIIII
 SELECT * FROM x x1, x x2, generate_series(x1.a, x2.b) AS x3(b) WHERE x1.b = x2.b AND x1.a = x3.b
@@ -181,116 +199,144 @@ SELECT * FROM x x1, x x2, generate_series(x1.a, x2.b) AS x3(b) WHERE x1.b = x2.b
 query T multiline
 EXPLAIN RAW PLAN FOR SELECT * FROM x, generate_series(1, a)
 ----
-%0 =
-| Get materialize.public.x (u3)
+CrossJoin
+  Get materialize.public.x
+  CallTable generate_series(1, #^0, 1)
 
-%1 =
-| CallTable generate_series(1, #^0, 1)
-
-%2 =
-| InnerJoin %0 %1 on true
+Target cluster: quickstart
 
 EOF
 
 query T multiline
 EXPLAIN RAW PLAN FOR SELECT * FROM x, generate_series(100::bigint, a)
 ----
-%0 =
-| Get materialize.public.x (u3)
+CrossJoin
+  Get materialize.public.x
+  CallTable generate_series(integer_to_bigint(100), integer_to_bigint(#^0), 1)
 
-%1 =
-| CallTable generate_series(i32toi64(100), i32toi64(#^0), 1)
-
-%2 =
-| InnerJoin %0 %1 on true
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT * FROM x, generate_series(1, 10)
+EXPLAIN WITH(arity, join implementations) SELECT * FROM x, generate_series(1, 10)
 ----
-%0 =
-| Get materialize.public.x (u3)
-| ArrangeBy ()
+Explained Query:
+  CrossJoin type=differential // { arity: 3 }
+    implementation
+      %0:x[×] » %1[×]
+    ArrangeBy keys=[[]] // { arity: 2 }
+      ReadStorage materialize.public.x // { arity: 2 }
+    ArrangeBy keys=[[]] // { arity: 1 }
+      Constant // { arity: 1 }
+        - (1)
+        - (2)
+        - (3)
+        - (4)
+        - (5)
+        - (6)
+        - (7)
+        - (8)
+        - (9)
+        - (10)
 
-%1 =
-| Constant (1) (2) (3) (4) (5) (6) (7) (8) (9) (10)
+Source materialize.public.x
 
-%2 =
-| Join %0 %1
-| | implementation = Differential %1 %0.()
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT * FROM x, generate_series(1, a)
+EXPLAIN WITH(arity, join implementations) SELECT * FROM x, generate_series(1, a)
 ----
-%0 =
-| Get materialize.public.x (u3)
-| FlatMap generate_series(1, #0, 1)
+Explained Query:
+  FlatMap generate_series(1, #0, 1) // { arity: 3 }
+    ReadStorage materialize.public.x // { arity: 2 }
+
+Source materialize.public.x
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT * FROM x x1, x x2, generate_series(x1.a, x2.a) WHERE x1.b = x2.b
+EXPLAIN WITH(arity, join implementations) SELECT * FROM x x1, x x2, generate_series(x1.a, x2.a) WHERE x1.b = x2.b
 ----
-%0 = Let l0 =
-| Get materialize.public.x (u3)
-| Filter !(isnull(#1))
+Explained Query:
+  With
+    cte l0 =
+      ArrangeBy keys=[[#1]] // { arity: 2 }
+        Filter (#1) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.x // { arity: 2 }
+  Return // { arity: 5 }
+    Project (#0..=#2, #1, #3) // { arity: 5 }
+      FlatMap generate_series(#0, #2, 1) // { arity: 4 }
+        Project (#0..=#2) // { arity: 3 }
+          Join on=(#1 = #3) type=differential // { arity: 4 }
+            implementation
+              %0:l0[#1]K » %1:l0[#1]K
+            Get l0 // { arity: 2 }
+            Get l0 // { arity: 2 }
 
-%1 =
-| Get %0 (l0)
-| ArrangeBy (#1)
+Source materialize.public.x
+  filter=((#1) IS NOT NULL)
 
-%2 =
-| Join %1 %0 (= #1 #3)
-| | implementation = Differential %0 %1.(#1)
-| Project (#0..#2)
-| FlatMap generate_series(#0, #2, 1)
-| Project (#0..#2, #1, #3)
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT * FROM x x1, x x2, generate_series(x1.a, x2.a) WHERE x1.b = x2.b
+EXPLAIN WITH(arity, join implementations) SELECT * FROM x x1, x x2, generate_series(x1.a, x2.a) WHERE x1.b = x2.b
 ----
-%0 = Let l0 =
-| Get materialize.public.x (u3)
-| Filter !(isnull(#1))
+Explained Query:
+  With
+    cte l0 =
+      ArrangeBy keys=[[#1]] // { arity: 2 }
+        Filter (#1) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.x // { arity: 2 }
+  Return // { arity: 5 }
+    Project (#0..=#2, #1, #3) // { arity: 5 }
+      FlatMap generate_series(#0, #2, 1) // { arity: 4 }
+        Project (#0..=#2) // { arity: 3 }
+          Join on=(#1 = #3) type=differential // { arity: 4 }
+            implementation
+              %0:l0[#1]K » %1:l0[#1]K
+            Get l0 // { arity: 2 }
+            Get l0 // { arity: 2 }
 
-%1 =
-| Get %0 (l0)
-| ArrangeBy (#1)
+Source materialize.public.x
+  filter=((#1) IS NOT NULL)
 
-%2 =
-| Join %1 %0 (= #1 #3)
-| | implementation = Differential %0 %1.(#1)
-| Project (#0..#2)
-| FlatMap generate_series(#0, #2, 1)
-| Project (#0..#2, #1, #3)
+Target cluster: quickstart
 
 EOF
 
-# Regression test for #5520: crash when a filter references an output column of
+# Regression test for database-issues#1700: crash when a filter references an output column of
 # a table function around a join
 query T multiline
-EXPLAIN PLAN FOR SELECT * FROM x x1, x x2, generate_series(x1.a, x2.b) AS x3(b) WHERE x1.b = x2.b AND x1.a = x3.b
+EXPLAIN WITH(arity, join implementations) SELECT * FROM x x1, x x2, generate_series(x1.a, x2.b) AS x3(b) WHERE x1.b = x2.b AND x1.a = x3.b
 ----
-%0 = Let l0 =
-| Get materialize.public.x (u3)
-| Filter !(isnull(#1))
+Explained Query:
+  With
+    cte l0 =
+      ArrangeBy keys=[[#1]] // { arity: 2 }
+        Filter (#1) IS NOT NULL // { arity: 2 }
+          ReadStorage materialize.public.x // { arity: 2 }
+  Return // { arity: 5 }
+    Project (#0..=#2, #1, #3) // { arity: 5 }
+      Filter (#0 = #3) // { arity: 4 }
+        FlatMap generate_series(#0, #1, 1) // { arity: 4 }
+          Project (#0..=#2) // { arity: 3 }
+            Join on=(#1 = #3) type=differential // { arity: 4 }
+              implementation
+                %0:l0[#1]K » %1:l0[#1]K
+              Get l0 // { arity: 2 }
+              Get l0 // { arity: 2 }
 
-%1 =
-| Get %0 (l0)
-| ArrangeBy (#1)
+Source materialize.public.x
+  filter=((#1) IS NOT NULL)
 
-%2 =
-| Join %1 %0 (= #1 #3)
-| | implementation = Differential %0 %1.(#1)
-| Project (#0..#2)
-| FlatMap generate_series(#0, #1, 1)
-| Filter (#0 = #3)
-| Project (#0..#2, #1, #3)
+Target cluster: quickstart
 
 EOF
 
@@ -394,12 +440,13 @@ SELECT generate_series FROM generate_series(-2::bigint, 2::bigint, 3::bigint)
 
 query I
 SELECT generate_series FROM generate_series(-2::bigint, 2, 1)
+ORDER BY 1
 ----
+-2
+-1
 0
 1
 2
--2
--1
 
 query I
 SELECT generate_series FROM generate_series(null, 1, 1)
@@ -420,41 +467,53 @@ SELECT generate_series FROM generate_series(1::bigint, null, 1::bigint)
 query T multiline
 EXPLAIN RAW PLAN FOR SELECT generate_series FROM generate_series(-2, 2, 1)
 ----
-%0 =
-| CallTable generate_series(-2, 2, 1)
+CallTable generate_series(-2, 2, 1)
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
 EXPLAIN RAW PLAN FOR SELECT generate_series FROM generate_series(-2::bigint, 2::bigint, 1::bigint)
 ----
-%0 =
-| CallTable generate_series(i32toi64(-2), i32toi64(2), i32toi64(1))
+CallTable generate_series(integer_to_bigint(-2), integer_to_bigint(2), integer_to_bigint(1))
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT generate_series FROM generate_series(-2, 2, 2)
+EXPLAIN WITH(arity, join implementations) SELECT generate_series FROM generate_series(-2, 2, 2)
 ----
-%0 =
-| Constant (0) (2) (-2)
+Explained Query (fast path):
+  Constant
+    - (0)
+    - (2)
+    - (-2)
+
+Target cluster: quickstart
 
 EOF
 
 query T multiline
-EXPLAIN PLAN FOR SELECT generate_series FROM generate_series(-2::bigint, 2::bigint, 2::bigint)
+EXPLAIN WITH(arity, join implementations) SELECT generate_series FROM generate_series(-2::bigint, 2::bigint, 2::bigint)
 ----
-%0 =
-| Constant (0) (2) (-2)
+Explained Query (fast path):
+  Constant
+    - (0)
+    - (2)
+    - (-2)
+
+Target cluster: quickstart
 
 EOF
 
 # information_schema._pg_expandarray
 
-query error arguments cannot be implicitly cast
+query error db error: ERROR: function information_schema\._pg_expandarray\(\) does not exist
 SELECT information_schema._pg_expandarray()
 
-query error arguments cannot be implicitly cast
+query error db error: ERROR: function information_schema\._pg_expandarray\(\) does not exist
 SELECT * FROM information_schema._pg_expandarray()
 
 query error cannot determine type of empty array
@@ -463,10 +522,10 @@ SELECT information_schema._pg_expandarray(ARRAY[])
 query error cannot determine type of empty array
 SELECT * FROM information_schema._pg_expandarray(ARRAY[])
 
-query error arguments cannot be implicitly cast
+query error could not determine polymorphic type because input has type unknown
 SELECT * FROM information_schema._pg_expandarray(NULL)
 
-query error arguments cannot be implicitly cast
+query error could not determine polymorphic type because input has type unknown
 SELECT information_schema._pg_expandarray(NULL)
 
 query T colnames
@@ -727,8 +786,13 @@ jsonb_each
 (1,2)
 (3,4)
 
-query error multiple table functions in select projections not yet supported
-SELECT 1, jsonb_object_keys('{"1":2,"3":4}'::JSONB), jsonb_object_keys('{"1":2,"3":4,"5":6}'::JSONB) ORDER BY 1
+query ITT colnames
+SELECT 1, jsonb_object_keys('{"1":2,"3":4}'::JSONB), jsonb_object_keys('{"1":2,"3":4,"5":6}'::JSONB) ORDER BY 3
+----
+?column? jsonb_object_keys jsonb_object_keys
+1  1  1
+1  3  3
+1  NULL  5
 
 query T colnames
 SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3) ORDER BY 1
@@ -743,13 +807,19 @@ SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3), jsonb
 {"a":1,"c":3} {"a":1,"c":3}
 {"b":1,"c":3} {"b":1,"c":3}
 
-query error multiple table functions in select projections not yet supported
-SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3), jsonb_build_object(jsonb_object_keys('{"a":2}'), 1, 'c', 3);
+query error key cannot be null
+SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3), jsonb_build_object(jsonb_object_keys('{"a":2}'), 1, 'c', 3)
 
-query error multiple table functions in select projections not yet supported
+query TT
+SELECT jsonb_build_array(jsonb_object_keys('{"a":2, "b":3}')), jsonb_build_array(jsonb_object_keys('{"a":2}'));
+----
+["b"]  [null]
+["a"]  ["a"]
+
+query error table functions are not allowed in other table functions
 SELECT jsonb_array_elements(jsonb_array_elements('[[1,2],[3,4]]')), jsonb_array_elements(jsonb_array_elements('[[1],[3,4,5]]')) ORDER BY 1
 
-query error multiple table functions in select projections not yet supported
+query error table functions are not allowed in other table functions
 SELECT jsonb_array_elements(jsonb_array_elements('[[1,2],[3,4]]')), jsonb_array_elements('[7,8,9]') ORDER BY 1
 
 # Postgres explicitly disallows table funcs (although it uses "set-returning
@@ -958,6 +1028,30 @@ SELECT * FROM generate_series('2020-01-01 22:00:00'::TIMESTAMPTZ, '2021-01-01 00
 query error step size cannot equal zero
 SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMPTZ, '2021-01-03 00:00:00'::TIMESTAMPTZ, '0 day');
 
+query error step size cannot equal zero
+SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2022-01-03 00:00:00'::TIMESTAMP, '1 month -30 day') ORDER BY 1;
+
+query error step size cannot equal zero
+SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2022-01-03 00:00:00'::TIMESTAMP, '1 day -24 hr') ORDER BY 1;
+
+query T
+SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2021-01-05 00:00:00'::TIMESTAMP, '1 day -12 hrs') ORDER BY 1;
+----
+2021-01-01 03:00:00
+2021-01-01 15:00:00
+2021-01-02 03:00:00
+2021-01-02 15:00:00
+2021-01-03 03:00:00
+2021-01-03 15:00:00
+2021-01-04 03:00:00
+2021-01-04 15:00:00
+
+query T
+SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2021-02-01 00:00:00'::TIMESTAMP, '1 month -15 days') ORDER BY 1;
+----
+2021-01-01 03:00:00
+2021-01-17 03:00:00
+
 # Test ROWS FROM
 
 query I colnames
@@ -1123,20 +1217,82 @@ x y
 1 1
 2 2
 
+query II
+SELECT generate_series(1, 1), generate_series(2, 2)
+----
+1 2
+
 query IT colnames
 SELECT (information_schema._pg_expandarray(array[10])).x, information_schema._pg_expandarray(array[10])
 ----
 x _pg_expandarray
 10 (10,1)
 
-query error multiple table functions in select projections not yet supported
-SELECT generate_series(1, 1), generate_series(2, 2)
+query IIITITT colnames
+SELECT
+    (information_schema._pg_expandarray(ARRAY[100])).*,
+    (information_schema._pg_expandarray(ARRAY[100])).x,
+    information_schema._pg_expandarray(ARRAY[100])::text,
+    generate_series(1, 2),
+    jsonb_array_elements('[3]'),
+    jsonb_array_elements('[4,5]')
+ORDER BY generate_series
+----
+x n x _pg_expandarray generate_series jsonb_array_elements jsonb_array_elements
+100 1 100 (100,1) 1 3 4
+NULL NULL NULL NULL 2 NULL 5
+
+query error column reference "generate_series" is ambiguous
+SELECT
+    generate_series(1, 2),
+    generate_series(1, 3)
+ORDER BY generate_series
+
+# Duplicate, identical table functions are not ambiguous.
+query II
+SELECT
+    generate_series(1, 2),
+    generate_series(1, 2)
+ORDER BY generate_series
+----
+1 1
+2 2
+
+query IIIT colnames,rowsort
+SELECT generate_series(1, 2), (information_schema._pg_expandarray(ARRAY[100])).*, jsonb_array_elements('[3]')::text ORDER BY 1
+----
+generate_series x n jsonb_array_elements
+1 100 1 3
+2 NULL NULL NULL
+
+query ITI colnames,rowsort
+SELECT generate_series(1, 2), information_schema._pg_expandarray(ARRAY[100])::text, generate_series(1, 3) ORDER BY 3
+----
+generate_series _pg_expandarray generate_series
+1 (100,1) 1
+2 NULL 2
+NULL NULL 3
+
+# Some error cases
+
+query error table functions are not allowed in WHERE clause
+SELECT 1 FROM t WHERE generate_series(1, 1) = 1
+
+# TODO: This error should complain about the DISTINCT.
+query error table functions are not allowed in SELECT clause
+SELECT generate_series(DISTINCT 1, 1)
 
 # Subqueries avoid the uniqueness check.
 query II
 SELECT generate_series(1, 1), (SELECT generate_series(2, 2))
 ----
 1 2
+
+query error type integer is not composite
+SELECT (generate_series(1, 1)).*
+
+query error not a composite type
+SELECT (generate_series(1, 1)).generate_series
 
 # GENERATE_SUBSCRIPTS
 
@@ -1181,11 +1337,22 @@ query I
 SELECT generate_subscripts('{1,2,3,4}'::int[], 12345) AS s;
 ----
 
-query error parsing multi-dimensional arrays is not supported
+query T
 SELECT generate_subscripts('{{1,2,3,4}, {5,6,7,8}}'::int[], 1) AS s;
+----
+1
+2
 
-query error multiple table functions in select projections not yet supported, see https://github.com/MaterializeInc/materialize/issues/1546 for more details
-SELECT generate_subscripts('{1,2,3,4}'::int[], 1), repeat_row(generate_series) AS s;
+query T
+SELECT generate_subscripts('{{1,2,3,4}, {5,6,7,8}}'::int[], 2) AS s;
+----
+1
+2
+3
+4
+
+query error table functions are not allowed in other table functions
+SELECT generate_subscripts('{1,2,3,4}'::int[], 1), repeat_row(generate_series(1, 1)) AS s
 
 # test lower bound, this should return indices 2,3,4
 # but currently we dont support this syntax
@@ -1205,7 +1372,10 @@ select generate_subscripts(ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]], 2);
 2
 3
 
-# Regression test for #9653: LATERAL column references in ROWS FROM
+query error could not determine polymorphic type because input has type unknown
+SELECT generate_subscripts(NULL, 1)
+
+# Regression test for database-issues#2939: LATERAL column references in ROWS FROM
 
 query III
 SELECT * FROM generate_series(1, 3) as foo(a), ROWS FROM (generate_series(foo.a, foo.a + 2), generate_series(foo.a, foo.a + 1)) order by 1, 2, 3;
@@ -1233,6 +1403,76 @@ SELECT * FROM generate_series(1, 3) as foo(a), ROWS FROM (generate_series(foo.a,
 3  4  4  NULL
 3  5  NULL  NULL
 
-# Regression test for #9657
+# Regression test for database-issues#2941
 statement ok
 create view bar as select * from y, rows from (generate_series(1, 2), jsonb_array_elements(y.a));
+
+# Regression for database-issues#3078
+query IT
+WITH a(x) AS (SELECT 'a') SELECT generate_series(1, 2), * FROM a ORDER BY generate_series
+----
+1 a
+2 a
+
+# Test optimization for single table function in scalar position
+# Plan should be just a simple FlatMap + Project
+# Regression test for database-issues#3173
+query T multiline
+EXPLAIN WITH(arity, join implementations) SELECT jsonb_object_keys(a) FROM y;
+----
+Explained Query:
+  Project (#1) // { arity: 1 }
+    FlatMap jsonb_object_keys(#0) // { arity: 2 }
+      ReadStorage materialize.public.y // { arity: 1 }
+
+Source materialize.public.y
+
+Target cluster: quickstart
+
+EOF
+
+# Test that table functions should produce deterministic plans
+query T multiline
+EXPLAIN RAW PLAN FOR SELECT jsonb_object_keys('{"1":2}'::JSONB), jsonb_object_keys('{"1":2}'::JSONB);
+----
+Project (#0, #0)
+  CallTable jsonb_object_keys(text_to_jsonb("{\"1\":2}"))
+
+Target cluster: quickstart
+
+EOF
+
+query T multiline
+EXPLAIN RAW PLAN FOR SELECT jsonb_object_keys('{"1":2}'::JSONB), jsonb_object_keys('{"3":4}'::JSONB);
+----
+Project (#5, #6)
+  Map (case when (#1) IS NULL then null else #0 end, case when (#3) IS NULL then null else #2 end)
+    Project (#0, #1, #3..=#5)
+      Map (coalesce(#2, #4))
+        FullOuterJoin (#2 = #4)
+          Map (row_number() over (order by []), #1)
+            CallTable jsonb_object_keys(text_to_jsonb("{\"1\":2}"))
+          Map (row_number() over (order by []))
+            CallTable jsonb_object_keys(text_to_jsonb("{\"3\":4}"))
+
+Target cluster: quickstart
+
+EOF
+
+# Disallowed table function behaviour
+
+query I
+SELECT generate_series FROM generate_series(1, 3) WHERE (generate_series < 3);
+----
+1
+2
+
+query error Expected right parenthesis, found BY
+SELECT generate_series FROM generate_series(1, 3) OVER (ORDER BY generate_series);
+
+query error Expected right parenthesis, found number "1"
+SELECT generate_series FROM generate_series(DISTINCT 1, 3);
+
+# Regression for https://github.com/MaterializeInc/database-issues/issues/6180
+query error db error: ERROR: regexp_extract must specify at least one capture group
+select regexp_extract('aaa', 'a')

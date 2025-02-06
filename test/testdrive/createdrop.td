@@ -6,46 +6,37 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
+
+$ set-arg-default single-replica-cluster=quickstart
 #
 # Test basic create and drop functionality
 
 $ set schema={
+    "name": "row",
     "type": "record",
-    "name": "envelope",
     "fields": [
-      {
-        "name": "before",
-        "type": [
-          {
-            "name": "row",
-            "type": "record",
-            "fields": [
-              {"name": "X", "type": "long"},
-              {"name": "Y", "type": "long"}
-            ]
-          },
-          "null"
-        ]
-      },
-      { "name": "after", "type": ["row", "null"] }
+      {"name": "X", "type": "long"},
+      {"name": "Y", "type": "long"}
     ]
   }
 
 $ kafka-create-topic topic=data
 
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
 > CREATE SOURCE s
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+
+> CREATE TABLE s_tbl FROM SOURCE s (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
-  ENVELOPE DEBEZIUM
 
-$ kafka-ingest format=avro topic=data schema=${schema} timestamp=33
-{"before": null, "after": {"row":{"X": 1, "Y": 1}}}
-{"before": null, "after": {"row":{"X": 2, "Y": 1}}}
-{"before": null, "after": {"row":{"X": 3, "Y": 1}}}
-{"before": null, "after": {"row":{"X": 1, "Y": 2}}}
-
-$ kafka-ingest format=avro topic=data schema=${schema} timestamp=34
-{"before": null, "after": null}
+$ kafka-ingest format=avro topic=data schema=${schema}
+{"X": 1, "Y": 1}
+{"X": 2, "Y": 1}
+{"X": 3, "Y": 1}
+{"X": 1, "Y": 2}
 
 > CREATE MATERIALIZED VIEW v AS SELECT 42 AS a
 
@@ -53,21 +44,21 @@ $ kafka-ingest format=avro topic=data schema=${schema} timestamp=34
 
 > CREATE INDEX i ON v(a)
 
-> CREATE INDEX j on s("X");
+> CREATE INDEX j on s_tbl("X");
 
 # Test that creating objects of the same name does not work
 
 ! CREATE MATERIALIZED VIEW i AS SELECT 1.5 AS c
-catalog item 'i' already exists
+contains:index "materialize.public.i" already exists
 
-! CREATE INDEX i ON s("Y")
-catalog item 'i' already exists
+! CREATE INDEX i ON s_tbl("Y")
+contains:index "materialize.public.i" already exists
 
 ! CREATE INDEX j on v2(x)
-catalog item 'j' already exists
+contains:index "materialize.public.j" already exists
 
 ! CREATE INDEX v ON v2(x)
-catalog item 'v' already exists
+contains:materialized view "materialize.public.v" already exists
 
 $ set dummy={
     "type": "record",
@@ -97,59 +88,57 @@ $ set dummy={
   }
 
 ! CREATE SOURCE v2
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${dummy}'
-  ENVELOPE DEBEZIUM
-catalog item 'v2' already exists
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+contains:materialized view "materialize.public.v2" already exists
 
 ! CREATE SOURCE i
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${dummy}'
-  ENVELOPE DEBEZIUM
-catalog item 'i' already exists
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+contains:index "materialize.public.i" already exists
 
 ! CREATE INDEX s ON v2(x)
-catalog item 's' already exists
+contains:source "materialize.public.s" already exists
 
 ! CREATE MATERIALIZED VIEW s AS SELECT 'bloop' AS d
-catalog item 's' already exists
+contains:source "materialize.public.s" already exists
 
 # Test that objects do not get dropped if the drop command does not specify the correct type
 ! DROP SOURCE v
-v is not of type SOURCE
+exact:v is a materialized view not a source
 
 ! DROP SOURCE IF EXISTS v
-v is not of type SOURCE
+exact:v is a materialized view not a source
 
 ! DROP INDEX v
-v is not of type INDEX
+exact:v is a materialized view not an index
 
 ! DROP INDEX IF EXISTS v
-v is not of type INDEX
+exact:v is a materialized view not an index
 
 ! DROP SOURCE i
-i is not of type SOURCE
+exact:i is an index not a source
 
 ! DROP SOURCE IF EXISTS i
-i is not of type SOURCE
+exact:i is an index not a source
 
 ! DROP VIEW i
-i is not of type VIEW
+exact:i is an index not a view
 
 ! DROP VIEW IF EXISTS i
-i is not of type VIEW
+exact:i is an index not a view
 
 ! DROP INDEX s
-s is not of type INDEX
+exact:s is a source not an index
 
 ! DROP INDEX IF EXISTS s
-s is not of type INDEX
+exact:s is a source not an index
 
 ! DROP VIEW s
-s is not of type VIEW
+exact:s is a source not a view
 
 ! DROP VIEW IF EXISTS s
-s is not of type VIEW
+exact:s is a source not a view
 
 # Delete objects
 
@@ -157,27 +146,29 @@ s is not of type VIEW
 
 > DROP INDEX i
 
-> DROP VIEW v
+> DROP MATERIALIZED VIEW v
 
-> DROP SOURCE s
+> DROP SOURCE s CASCADE
 
 # test that the names of the deleted objects can be used to create objects of other types
 > CREATE MATERIALIZED VIEW s AS SELECT 84 AS b
 
 > CREATE SOURCE i
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+
+> CREATE TABLE i_tbl FROM SOURCE i (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
-  ENVELOPE DEBEZIUM
 
 > CREATE INDEX v ON s(b)
 
-# Test that if exists works when the referred objects do not exist
+# Test that if exists works when the referred objects exist
 
 > DROP INDEX IF EXISTS v
 
-> DROP VIEW IF EXISTS s
+> DROP MATERIALIZED VIEW IF EXISTS s
 
-> DROP SOURCE IF EXISTS i
+> DROP SOURCE IF EXISTS i CASCADE
 
 # Test that if exists works when the referred objects do not exist
 
@@ -185,35 +176,35 @@ s is not of type VIEW
 
 > DROP VIEW IF EXISTS nonexistent
 
-> DROP SOURCE IF EXISTS nonexistent
+> DROP SOURCE IF EXISTS nonexistent CASCADE
 
 # Test that drop without if exists does not work if the object does not exist
 
 ! DROP INDEX nonexistent
-unknown catalog item 'nonexistent'
+contains:unknown catalog item 'nonexistent'
 
 ! DROP VIEW nonexistent
-unknown catalog item 'nonexistent'
+contains:unknown catalog item 'nonexistent'
 
 ! DROP SOURCE nonexistent
-unknown catalog item 'nonexistent'
+contains:unknown catalog item 'nonexistent'
 
 # Test CREATE VIEW IF NOT EXISTS
-> CREATE MATERIALIZED VIEW IF NOT EXISTS test1 AS SELECT 42 AS a
+> CREATE VIEW IF NOT EXISTS test1 AS SELECT 42 AS a
 
 > SHOW CREATE VIEW test1
-View                      "Create View"
-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+name                      create_sql
+--------------------------------------------------------------------------------------------------
 materialize.public.test1  "CREATE VIEW \"materialize\".\"public\".\"test1\" AS SELECT 42 AS \"a\""
 
-! CREATE MATERIALIZED VIEW test1 AS SELECT 43 AS b
-catalog item 'test1' already exists
+! CREATE VIEW test1 AS SELECT 43 AS b
+contains:view "materialize.public.test1" already exists
 
 > SELECT * FROM test1
 a
 -----------
 42
 
-> CREATE MATERIALIZED VIEW IF NOT EXISTS test1 AS SELECT 42 AS a
+> CREATE VIEW IF NOT EXISTS test1 AS SELECT 42 AS a
 
 > DROP VIEW test1

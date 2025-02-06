@@ -7,35 +7,55 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::bail;
-use reqwest::{Method, Url};
+use proptest_derive::Arbitrary;
+use reqwest::{Method, Response, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Auth;
 
 /// An API client for a Confluent-compatible schema registry.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct Client {
     inner: reqwest::Client,
-    url: Url,
+    url: Arc<dyn Fn() -> Url + Send + Sync + 'static>,
     auth: Option<Auth>,
+    timeout: Duration,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("inner", &self.inner)
+            .field("url", &"...")
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 impl Client {
     pub(crate) fn new(
         inner: reqwest::Client,
-        url: Url,
+        url: Arc<dyn Fn() -> Url + Send + Sync + 'static>,
         auth: Option<Auth>,
+        timeout: Duration,
     ) -> Result<Self, anyhow::Error> {
-        if url.cannot_be_a_base() {
+        if url().cannot_be_a_base() {
             bail!("cannot construct a CCSR client with a cannot-be-a-base URL");
         }
-        Ok(Client { inner, url, auth })
+        Ok(Client {
+            inner,
+            url,
+            auth,
+            timeout,
+        })
     }
 
     fn make_request<P>(&self, method: Method, path: P) -> reqwest::RequestBuilder
@@ -43,7 +63,7 @@ impl Client {
         P: IntoIterator,
         P::Item: AsRef<str>,
     {
-        let mut url = self.url.clone();
+        let mut url = (self.url)();
         url.path_segments_mut()
             .expect("constructor validated URL can be a base")
             .clear()
@@ -54,6 +74,10 @@ impl Client {
             request = request.basic_auth(&auth.username, auth.password.as_ref());
         }
         request
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Gets the schema with the associated ID.
@@ -68,11 +92,11 @@ impl Client {
 
     /// Gets the latest schema for the specified subject.
     pub async fn get_schema_by_subject(&self, subject: &str) -> Result<Schema, GetBySubjectError> {
-        self.get_subject(subject).await.map(|s| s.schema)
+        self.get_subject_latest(subject).await.map(|s| s.schema)
     }
 
     /// Gets the latest version of the specified subject.
-    pub async fn get_subject(&self, subject: &str) -> Result<Subject, GetBySubjectError> {
+    pub async fn get_subject_latest(&self, subject: &str) -> Result<Subject, GetBySubjectError> {
         let req = self.make_request(Method::GET, &["subjects", subject, "versions", "latest"]);
         let res: GetBySubjectResponse = send_request(req).await?;
         Ok(Subject {
@@ -83,6 +107,16 @@ impl Client {
             version: res.version,
             name: res.subject,
         })
+    }
+
+    /// Gets the config set for the specified subject
+    pub async fn get_subject_config(
+        &self,
+        subject: &str,
+    ) -> Result<SubjectConfig, GetSubjectConfigError> {
+        let req = self.make_request(Method::GET, &["config", subject]);
+        let res: SubjectConfig = send_request(req).await?;
+        Ok(res)
     }
 
     /// Gets the latest version of the specified subject as well as all other
@@ -106,7 +140,7 @@ impl Client {
         version: String,
     ) -> Result<(Subject, Vec<Subject>), GetBySubjectError> {
         let mut subjects = vec![];
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         let mut subjects_queue = vec![(subject.to_owned(), version)];
         while let Some((subject, version)) = subjects_queue.pop() {
             let req = self.make_request(Method::GET, &["subjects", &subject, "versions", &version]);
@@ -157,6 +191,20 @@ impl Client {
         Ok(res.id)
     }
 
+    /// Sets the compatibility level for the specified subject.
+    pub async fn set_subject_compatibility_level(
+        &self,
+        subject: &str,
+        compatibility_level: CompatibilityLevel,
+    ) -> Result<(), SetCompatibilityLevelError> {
+        let req = self.make_request(Method::PUT, &["config", subject]);
+        let req = req.json(&CompatibilityLevelRequest {
+            compatibility: compatibility_level,
+        });
+        send_request_raw(req).await?;
+        Ok(())
+    }
+
     /// Lists the names of all subjects that the schema registry is aware of.
     pub async fn list_subjects(&self) -> Result<Vec<String>, ListError> {
         let req = self.make_request(Method::GET, &["subjects"]);
@@ -171,7 +219,7 @@ impl Client {
     /// to be reused.
     pub async fn delete_subject(&self, subject: &str) -> Result<(), DeleteError> {
         let req = self.make_request(Method::DELETE, &["subjects", subject]);
-        let _res: Vec<i32> = send_request(req).await?;
+        send_request_raw(req).await?;
         Ok(())
     }
 
@@ -217,10 +265,15 @@ async fn send_request<T>(req: reqwest::RequestBuilder) -> Result<T, UnhandledErr
 where
     T: DeserializeOwned,
 {
+    let res = send_request_raw(req).await?;
+    Ok(res.json().await?)
+}
+
+async fn send_request_raw(req: reqwest::RequestBuilder) -> Result<Response, UnhandledError> {
     let res = req.send().await?;
     let status = res.status();
     if status.is_success() {
-        Ok(res.json().await?)
+        Ok(res)
     } else {
         match res.json::<ErrorResponse>().await {
             Ok(err_res) => Err(UnhandledError::Api {
@@ -297,7 +350,7 @@ pub enum GetByIdError {
     SchemaNotFound,
     /// The underlying HTTP transport failed.
     Transport(reqwest::Error),
-    /// An internal server error occured.
+    /// An internal server error occurred.
     Server { code: i32, message: String },
 }
 
@@ -344,6 +397,65 @@ impl fmt::Display for GetByIdError {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SubjectConfig {
+    pub compatibility_level: CompatibilityLevel,
+    // There are other fields to include if we need them.
+}
+
+/// Errors for schema lookups by subject.
+#[derive(Debug)]
+pub enum GetSubjectConfigError {
+    /// The requested subject does not exist.
+    SubjectNotFound,
+    /// The compatibility level for the subject has not been set.
+    SubjectCompatibilityLevelNotSet,
+    /// The underlying HTTP transport failed.
+    Transport(reqwest::Error),
+    /// An internal server error occurred.
+    Server { code: i32, message: String },
+}
+
+impl From<UnhandledError> for GetSubjectConfigError {
+    fn from(err: UnhandledError) -> GetSubjectConfigError {
+        match err {
+            UnhandledError::Transport(err) => GetSubjectConfigError::Transport(err),
+            UnhandledError::Api { code, message } => match code {
+                404 => GetSubjectConfigError::SubjectNotFound,
+                40408 => GetSubjectConfigError::SubjectCompatibilityLevelNotSet,
+                _ => GetSubjectConfigError::Server { code, message },
+            },
+        }
+    }
+}
+
+impl Error for GetSubjectConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            GetSubjectConfigError::SubjectNotFound
+            | GetSubjectConfigError::SubjectCompatibilityLevelNotSet
+            | GetSubjectConfigError::Server { .. } => None,
+            GetSubjectConfigError::Transport(err) => Some(err),
+        }
+    }
+}
+
+impl fmt::Display for GetSubjectConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            GetSubjectConfigError::SubjectNotFound => write!(f, "subject not found"),
+            GetSubjectConfigError::SubjectCompatibilityLevelNotSet => {
+                write!(f, "subject level compatibility not set")
+            }
+            GetSubjectConfigError::Transport(err) => write!(f, "transport: {}", err),
+            GetSubjectConfigError::Server { code, message } => {
+                write!(f, "server error {}: {}", code, message)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GetBySubjectResponse {
     id: i32,
     schema: String,
@@ -358,9 +470,11 @@ struct GetBySubjectResponse {
 pub enum GetBySubjectError {
     /// The requested subject does not exist.
     SubjectNotFound,
+    /// The requested version does not exist.
+    VersionNotFound(String),
     /// The underlying HTTP transport failed.
     Transport(reqwest::Error),
-    /// An internal server error occured.
+    /// An internal server error occurred.
     Server { code: i32, message: String },
 }
 
@@ -370,6 +484,7 @@ impl From<UnhandledError> for GetBySubjectError {
             UnhandledError::Transport(err) => GetBySubjectError::Transport(err),
             UnhandledError::Api { code, message } => match code {
                 40401 => GetBySubjectError::SubjectNotFound,
+                40402 => GetBySubjectError::VersionNotFound(message),
                 _ => GetBySubjectError::Server { code, message },
             },
         }
@@ -379,7 +494,9 @@ impl From<UnhandledError> for GetBySubjectError {
 impl Error for GetBySubjectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            GetBySubjectError::SubjectNotFound | GetBySubjectError::Server { .. } => None,
+            GetBySubjectError::SubjectNotFound
+            | GetBySubjectError::VersionNotFound(_)
+            | GetBySubjectError::Server { .. } => None,
             GetBySubjectError::Transport(err) => Some(err),
         }
     }
@@ -389,6 +506,9 @@ impl fmt::Display for GetBySubjectError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             GetBySubjectError::SubjectNotFound => write!(f, "subject not found"),
+            GetBySubjectError::VersionNotFound(message) => {
+                write!(f, "version not found: {}", message)
+            }
             GetBySubjectError::Transport(err) => write!(f, "transport: {}", err),
             GetBySubjectError::Server { code, message } => {
                 write!(f, "server error {}: {}", code, message)
@@ -416,6 +536,55 @@ struct PublishResponse {
     id: i32,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompatibilityLevelRequest {
+    compatibility: CompatibilityLevel,
+}
+
+#[derive(Arbitrary, Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CompatibilityLevel {
+    Backward,
+    BackwardTransitive,
+    Forward,
+    ForwardTransitive,
+    Full,
+    FullTransitive,
+    None,
+}
+
+impl TryFrom<&str> for CompatibilityLevel {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "BACKWARD" => Ok(CompatibilityLevel::Backward),
+            "BACKWARD_TRANSITIVE" => Ok(CompatibilityLevel::BackwardTransitive),
+            "FORWARD" => Ok(CompatibilityLevel::Forward),
+            "FORWARD_TRANSITIVE" => Ok(CompatibilityLevel::ForwardTransitive),
+            "FULL" => Ok(CompatibilityLevel::Full),
+            "FULL_TRANSITIVE" => Ok(CompatibilityLevel::FullTransitive),
+            "NONE" => Ok(CompatibilityLevel::None),
+            _ => Err(format!("invalid compatibility level: {}", value)),
+        }
+    }
+}
+
+impl fmt::Display for CompatibilityLevel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            CompatibilityLevel::Backward => write!(f, "BACKWARD"),
+            CompatibilityLevel::BackwardTransitive => write!(f, "BACKWARD_TRANSITIVE"),
+            CompatibilityLevel::Forward => write!(f, "FORWARD"),
+            CompatibilityLevel::ForwardTransitive => write!(f, "FORWARD_TRANSITIVE"),
+            CompatibilityLevel::Full => write!(f, "FULL"),
+            CompatibilityLevel::FullTransitive => write!(f, "FULL_TRANSITIVE"),
+            CompatibilityLevel::None => write!(f, "NONE"),
+        }
+    }
+}
+
 /// Errors for publish operations.
 #[derive(Debug)]
 pub enum PublishError {
@@ -427,7 +596,7 @@ pub enum PublishError {
     InvalidSchema { message: String },
     /// The underlying HTTP transport failed.
     Transport(reqwest::Error),
-    /// An internal server error occured.
+    /// An internal server error occurred.
     Server { code: i32, message: String },
 }
 
@@ -478,7 +647,7 @@ impl fmt::Display for PublishError {
 pub enum ListError {
     /// The underlying HTTP transport failed.
     Transport(reqwest::Error),
-    /// An internal server error occured.
+    /// An internal server error occurred.
     Server { code: i32, message: String },
 }
 
@@ -516,7 +685,7 @@ pub enum DeleteError {
     SubjectNotFound,
     /// The underlying HTTP transport failed.
     Transport(reqwest::Error),
-    /// An internal server error occured.
+    /// An internal server error occurred.
     Server { code: i32, message: String },
 }
 
@@ -547,6 +716,53 @@ impl fmt::Display for DeleteError {
             DeleteError::SubjectNotFound => write!(f, "subject not found"),
             DeleteError::Transport(err) => write!(f, "transport: {}", err),
             DeleteError::Server { code, message } => {
+                write!(f, "server error {}: {}", code, message)
+            }
+        }
+    }
+}
+
+/// Errors for setting compatibility level operations.
+#[derive(Debug)]
+pub enum SetCompatibilityLevelError {
+    /// The compatibility level is invalid.
+    InvalidCompatibilityLevel,
+    /// The underlying HTTP transport failed.
+    Transport(reqwest::Error),
+    /// An internal server error occurred.
+    Server { code: i32, message: String },
+}
+
+impl From<UnhandledError> for SetCompatibilityLevelError {
+    fn from(err: UnhandledError) -> SetCompatibilityLevelError {
+        match err {
+            UnhandledError::Transport(err) => SetCompatibilityLevelError::Transport(err),
+            UnhandledError::Api { code, message } => match code {
+                42203 => SetCompatibilityLevelError::InvalidCompatibilityLevel,
+                _ => SetCompatibilityLevelError::Server { code, message },
+            },
+        }
+    }
+}
+
+impl Error for SetCompatibilityLevelError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            SetCompatibilityLevelError::InvalidCompatibilityLevel
+            | SetCompatibilityLevelError::Server { .. } => None,
+            SetCompatibilityLevelError::Transport(err) => Some(err),
+        }
+    }
+}
+
+impl fmt::Display for SetCompatibilityLevelError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            SetCompatibilityLevelError::InvalidCompatibilityLevel => {
+                write!(f, "invalid compatibility level")
+            }
+            SetCompatibilityLevelError::Transport(err) => write!(f, "transport: {}", err),
+            SetCompatibilityLevelError::Server { code, message } => {
                 write!(f, "server error {}: {}", code, message)
             }
         }

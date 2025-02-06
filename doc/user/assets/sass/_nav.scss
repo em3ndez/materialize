@@ -1,0 +1,205 @@
+.nav {
+    border-bottom: 1px solid var(--divider-light);
+    background: var(--bg-nav);
+    backdrop-filter: saturate(0.5) blur(5px);
+    position: fixed;
+    width: 100vw;
+    z-index: 101;
+
+    .desktop {
+        display: flex;
+        align-items: center;
+        gap: var(--small);
+
+        @media(max-width: 850px) {
+            display: none !important;
+        }
+    }
+
+    .mobile {
+        display: none;
+        padding: var(--micro) 0;
+
+        a:not(.btn) {
+            padding: var(--nano) 0;
+            border-bottom: 1px solid var(--divider-light) !important;
+        }
+
+        .btn {
+            margin-top: var(--milli);
+        }
+
+        .active {
+            font-weight: bold;
+        }
+
+        @media(max-width: 850px) {
+            height: calc(100vh - var(--nav-height));
+
+            .row {
+                display: flex;
+                flex-direction: column;
+            }
+        }
+    }
+
+    &-container {
+        display: flex;
+        justify-content: space-between;
+        flex: 0 0 100%;
+        align-items: center;
+        height: calc(var(--nav-height) - 25px);
+    }
+
+    a:not([class*="btn"]) {
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+
+        &:hover,
+        &:focus,
+        &.active {
+            text-decoration: none;
+            color: var(--important);
+            border-color: var(--important);
+        }
+    }
+
+    &-logo {
+        display: flex;
+        align-items: center;
+        font-weight: 600;
+        font-size: rem(1.8);
+        color: var(--important);
+
+        a {
+            display: flex;
+            border-bottom: none !important;
+        }
+
+        svg {
+            margin-right: rem(1.5);
+        }
+    }
+}
+
+.toggle {
+    display: none;
+    transform: translateX(rem(.8));
+
+    @media(max-width: 850px) {
+        display: initial;
+    }
+
+    div {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        height: rem(4.8);
+        width: rem(4.8);
+        border-radius: 12px;
+        transition: all .2s cubic-bezier(0, 0, 0.2, 1);
+
+        span,
+        &::before,
+        &::after {
+            background: var(--sub);
+            height: rem(.2);
+            width: rem(2.4);
+            transition: all .2s cubic-bezier(0, 0, 0.2, 1);
+        }
+
+        &::before,
+        &::after {
+            content: '';
+        }
+
+        &::before {
+            margin-bottom: rem(.6);
+        }
+
+        &::after {
+            margin-top: rem(.6);
+        }
+    }
+
+    &.open {
+        div {
+
+            &::before,
+            &::after {
+                background: var(--important);
+            }
+
+            span {
+                opacity: 0;
+            }
+
+            &:before {
+                transform: rotate(-135deg);
+                margin-bottom: -10px;
+            }
+
+            &::after {
+                transform: rotate(135deg);
+            }
+        }
+    }
+}
+
+button.show-topics {
+    display: none;
+    margin: 0 0 var(--small) !important;
+    text-align: left;
+    font-weight: 300;
+    font-size: var(--base);
+    color: var(--sub);
+
+    @media(max-width: 850px) {
+        display: flex;
+    }
+
+    svg {
+        height: 20px;
+        margin-right: var(--micro);
+        stroke: var(--important);
+    }
+}
+
+button.close-topics {
+    display: none;
+    position: absolute;
+    justify-content: center;
+    align-items: center;
+    top: 0;
+    right: 0;
+    transform: translateX(50%) translateY(50%);
+    background: var(--bg);
+    height: rem(4.8);
+    width: rem(4.8);
+    border: 1px solid var(--divider-light);
+    border-radius: 100%;
+    box-shadow: var(--shadow-default);
+    transition: all .2s ease-out;
+
+    svg {
+        height: 30px;
+        width: 30px;
+
+        path {
+            stroke: var(--important);
+        }
+    }
+
+    @media(max-width: 850px) {
+        display: flex;
+    }
+}
+
+body.light {
+    .logo-link {
+        path {
+            fill: var(--black);
+        }
+    }
+}

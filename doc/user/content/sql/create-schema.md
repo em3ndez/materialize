@@ -3,7 +3,7 @@ title: "CREATE SCHEMA"
 description: "`CREATE SCHEMA` creates a new schema."
 menu:
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
 
 `CREATE SCHEMA` creates a new schema.
@@ -29,20 +29,26 @@ For more information, see [Namespaces](../namespaces).
 Field | Use
 ------|-----
 **IF NOT EXISTS** | If specified, _do not_ generate an error if a schema of the same name already exists. <br/><br/>If _not_ specified, throw an error if a schema of the same name already exists. _(Default)_
-_schema&lowbar;name_ | A name for the schema. <br/><br/>You can specify the database for the schema with a preceding `database_name.schema_name`, e.g. `my_db.my_shcmea`, otherwise the schema is created in the current database.
+_schema&lowbar;name_ | A name for the schema. <br/><br/>You can specify the database for the schema with a preceding `database_name.schema_name`, e.g. `my_db.my_schema`, otherwise the schema is created in the current database.
 
 ## Examples
 
-```sql
+```mzsql
 CREATE SCHEMA my_db.my_schema;
 ```
-```sql
+```mzsql
 SHOW SCHEMAS FROM my_db;
 ```
 ```nofmt
 public
 my_schema
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `CREATE` privileges on the containing database.
 
 ## Related pages
 

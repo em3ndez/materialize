@@ -22,55 +22,154 @@
 //! (commonly referred to as Data Definition Language, or DDL)
 
 use std::fmt;
-use std::path::PathBuf;
 
-use enum_kinds::EnumKind;
+use crate::ast::display::{self, AstDisplay, AstFormatter, WithOptionName};
+use crate::ast::{
+    AstInfo, ColumnName, Expr, Ident, OrderByExpr, UnresolvedItemName, Version, WithOptionValue,
+};
 
-use crate::ast::display::{self, AstDisplay, AstFormatter};
-use crate::ast::{AstInfo, DataType, Expr, Ident, SqlOption, UnresolvedObjectName, WithOption};
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MaterializedViewOptionName {
+    /// The `ASSERT NOT NULL [=] <ident>` option.
+    AssertNotNull,
+    PartitionBy,
+    RetainHistory,
+    /// The `REFRESH [=] ...` option.
+    Refresh,
+}
+
+impl AstDisplay for MaterializedViewOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            MaterializedViewOptionName::AssertNotNull => f.write_str("ASSERT NOT NULL"),
+            MaterializedViewOptionName::PartitionBy => f.write_str("PARTITION BY"),
+            MaterializedViewOptionName::RetainHistory => f.write_str("RETAIN HISTORY"),
+            MaterializedViewOptionName::Refresh => f.write_str("REFRESH"),
+        }
+    }
+}
+
+impl WithOptionName for MaterializedViewOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            MaterializedViewOptionName::AssertNotNull
+            | MaterializedViewOptionName::PartitionBy
+            | MaterializedViewOptionName::RetainHistory
+            | MaterializedViewOptionName::Refresh => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MaterializedViewOption<T: AstInfo> {
+    pub name: MaterializedViewOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(MaterializedViewOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ContinualTaskOptionName {
+    /// The `SNAPSHOT [=] ...` option.
+    Snapshot,
+}
+
+impl AstDisplay for ContinualTaskOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            ContinualTaskOptionName::Snapshot => f.write_str("SNAPSHOT"),
+        }
+    }
+}
+
+impl WithOptionName for ContinualTaskOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            ContinualTaskOptionName::Snapshot => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContinualTaskOption<T: AstInfo> {
+    pub name: ContinualTaskOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(ContinualTaskOption);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Schema {
-    File(PathBuf),
-    Inline(String),
+pub struct Schema {
+    pub schema: String,
 }
 
 impl AstDisplay for Schema {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            Self::File(path) => {
-                f.write_str("SCHEMA FILE '");
-                f.write_node(&display::escape_single_quote_string(
-                    &path.display().to_string(),
-                ));
-                f.write_str("'");
-            }
-            Self::Inline(inner) => {
-                f.write_str("SCHEMA '");
-                f.write_node(&display::escape_single_quote_string(inner));
-                f.write_str("'");
-            }
-        }
+        f.write_str("SCHEMA '");
+        f.write_node(&display::escape_single_quote_string(&self.schema));
+        f.write_str("'");
     }
 }
 impl_display!(Schema);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AvroSchemaOptionName {
+    /// The `CONFLUENT WIRE FORMAT [=] <bool>` option.
+    ConfluentWireFormat,
+}
+
+impl AstDisplay for AvroSchemaOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            AvroSchemaOptionName::ConfluentWireFormat => f.write_str("CONFLUENT WIRE FORMAT"),
+        }
+    }
+}
+
+impl WithOptionName for AvroSchemaOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            Self::ConfluentWireFormat => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AvroSchemaOption<T: AstInfo> {
+    pub name: AvroSchemaOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(AvroSchemaOption);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AvroSchema<T: AstInfo> {
     Csr {
-        csr_connector: CsrConnectorAvro<T>,
+        csr_connection: CsrConnectionAvro<T>,
     },
     InlineSchema {
         schema: Schema,
-        with_options: Vec<WithOption>,
+        with_options: Vec<AvroSchemaOption<T>>,
     },
 }
 
 impl<T: AstInfo> AstDisplay for AvroSchema<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            Self::Csr { csr_connector } => {
-                f.write_node(csr_connector);
+            Self::Csr { csr_connection } => {
+                f.write_node(csr_connection);
             }
             Self::InlineSchema {
                 schema,
@@ -79,7 +178,7 @@ impl<T: AstInfo> AstDisplay for AvroSchema<T> {
                 f.write_str("USING ");
                 schema.fmt(f);
                 if !with_options.is_empty() {
-                    f.write_str(" WITH (");
+                    f.write_str(" (");
                     f.write_node(&display::comma_separated(with_options));
                     f.write_str(")");
                 }
@@ -92,7 +191,7 @@ impl_display_t!(AvroSchema);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProtobufSchema<T: AstInfo> {
     Csr {
-        csr_connector: CsrConnectorProto<T>,
+        csr_connection: CsrConnectionProtobuf<T>,
     },
     InlineSchema {
         message_name: String,
@@ -103,8 +202,8 @@ pub enum ProtobufSchema<T: AstInfo> {
 impl<T: AstInfo> AstDisplay for ProtobufSchema<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            Self::Csr { csr_connector } => {
-                f.write_node(csr_connector);
+            Self::Csr { csr_connection } => {
+                f.write_node(csr_connection);
             }
             Self::InlineSchema {
                 message_name,
@@ -120,63 +219,176 @@ impl<T: AstInfo> AstDisplay for ProtobufSchema<T> {
 }
 impl_display_t!(ProtobufSchema);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CsrConnectorAvro<T: AstInfo> {
-    pub url: String,
-    pub seed: Option<CsrSeed>,
-    pub with_options: Vec<SqlOption<T>>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CsrConfigOptionName<T: AstInfo> {
+    AvroKeyFullname,
+    AvroValueFullname,
+    NullDefaults,
+    AvroDocOn(AvroDocOn<T>),
+    KeyCompatibilityLevel,
+    ValueCompatibilityLevel,
 }
 
-impl<T: AstInfo> AstDisplay for CsrConnectorAvro<T> {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str("USING CONFLUENT SCHEMA REGISTRY '");
-        f.write_node(&display::escape_single_quote_string(&self.url));
-        f.write_str("'");
-        if let Some(seed) = &self.seed {
-            f.write_str(" ");
-            f.write_node(seed);
+impl<T: AstInfo> WithOptionName for CsrConfigOptionName<T> {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            Self::AvroKeyFullname
+            | Self::AvroValueFullname
+            | Self::NullDefaults
+            | Self::AvroDocOn(_)
+            | Self::KeyCompatibilityLevel
+            | Self::ValueCompatibilityLevel => false,
         }
-        if !self.with_options.is_empty() {
-            f.write_str(" WITH (");
-            f.write_node(&display::comma_separated(&self.with_options));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AvroDocOn<T: AstInfo> {
+    pub identifier: DocOnIdentifier<T>,
+    pub for_schema: DocOnSchema,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DocOnSchema {
+    KeyOnly,
+    ValueOnly,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DocOnIdentifier<T: AstInfo> {
+    Column(ColumnName<T>),
+    Type(T::ItemName),
+}
+
+impl<T: AstInfo> AstDisplay for AvroDocOn<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match &self.for_schema {
+            DocOnSchema::KeyOnly => f.write_str("KEY "),
+            DocOnSchema::ValueOnly => f.write_str("VALUE "),
+            DocOnSchema::All => {}
+        }
+        match &self.identifier {
+            DocOnIdentifier::Column(name) => {
+                f.write_str("DOC ON COLUMN ");
+                f.write_node(name);
+            }
+            DocOnIdentifier::Type(name) => {
+                f.write_str("DOC ON TYPE ");
+                f.write_node(name);
+            }
+        }
+    }
+}
+impl_display_t!(AvroDocOn);
+
+impl<T: AstInfo> AstDisplay for CsrConfigOptionName<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            CsrConfigOptionName::AvroKeyFullname => f.write_str("AVRO KEY FULLNAME"),
+            CsrConfigOptionName::AvroValueFullname => f.write_str("AVRO VALUE FULLNAME"),
+            CsrConfigOptionName::NullDefaults => f.write_str("NULL DEFAULTS"),
+            CsrConfigOptionName::AvroDocOn(doc_on) => f.write_node(doc_on),
+            CsrConfigOptionName::KeyCompatibilityLevel => f.write_str("KEY COMPATIBILITY LEVEL"),
+            CsrConfigOptionName::ValueCompatibilityLevel => {
+                f.write_str("VALUE COMPATIBILITY LEVEL")
+            }
+        }
+    }
+}
+impl_display_t!(CsrConfigOptionName);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in a `{FROM|INTO} CONNECTION ...` statement.
+pub struct CsrConfigOption<T: AstInfo> {
+    pub name: CsrConfigOptionName<T>,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(CsrConfigOption);
+impl_display_t!(CsrConfigOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CsrConnection<T: AstInfo> {
+    pub connection: T::ItemName,
+    pub options: Vec<CsrConfigOption<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for CsrConnection<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("CONNECTION ");
+        f.write_node(&self.connection);
+        if !self.options.is_empty() {
+            f.write_str(" (");
+            f.write_node(&display::comma_separated(&self.options));
             f.write_str(")");
         }
     }
 }
-impl_display_t!(CsrConnectorAvro);
+impl_display_t!(CsrConnection);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CsrConnectorProto<T: AstInfo> {
-    pub url: String,
-    pub seed: Option<CsrSeedCompiledOrLegacy>,
-    pub with_options: Vec<SqlOption<T>>,
+pub enum ReaderSchemaSelectionStrategy {
+    Latest,
+    Inline(String),
+    ById(i32),
 }
 
-impl<T: AstInfo> AstDisplay for CsrConnectorProto<T> {
+impl Default for ReaderSchemaSelectionStrategy {
+    fn default() -> Self {
+        Self::Latest
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CsrConnectionAvro<T: AstInfo> {
+    pub connection: CsrConnection<T>,
+    pub key_strategy: Option<ReaderSchemaSelectionStrategy>,
+    pub value_strategy: Option<ReaderSchemaSelectionStrategy>,
+    pub seed: Option<CsrSeedAvro>,
+}
+
+impl<T: AstInfo> AstDisplay for CsrConnectionAvro<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str("USING CONFLUENT SCHEMA REGISTRY '");
-        f.write_node(&display::escape_single_quote_string(&self.url));
-        f.write_str("'");
+        f.write_str("USING CONFLUENT SCHEMA REGISTRY ");
+        f.write_node(&self.connection);
         if let Some(seed) = &self.seed {
             f.write_str(" ");
             f.write_node(seed);
         }
-        if !self.with_options.is_empty() {
-            f.write_str(" WITH (");
-            f.write_node(&display::comma_separated(&self.with_options));
-            f.write_str(")");
+    }
+}
+impl_display_t!(CsrConnectionAvro);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CsrConnectionProtobuf<T: AstInfo> {
+    pub connection: CsrConnection<T>,
+    pub seed: Option<CsrSeedProtobuf>,
+}
+
+impl<T: AstInfo> AstDisplay for CsrConnectionProtobuf<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("USING CONFLUENT SCHEMA REGISTRY ");
+        f.write_node(&self.connection);
+
+        if let Some(seed) = &self.seed {
+            f.write_str(" ");
+            f.write_node(seed);
         }
     }
 }
-impl_display_t!(CsrConnectorProto);
+impl_display_t!(CsrConnectionProtobuf);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CsrSeed {
+pub struct CsrSeedAvro {
     pub key_schema: Option<String>,
     pub value_schema: String,
 }
 
-impl AstDisplay for CsrSeed {
+impl AstDisplay for CsrSeedAvro {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SEED");
         if let Some(key_schema) = &self.key_schema {
@@ -189,33 +401,17 @@ impl AstDisplay for CsrSeed {
         f.write_str("'");
     }
 }
-impl_display!(CsrSeed);
+impl_display!(CsrSeedAvro);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CsrSeedCompiledOrLegacy {
-    Compiled(CsrSeedCompiled),
-    // Starting with version 0.9.13, Legacy should only be found when reading
-    // from the catalog and should be transformed during migration.
-    Legacy(CsrSeed),
+pub struct CsrSeedProtobuf {
+    pub key: Option<CsrSeedProtobufSchema>,
+    pub value: CsrSeedProtobufSchema,
 }
-impl AstDisplay for CsrSeedCompiledOrLegacy {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            CsrSeedCompiledOrLegacy::Compiled(c) => f.write_node(c),
-            CsrSeedCompiledOrLegacy::Legacy(l) => f.write_node(l),
-        }
-    }
-}
-impl_display!(CsrSeedCompiledOrLegacy);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CsrSeedCompiled {
-    pub key: Option<CsrSeedCompiledEncoding>,
-    pub value: CsrSeedCompiledEncoding,
-}
-impl AstDisplay for CsrSeedCompiled {
+impl AstDisplay for CsrSeedProtobuf {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str("SEED COMPILED");
+        f.write_str("SEED");
         if let Some(key) = &self.key {
             f.write_str(" KEY ");
             f.write_node(key);
@@ -224,49 +420,42 @@ impl AstDisplay for CsrSeedCompiled {
         f.write_node(&self.value);
     }
 }
-impl_display!(CsrSeedCompiled);
+impl_display!(CsrSeedProtobuf);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CsrSeedCompiledEncoding {
+pub struct CsrSeedProtobufSchema {
     // Hex encoded string.
     pub schema: String,
     pub message_name: String,
 }
-impl AstDisplay for CsrSeedCompiledEncoding {
+impl AstDisplay for CsrSeedProtobufSchema {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str(" SCHEMA '");
+        f.write_str("SCHEMA '");
         f.write_str(&display::escape_single_quote_string(&self.schema));
         f.write_str("' MESSAGE '");
         f.write_str(&self.message_name);
         f.write_str("'");
     }
 }
-impl_display!(CsrSeedCompiledEncoding);
+impl_display!(CsrSeedProtobufSchema);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CreateSourceFormat<T: AstInfo> {
-    None,
-    /// `CREATE SOURCE .. FORMAT`
+pub enum FormatSpecifier<T: AstInfo> {
+    /// `CREATE SOURCE/SINK .. FORMAT`
     Bare(Format<T>),
-    /// `CREATE SOURCE .. KEY FORMAT .. VALUE FORMAT`
-    ///
-    /// Also the destination for the legacy `ENVELOPE UPSERT FORMAT ...`
-    KeyValue {
-        key: Format<T>,
-        value: Format<T>,
-    },
+    /// `CREATE SOURCE/SINK .. KEY FORMAT .. VALUE FORMAT`
+    KeyValue { key: Format<T>, value: Format<T> },
 }
 
-impl<T: AstInfo> AstDisplay for CreateSourceFormat<T> {
+impl<T: AstInfo> AstDisplay for FormatSpecifier<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            CreateSourceFormat::None => {}
-            CreateSourceFormat::Bare(format) => {
-                f.write_str(" FORMAT ");
+            FormatSpecifier::Bare(format) => {
+                f.write_str("FORMAT ");
                 f.write_node(format)
             }
-            CreateSourceFormat::KeyValue { key, value } => {
-                f.write_str(" KEY FORMAT ");
+            FormatSpecifier::KeyValue { key, value } => {
+                f.write_str("KEY FORMAT ");
                 f.write_node(key);
                 f.write_str(" VALUE FORMAT ");
                 f.write_node(value);
@@ -274,7 +463,7 @@ impl<T: AstInfo> AstDisplay for CreateSourceFormat<T> {
         }
     }
 }
-impl_display_t!(CreateSourceFormat);
+impl_display_t!(FormatSpecifier);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Format<T: AstInfo> {
@@ -286,14 +475,16 @@ pub enum Format<T: AstInfo> {
         columns: CsvColumns,
         delimiter: char,
     },
-    Json,
+    Json {
+        array: bool,
+    },
     Text,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CsvColumns {
     /// `WITH count COLUMNS`
-    Count(usize),
+    Count(u64),
     /// `WITH HEADER (ident, ...)?`: `names` is empty if there are no names specified
     Header { names: Vec<Ident> },
 }
@@ -309,7 +500,7 @@ impl AstDisplay for CsvColumns {
                 f.write_str("HEADER");
                 if !names.is_empty() {
                     f.write_str(" (");
-                    f.write_node(&display::comma_separated(&names));
+                    f.write_node(&display::comma_separated(names));
                     f.write_str(")");
                 }
             }
@@ -318,65 +509,143 @@ impl AstDisplay for CsvColumns {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SourceIncludeMetadataType {
-    Key,
-    Timestamp,
-    Partition,
-    Topic,
-    Offset,
-}
-
-impl AstDisplay for SourceIncludeMetadataType {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            SourceIncludeMetadataType::Key => f.write_str("KEY"),
-            SourceIncludeMetadataType::Timestamp => f.write_str("TIMESTAMP"),
-            SourceIncludeMetadataType::Partition => f.write_str("PARTITION"),
-            SourceIncludeMetadataType::Topic => f.write_str("TOPIC"),
-            SourceIncludeMetadataType::Offset => f.write_str("OFFSET"),
-        }
-    }
-}
-impl_display!(SourceIncludeMetadataType);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SourceIncludeMetadata {
-    pub ty: SourceIncludeMetadataType,
-    pub alias: Option<Ident>,
+pub enum SourceIncludeMetadata {
+    Key {
+        alias: Option<Ident>,
+    },
+    Timestamp {
+        alias: Option<Ident>,
+    },
+    Partition {
+        alias: Option<Ident>,
+    },
+    Offset {
+        alias: Option<Ident>,
+    },
+    Headers {
+        alias: Option<Ident>,
+    },
+    Header {
+        key: String,
+        alias: Ident,
+        use_bytes: bool,
+    },
 }
 
 impl AstDisplay for SourceIncludeMetadata {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_node(&self.ty);
-        if let Some(alias) = &self.alias {
-            f.write_str(" AS ");
-            f.write_node(alias);
+        let print_alias = |f: &mut AstFormatter<W>, alias: &Option<Ident>| {
+            if let Some(alias) = alias {
+                f.write_str(" AS ");
+                f.write_node(alias);
+            }
+        };
+
+        match self {
+            SourceIncludeMetadata::Key { alias } => {
+                f.write_str("KEY");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::Timestamp { alias } => {
+                f.write_str("TIMESTAMP");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::Partition { alias } => {
+                f.write_str("PARTITION");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::Offset { alias } => {
+                f.write_str("OFFSET");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::Headers { alias } => {
+                f.write_str("HEADERS");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::Header {
+                alias,
+                key,
+                use_bytes,
+            } => {
+                f.write_str("HEADER '");
+                f.write_str(&display::escape_single_quote_string(key));
+                f.write_str("'");
+                print_alias(f, &Some(alias.clone()));
+                if *use_bytes {
+                    f.write_str(" BYTES");
+                }
+            }
         }
     }
 }
 impl_display!(SourceIncludeMetadata);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Envelope {
+pub enum SourceErrorPolicy {
+    Inline {
+        /// The alias to use for the error column. If unspecified will be `error`.
+        alias: Option<Ident>,
+    },
+}
+
+impl AstDisplay for SourceErrorPolicy {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            Self::Inline { alias } => {
+                f.write_str("INLINE");
+                if let Some(alias) = alias {
+                    f.write_str(" AS ");
+                    f.write_node(alias);
+                }
+            }
+        }
+    }
+}
+impl_display!(SourceErrorPolicy);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SourceEnvelope {
     None,
-    Debezium(DbzMode),
-    Upsert,
+    Debezium,
+    Upsert {
+        value_decode_err_policy: Vec<SourceErrorPolicy>,
+    },
     CdcV2,
 }
 
-impl AstDisplay for Envelope {
+impl SourceEnvelope {
+    /// `true` iff Materialize is expected to crash or exhibit UB
+    /// when attempting to ingest data starting at an offset other than zero.
+    pub fn requires_all_input(&self) -> bool {
+        match self {
+            SourceEnvelope::None => false,
+            SourceEnvelope::Debezium => false,
+            SourceEnvelope::Upsert { .. } => false,
+            SourceEnvelope::CdcV2 => true,
+        }
+    }
+}
+
+impl AstDisplay for SourceEnvelope {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Self::None => {
                 // this is unreachable as long as the default is None, but include it in case we ever change that
                 f.write_str("NONE");
             }
-            Self::Debezium(mode) => {
+            Self::Debezium => {
                 f.write_str("DEBEZIUM");
-                f.write_node(mode);
             }
-            Self::Upsert => {
-                f.write_str("UPSERT");
+            Self::Upsert {
+                value_decode_err_policy,
+            } => {
+                if value_decode_err_policy.is_empty() {
+                    f.write_str("UPSERT");
+                } else {
+                    f.write_str("UPSERT (VALUE DECODING ERRORS = (");
+                    f.write_node(&display::comma_separated(value_decode_err_policy));
+                    f.write_str("))")
+                }
             }
             Self::CdcV2 => {
                 f.write_str("MATERIALIZE");
@@ -384,7 +653,58 @@ impl AstDisplay for Envelope {
         }
     }
 }
-impl_display!(Envelope);
+impl_display!(SourceEnvelope);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SinkEnvelope {
+    Debezium,
+    Upsert,
+}
+
+impl AstDisplay for SinkEnvelope {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            Self::Upsert => {
+                f.write_str("UPSERT");
+            }
+            Self::Debezium => {
+                f.write_str("DEBEZIUM");
+            }
+        }
+    }
+}
+impl_display!(SinkEnvelope);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SubscribeOutput<T: AstInfo> {
+    Diffs,
+    WithinTimestampOrderBy { order_by: Vec<OrderByExpr<T>> },
+    EnvelopeUpsert { key_columns: Vec<Ident> },
+    EnvelopeDebezium { key_columns: Vec<Ident> },
+}
+
+impl<T: AstInfo> AstDisplay for SubscribeOutput<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            Self::Diffs => {}
+            Self::WithinTimestampOrderBy { order_by } => {
+                f.write_str(" WITHIN TIMESTAMP ORDER BY ");
+                f.write_node(&display::comma_separated(order_by));
+            }
+            Self::EnvelopeUpsert { key_columns } => {
+                f.write_str(" ENVELOPE UPSERT (KEY (");
+                f.write_node(&display::comma_separated(key_columns));
+                f.write_str("))");
+            }
+            Self::EnvelopeDebezium { key_columns } => {
+                f.write_str(" ENVELOPE DEBEZIUM (KEY (");
+                f.write_node(&display::comma_separated(key_columns));
+                f.write_str("))");
+            }
+        }
+    }
+}
+impl_display_t!(SubscribeOutput);
 
 impl<T: AstInfo> AstDisplay for Format<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
@@ -413,242 +733,692 @@ impl<T: AstInfo> AstDisplay for Format<T> {
                     f.write_str("'");
                 }
             }
-            Self::Json => f.write_str("JSON"),
+            Self::Json { array } => {
+                f.write_str("JSON");
+                if *array {
+                    f.write_str(" ARRAY");
+                }
+            }
             Self::Text => f.write_str("TEXT"),
         }
     }
 }
 impl_display_t!(Format);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Compression {
-    Gzip,
-    None,
+// All connection options are bundled together to allow us to parse `ALTER
+// CONNECTION` without specifying the type of connection we're altering. Il faut
+// souffrir pour être belle.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConnectionOptionName {
+    AccessKeyId,
+    AssumeRoleArn,
+    AssumeRoleSessionName,
+    AvailabilityZones,
+    AwsConnection,
+    AwsPrivatelink,
+    Broker,
+    Brokers,
+    Database,
+    Endpoint,
+    Host,
+    Password,
+    Port,
+    ProgressTopic,
+    ProgressTopicReplicationFactor,
+    PublicKey1,
+    PublicKey2,
+    Region,
+    SaslMechanisms,
+    SaslPassword,
+    SaslUsername,
+    SecretAccessKey,
+    SecurityProtocol,
+    ServiceName,
+    SshTunnel,
+    SslCertificate,
+    SslCertificateAuthority,
+    SslKey,
+    SslMode,
+    SessionToken,
+    Url,
+    User,
 }
 
-impl AstDisplay for Compression {
+impl AstDisplay for ConnectionOptionName {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            ConnectionOptionName::AccessKeyId => "ACCESS KEY ID",
+            ConnectionOptionName::AvailabilityZones => "AVAILABILITY ZONES",
+            ConnectionOptionName::AwsConnection => "AWS CONNECTION",
+            ConnectionOptionName::AwsPrivatelink => "AWS PRIVATELINK",
+            ConnectionOptionName::Broker => "BROKER",
+            ConnectionOptionName::Brokers => "BROKERS",
+            ConnectionOptionName::Database => "DATABASE",
+            ConnectionOptionName::Endpoint => "ENDPOINT",
+            ConnectionOptionName::Host => "HOST",
+            ConnectionOptionName::Password => "PASSWORD",
+            ConnectionOptionName::Port => "PORT",
+            ConnectionOptionName::ProgressTopic => "PROGRESS TOPIC",
+            ConnectionOptionName::ProgressTopicReplicationFactor => {
+                "PROGRESS TOPIC REPLICATION FACTOR"
+            }
+            ConnectionOptionName::PublicKey1 => "PUBLIC KEY 1",
+            ConnectionOptionName::PublicKey2 => "PUBLIC KEY 2",
+            ConnectionOptionName::Region => "REGION",
+            ConnectionOptionName::AssumeRoleArn => "ASSUME ROLE ARN",
+            ConnectionOptionName::AssumeRoleSessionName => "ASSUME ROLE SESSION NAME",
+            ConnectionOptionName::SaslMechanisms => "SASL MECHANISMS",
+            ConnectionOptionName::SaslPassword => "SASL PASSWORD",
+            ConnectionOptionName::SaslUsername => "SASL USERNAME",
+            ConnectionOptionName::SecurityProtocol => "SECURITY PROTOCOL",
+            ConnectionOptionName::SecretAccessKey => "SECRET ACCESS KEY",
+            ConnectionOptionName::ServiceName => "SERVICE NAME",
+            ConnectionOptionName::SshTunnel => "SSH TUNNEL",
+            ConnectionOptionName::SslCertificate => "SSL CERTIFICATE",
+            ConnectionOptionName::SslCertificateAuthority => "SSL CERTIFICATE AUTHORITY",
+            ConnectionOptionName::SslKey => "SSL KEY",
+            ConnectionOptionName::SslMode => "SSL MODE",
+            ConnectionOptionName::SessionToken => "SESSION TOKEN",
+            ConnectionOptionName::Url => "URL",
+            ConnectionOptionName::User => "USER",
+        })
+    }
+}
+impl_display!(ConnectionOptionName);
+
+impl WithOptionName for ConnectionOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
         match self {
-            Self::Gzip => f.write_str("GZIP"),
-            Self::None => f.write_str("NONE"),
+            ConnectionOptionName::AccessKeyId
+            | ConnectionOptionName::AvailabilityZones
+            | ConnectionOptionName::AwsConnection
+            | ConnectionOptionName::AwsPrivatelink
+            | ConnectionOptionName::Broker
+            | ConnectionOptionName::Brokers
+            | ConnectionOptionName::Database
+            | ConnectionOptionName::Endpoint
+            | ConnectionOptionName::Host
+            | ConnectionOptionName::Password
+            | ConnectionOptionName::Port
+            | ConnectionOptionName::ProgressTopic
+            | ConnectionOptionName::ProgressTopicReplicationFactor
+            | ConnectionOptionName::PublicKey1
+            | ConnectionOptionName::PublicKey2
+            | ConnectionOptionName::Region
+            | ConnectionOptionName::AssumeRoleArn
+            | ConnectionOptionName::AssumeRoleSessionName
+            | ConnectionOptionName::SaslMechanisms
+            | ConnectionOptionName::SaslPassword
+            | ConnectionOptionName::SaslUsername
+            | ConnectionOptionName::SecurityProtocol
+            | ConnectionOptionName::SecretAccessKey
+            | ConnectionOptionName::ServiceName
+            | ConnectionOptionName::SshTunnel
+            | ConnectionOptionName::SslCertificate
+            | ConnectionOptionName::SslCertificateAuthority
+            | ConnectionOptionName::SslKey
+            | ConnectionOptionName::SslMode
+            | ConnectionOptionName::SessionToken
+            | ConnectionOptionName::Url
+            | ConnectionOptionName::User => false,
         }
     }
 }
-impl_display!(Compression);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DbzMode {
-    /// `ENVELOPE DEBEZIUM` with no suffix
-    Plain,
-    /// `ENVELOPE DEBEZIUM UPSERT`
-    Upsert,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in a `CREATE CONNECTION`.
+pub struct ConnectionOption<T: AstInfo> {
+    pub name: ConnectionOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(ConnectionOption);
+impl_display_t!(ConnectionOption);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum CreateConnectionType {
+    Aws,
+    AwsPrivatelink,
+    Kafka,
+    Csr,
+    Postgres,
+    Ssh,
+    MySql,
+    Yugabyte,
 }
 
-impl AstDisplay for DbzMode {
+impl AstDisplay for CreateConnectionType {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            Self::Plain => f.write_str(""),
-            Self::Upsert => f.write_str(" UPSERT"),
+            Self::Kafka => {
+                f.write_str("KAFKA");
+            }
+            Self::Csr => {
+                f.write_str("CONFLUENT SCHEMA REGISTRY");
+            }
+            Self::Postgres => {
+                f.write_str("POSTGRES");
+            }
+            Self::Aws => {
+                f.write_str("AWS");
+            }
+            Self::AwsPrivatelink => {
+                f.write_str("AWS PRIVATELINK");
+            }
+            Self::Ssh => {
+                f.write_str("SSH TUNNEL");
+            }
+            Self::MySql => {
+                f.write_str("MYSQL");
+            }
+            Self::Yugabyte => {
+                f.write_str("YUGABYTE");
+            }
         }
     }
 }
-impl_display!(DbzMode);
+impl_display!(CreateConnectionType);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, EnumKind)]
-#[enum_kind(ConnectorType)]
-pub enum CreateSourceConnector {
-    File {
-        path: String,
-        compression: Compression,
-    },
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CreateConnectionOptionName {
+    Validate,
+}
+
+impl AstDisplay for CreateConnectionOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            CreateConnectionOptionName::Validate => "VALIDATE",
+        })
+    }
+}
+impl_display!(CreateConnectionOptionName);
+
+impl WithOptionName for CreateConnectionOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            CreateConnectionOptionName::Validate => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in a `CREATE CONNECTION...` statement.
+pub struct CreateConnectionOption<T: AstInfo> {
+    pub name: CreateConnectionOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(CreateConnectionOption);
+impl_display_t!(CreateConnectionOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KafkaSourceConfigOptionName {
+    GroupIdPrefix,
+    Topic,
+    TopicMetadataRefreshInterval,
+    StartTimestamp,
+    StartOffset,
+}
+
+impl AstDisplay for KafkaSourceConfigOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            KafkaSourceConfigOptionName::GroupIdPrefix => "GROUP ID PREFIX",
+            KafkaSourceConfigOptionName::Topic => "TOPIC",
+            KafkaSourceConfigOptionName::TopicMetadataRefreshInterval => {
+                "TOPIC METADATA REFRESH INTERVAL"
+            }
+            KafkaSourceConfigOptionName::StartOffset => "START OFFSET",
+            KafkaSourceConfigOptionName::StartTimestamp => "START TIMESTAMP",
+        })
+    }
+}
+impl_display!(KafkaSourceConfigOptionName);
+
+impl WithOptionName for KafkaSourceConfigOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            KafkaSourceConfigOptionName::GroupIdPrefix
+            | KafkaSourceConfigOptionName::Topic
+            | KafkaSourceConfigOptionName::TopicMetadataRefreshInterval
+            | KafkaSourceConfigOptionName::StartOffset
+            | KafkaSourceConfigOptionName::StartTimestamp => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KafkaSourceConfigOption<T: AstInfo> {
+    pub name: KafkaSourceConfigOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(KafkaSourceConfigOption);
+impl_display_t!(KafkaSourceConfigOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KafkaSinkConfigOptionName {
+    CompressionType,
+    PartitionBy,
+    ProgressGroupIdPrefix,
+    Topic,
+    TransactionalIdPrefix,
+    LegacyIds,
+    TopicConfig,
+    TopicMetadataRefreshInterval,
+    TopicPartitionCount,
+    TopicReplicationFactor,
+}
+
+impl AstDisplay for KafkaSinkConfigOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            KafkaSinkConfigOptionName::CompressionType => "COMPRESSION TYPE",
+            KafkaSinkConfigOptionName::PartitionBy => "PARTITION BY",
+            KafkaSinkConfigOptionName::ProgressGroupIdPrefix => "PROGRESS GROUP ID PREFIX",
+            KafkaSinkConfigOptionName::Topic => "TOPIC",
+            KafkaSinkConfigOptionName::TransactionalIdPrefix => "TRANSACTIONAL ID PREFIX",
+            KafkaSinkConfigOptionName::LegacyIds => "LEGACY IDS",
+            KafkaSinkConfigOptionName::TopicConfig => "TOPIC CONFIG",
+            KafkaSinkConfigOptionName::TopicMetadataRefreshInterval => {
+                "TOPIC METADATA REFRESH INTERVAL"
+            }
+            KafkaSinkConfigOptionName::TopicPartitionCount => "TOPIC PARTITION COUNT",
+            KafkaSinkConfigOptionName::TopicReplicationFactor => "TOPIC REPLICATION FACTOR",
+        })
+    }
+}
+impl_display!(KafkaSinkConfigOptionName);
+
+impl WithOptionName for KafkaSinkConfigOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            KafkaSinkConfigOptionName::CompressionType
+            | KafkaSinkConfigOptionName::ProgressGroupIdPrefix
+            | KafkaSinkConfigOptionName::Topic
+            | KafkaSinkConfigOptionName::TopicMetadataRefreshInterval
+            | KafkaSinkConfigOptionName::TransactionalIdPrefix
+            | KafkaSinkConfigOptionName::LegacyIds
+            | KafkaSinkConfigOptionName::TopicConfig
+            | KafkaSinkConfigOptionName::TopicPartitionCount
+            | KafkaSinkConfigOptionName::TopicReplicationFactor => false,
+            KafkaSinkConfigOptionName::PartitionBy => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KafkaSinkConfigOption<T: AstInfo> {
+    pub name: KafkaSinkConfigOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(KafkaSinkConfigOption);
+impl_display_t!(KafkaSinkConfigOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PgConfigOptionName {
+    /// Hex encoded string of binary serialization of
+    /// `mz_storage_types::sources::postgres::PostgresSourcePublicationDetails`
+    Details,
+    /// The name of the publication to sync
+    Publication,
+    /// Columns whose types you want to unconditionally format as text
+    /// NOTE(roshan): This value is kept around to allow round-tripping a
+    /// `CREATE SOURCE` statement while we still allow creating implicit
+    /// subsources from `CREATE SOURCE`, but will be removed once
+    /// fully deprecating that feature and forcing users to use explicit
+    /// `CREATE TABLE .. FROM SOURCE` statements
+    TextColumns,
+}
+
+impl AstDisplay for PgConfigOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            PgConfigOptionName::Details => "DETAILS",
+            PgConfigOptionName::Publication => "PUBLICATION",
+            PgConfigOptionName::TextColumns => "TEXT COLUMNS",
+        })
+    }
+}
+impl_display!(PgConfigOptionName);
+
+impl WithOptionName for PgConfigOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            PgConfigOptionName::Details
+            | PgConfigOptionName::Publication
+            | PgConfigOptionName::TextColumns => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in a `{FROM|INTO} CONNECTION ...` statement.
+pub struct PgConfigOption<T: AstInfo> {
+    pub name: PgConfigOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(PgConfigOption);
+impl_display_t!(PgConfigOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MySqlConfigOptionName {
+    /// Hex encoded string of binary serialization of
+    /// `mz_storage_types::sources::mysql::MySqlSourceDetails`
+    Details,
+    /// Columns whose types you want to unconditionally format as text
+    /// NOTE(roshan): This value is kept around to allow round-tripping a
+    /// `CREATE SOURCE` statement while we still allow creating implicit
+    /// subsources from `CREATE SOURCE`, but will be removed once
+    /// fully deprecating that feature and forcing users to use explicit
+    /// `CREATE TABLE .. FROM SOURCE` statements
+    TextColumns,
+    /// Columns you want to exclude
+    /// NOTE(roshan): This value is kept around to allow round-tripping a
+    /// `CREATE SOURCE` statement while we still allow creating implicit
+    /// subsources from `CREATE SOURCE`, but will be removed once
+    /// fully deprecating that feature and forcing users to use explicit
+    /// `CREATE TABLE .. FROM SOURCE` statements
+    ExcludeColumns,
+}
+
+impl AstDisplay for MySqlConfigOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            MySqlConfigOptionName::Details => "DETAILS",
+            MySqlConfigOptionName::TextColumns => "TEXT COLUMNS",
+            MySqlConfigOptionName::ExcludeColumns => "EXCLUDE COLUMNS",
+        })
+    }
+}
+impl_display!(MySqlConfigOptionName);
+
+impl WithOptionName for MySqlConfigOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            MySqlConfigOptionName::Details
+            | MySqlConfigOptionName::TextColumns
+            | MySqlConfigOptionName::ExcludeColumns => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in a `{FROM|INTO} CONNECTION ...` statement.
+pub struct MySqlConfigOption<T: AstInfo> {
+    pub name: MySqlConfigOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(MySqlConfigOption);
+impl_display_t!(MySqlConfigOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CreateSourceConnection<T: AstInfo> {
     Kafka {
-        broker: String,
-        topic: String,
-        key: Option<Vec<Ident>>,
-    },
-    Kinesis {
-        arn: String,
-    },
-    /// Avro Object Container File
-    AvroOcf {
-        path: String,
-    },
-    S3 {
-        /// The arguments to `DISCOVER OBJECTS USING`: `BUCKET SCAN` or `SQS NOTIFICATIONS`
-        key_sources: Vec<S3KeySource>,
-        /// The argument to the MATCHING clause: `MATCHING 'a/**/*.json'`
-        pattern: Option<String>,
-        compression: Compression,
+        connection: T::ItemName,
+        options: Vec<KafkaSourceConfigOption<T>>,
     },
     Postgres {
-        /// The postgres connection string
-        conn: String,
-        /// The name of the publication to sync
-        publication: String,
-        /// The replication slot name that will be created upstream
-        slot: Option<String>,
+        connection: T::ItemName,
+        options: Vec<PgConfigOption<T>>,
     },
-    PubNub {
-        /// PubNub's subscribe key
-        subscribe_key: String,
-        /// The PubNub channel to subscribe to
-        channel: String,
+    Yugabyte {
+        connection: T::ItemName,
+        options: Vec<PgConfigOption<T>>,
+    },
+    MySql {
+        connection: T::ItemName,
+        options: Vec<MySqlConfigOption<T>>,
+    },
+    LoadGenerator {
+        generator: LoadGenerator,
+        options: Vec<LoadGeneratorOption<T>>,
     },
 }
 
-impl AstDisplay for CreateSourceConnector {
+impl<T: AstInfo> AstDisplay for CreateSourceConnection<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            CreateSourceConnector::File { path, compression } => {
-                f.write_str("FILE '");
-                f.write_node(&display::escape_single_quote_string(path));
-                f.write_str("'");
-                f.write_str(" COMPRESSION ");
-                f.write_node(compression);
-            }
-            CreateSourceConnector::Kafka { broker, topic, key } => {
-                f.write_str("KAFKA BROKER '");
-                f.write_node(&display::escape_single_quote_string(broker));
-                f.write_str("'");
-                f.write_str(" TOPIC '");
-                f.write_node(&display::escape_single_quote_string(topic));
-                f.write_str("'");
-                if let Some(key) = key.as_ref() {
-                    f.write_str(" KEY (");
-                    f.write_node(&display::comma_separated(&key));
+            CreateSourceConnection::Kafka {
+                connection,
+                options,
+            } => {
+                f.write_str("KAFKA CONNECTION ");
+                f.write_node(connection);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
                     f.write_str(")");
                 }
             }
-            CreateSourceConnector::Kinesis { arn } => {
-                f.write_str("KINESIS ARN '");
-                f.write_node(&display::escape_single_quote_string(arn));
-                f.write_str("'");
-            }
-            CreateSourceConnector::AvroOcf { path } => {
-                f.write_str("AVRO OCF '");
-                f.write_node(&display::escape_single_quote_string(path));
-                f.write_str("'");
-            }
-            CreateSourceConnector::S3 {
-                key_sources,
-                pattern,
-                compression,
+            CreateSourceConnection::Postgres {
+                connection,
+                options,
             } => {
-                f.write_str("S3 DISCOVER OBJECTS");
-                if let Some(pattern) = pattern {
-                    f.write_str(" MATCHING '");
-                    f.write_str(&display::escape_single_quote_string(pattern));
-                    f.write_str("'");
+                f.write_str("POSTGRES CONNECTION ");
+                f.write_node(connection);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
                 }
-                f.write_str(" USING");
-                f.write_node(&display::comma_separated(key_sources));
-                f.write_str(" COMPRESSION ");
-                f.write_node(compression);
             }
-            CreateSourceConnector::Postgres {
-                conn,
-                publication,
-                slot,
+            CreateSourceConnection::Yugabyte {
+                connection,
+                options,
             } => {
-                f.write_str("POSTGRES CONNECTION '");
-                f.write_str(&display::escape_single_quote_string(conn));
-                f.write_str("' PUBLICATION '");
-                f.write_str(&display::escape_single_quote_string(publication));
-                if let Some(slot) = slot {
-                    f.write_str("' SLOT '");
-                    f.write_str(&display::escape_single_quote_string(slot));
+                f.write_str("YUGABYTE CONNECTION ");
+                f.write_node(connection);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
                 }
-                f.write_str("'");
             }
-            CreateSourceConnector::PubNub {
-                subscribe_key,
-                channel,
+            CreateSourceConnection::MySql {
+                connection,
+                options,
             } => {
-                f.write_str("PUBNUB SUBSCRIBE KEY '");
-                f.write_str(&display::escape_single_quote_string(subscribe_key));
-                f.write_str("' CHANNEL '");
-                f.write_str(&display::escape_single_quote_string(channel));
-                f.write_str("'");
+                f.write_str("MYSQL CONNECTION ");
+                f.write_node(connection);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
+                }
+            }
+            CreateSourceConnection::LoadGenerator { generator, options } => {
+                f.write_str("LOAD GENERATOR ");
+                f.write_node(generator);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
+                }
             }
         }
     }
 }
-impl_display!(CreateSourceConnector);
+impl_display_t!(CreateSourceConnection);
 
-impl<T: AstInfo> From<&CreateSinkConnector<T>> for ConnectorType {
-    fn from(connector: &CreateSinkConnector<T>) -> ConnectorType {
-        match connector {
-            CreateSinkConnector::Kafka { .. } => ConnectorType::Kafka,
-            CreateSinkConnector::AvroOcf { .. } => ConnectorType::AvroOcf,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LoadGenerator {
+    Clock,
+    Counter,
+    Marketing,
+    Auction,
+    Datums,
+    Tpch,
+    KeyValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, EnumKind)]
-#[enum_kind(CreateSinkConnectorKind)]
-pub enum CreateSinkConnector<T: AstInfo> {
-    Kafka {
-        broker: String,
-        topic: String,
-        key: Option<KafkaSinkKey>,
-        consistency: Option<KafkaConsistency<T>>,
-    },
-    /// Avro Object Container File
-    AvroOcf { path: String },
-}
-
-impl<T: AstInfo> AstDisplay for CreateSinkConnector<T> {
+impl AstDisplay for LoadGenerator {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            CreateSinkConnector::Kafka {
-                broker,
-                topic,
+            Self::Counter => f.write_str("COUNTER"),
+            Self::Clock => f.write_str("CLOCK"),
+            Self::Marketing => f.write_str("MARKETING"),
+            Self::Auction => f.write_str("AUCTION"),
+            Self::Datums => f.write_str("DATUMS"),
+            Self::Tpch => f.write_str("TPCH"),
+            Self::KeyValue => f.write_str("KEY VALUE"),
+        }
+    }
+}
+impl_display!(LoadGenerator);
+
+impl LoadGenerator {
+    /// Corresponds with the same mapping on the `LoadGenerator` enum defined in
+    /// src/storage-types/src/sources/load_generator.rs, but re-defined here for
+    /// cases where we only have the AST representation. This can be removed once
+    /// the `ast_rewrite_sources_to_tables` migration is removed.
+    pub fn schema_name(&self) -> &'static str {
+        match self {
+            LoadGenerator::Counter => "counter",
+            LoadGenerator::Clock => "clock",
+            LoadGenerator::Marketing => "marketing",
+            LoadGenerator::Auction => "auction",
+            LoadGenerator::Datums => "datums",
+            LoadGenerator::Tpch => "tpch",
+            LoadGenerator::KeyValue => "key_value",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoadGeneratorOptionName {
+    ScaleFactor,
+    TickInterval,
+    AsOf,
+    UpTo,
+    MaxCardinality,
+    Keys,
+    SnapshotRounds,
+    TransactionalSnapshot,
+    ValueSize,
+    Seed,
+    Partitions,
+    BatchSize,
+}
+
+impl AstDisplay for LoadGeneratorOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            LoadGeneratorOptionName::ScaleFactor => "SCALE FACTOR",
+            LoadGeneratorOptionName::TickInterval => "TICK INTERVAL",
+            LoadGeneratorOptionName::AsOf => "AS OF",
+            LoadGeneratorOptionName::UpTo => "UP TO",
+            LoadGeneratorOptionName::MaxCardinality => "MAX CARDINALITY",
+            LoadGeneratorOptionName::Keys => "KEYS",
+            LoadGeneratorOptionName::SnapshotRounds => "SNAPSHOT ROUNDS",
+            LoadGeneratorOptionName::TransactionalSnapshot => "TRANSACTIONAL SNAPSHOT",
+            LoadGeneratorOptionName::ValueSize => "VALUE SIZE",
+            LoadGeneratorOptionName::Seed => "SEED",
+            LoadGeneratorOptionName::Partitions => "PARTITIONS",
+            LoadGeneratorOptionName::BatchSize => "BATCH SIZE",
+        })
+    }
+}
+impl_display!(LoadGeneratorOptionName);
+
+impl WithOptionName for LoadGeneratorOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            LoadGeneratorOptionName::ScaleFactor
+            | LoadGeneratorOptionName::TickInterval
+            | LoadGeneratorOptionName::AsOf
+            | LoadGeneratorOptionName::UpTo
+            | LoadGeneratorOptionName::MaxCardinality
+            | LoadGeneratorOptionName::Keys
+            | LoadGeneratorOptionName::SnapshotRounds
+            | LoadGeneratorOptionName::TransactionalSnapshot
+            | LoadGeneratorOptionName::ValueSize
+            | LoadGeneratorOptionName::Partitions
+            | LoadGeneratorOptionName::BatchSize
+            | LoadGeneratorOptionName::Seed => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in a `CREATE CONNECTION...SSH`.
+pub struct LoadGeneratorOption<T: AstInfo> {
+    pub name: LoadGeneratorOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(LoadGeneratorOption);
+impl_display_t!(LoadGeneratorOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CreateSinkConnection<T: AstInfo> {
+    Kafka {
+        connection: T::ItemName,
+        options: Vec<KafkaSinkConfigOption<T>>,
+        key: Option<KafkaSinkKey>,
+        headers: Option<Ident>,
+    },
+}
+
+impl<T: AstInfo> AstDisplay for CreateSinkConnection<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            CreateSinkConnection::Kafka {
+                connection,
+                options,
                 key,
-                consistency,
+                headers,
             } => {
-                f.write_str("KAFKA BROKER '");
-                f.write_node(&display::escape_single_quote_string(broker));
-                f.write_str("'");
-                f.write_str(" TOPIC '");
-                f.write_node(&display::escape_single_quote_string(topic));
-                f.write_str("'");
+                f.write_str("KAFKA CONNECTION ");
+                f.write_node(connection);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
+                }
                 if let Some(key) = key.as_ref() {
                     f.write_node(key);
                 }
-                if let Some(consistency) = consistency.as_ref() {
-                    f.write_node(consistency);
+                if let Some(headers) = headers {
+                    f.write_str(" HEADERS ");
+                    f.write_node(headers);
                 }
             }
-            CreateSinkConnector::AvroOcf { path } => {
-                f.write_str("AVRO OCF '");
-                f.write_node(&display::escape_single_quote_string(path));
-                f.write_str("'");
-            }
         }
     }
 }
-impl_display_t!(CreateSinkConnector);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct KafkaConsistency<T: AstInfo> {
-    pub topic: String,
-    pub topic_format: Option<Format<T>>,
-}
-
-impl<T: AstInfo> AstDisplay for KafkaConsistency<T> {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str(" CONSISTENCY (TOPIC '");
-        f.write_node(&display::escape_single_quote_string(&self.topic));
-        f.write_str("'");
-
-        if let Some(format) = self.topic_format.as_ref() {
-            f.write_str(" FORMAT ");
-            f.write_node(format);
-        }
-        f.write_str(")");
-    }
-}
-impl_display_t!(KafkaConsistency);
+impl_display_t!(CreateSinkConnection);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KafkaSinkKey {
@@ -667,75 +1437,26 @@ impl AstDisplay for KafkaSinkKey {
     }
 }
 
-/// Information about upstream Postgres tables used for replication sources
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PgTable<T: AstInfo> {
-    /// The name of the table to sync
-    pub name: UnresolvedObjectName,
-    /// The name for the table in Materialize
-    pub alias: T::ObjectName,
-    /// The expected column schema of the synced table
-    pub columns: Vec<ColumnDef<T>>,
-}
-
-impl<T: AstInfo> AstDisplay for PgTable<T> {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_node(&self.name);
-        f.write_str(" AS ");
-        f.write_str(self.alias.to_ast_string());
-        if !self.columns.is_empty() {
-            f.write_str(" (");
-            f.write_node(&display::comma_separated(&self.columns));
-            f.write_str(")");
-        }
-    }
-}
-impl_display_t!(PgTable);
-
-/// The key sources specified in the S3 source's `DISCOVER OBJECTS` clause.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum S3KeySource {
-    /// `SCAN BUCKET '<bucket>'`
-    Scan { bucket: String },
-    /// `SQS NOTIFICATIONS '<queue-name>'`
-    SqsNotifications { queue: String },
-}
-
-impl AstDisplay for S3KeySource {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            S3KeySource::Scan { bucket } => {
-                f.write_str(" BUCKET SCAN '");
-                f.write_str(&display::escape_single_quote_string(bucket));
-                f.write_str("'");
-            }
-            S3KeySource::SqsNotifications { queue } => {
-                f.write_str(" SQS NOTIFICATIONS '");
-                f.write_str(&display::escape_single_quote_string(queue));
-                f.write_str("'");
-            }
-        }
-    }
-}
-impl_display!(S3KeySource);
-
 /// A table-level constraint, specified in a `CREATE TABLE` or an
 /// `ALTER TABLE ADD <constraint>` statement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TableConstraint<T: AstInfo> {
-    /// `[ CONSTRAINT <name> ] { PRIMARY KEY | UNIQUE } (<columns>)`
+    /// `[ CONSTRAINT <name> ] { PRIMARY KEY | UNIQUE (NULLS NOT DISTINCT)? } (<columns>)`
     Unique {
         name: Option<Ident>,
         columns: Vec<Ident>,
         /// Whether this is a `PRIMARY KEY` or just a `UNIQUE` constraint
         is_primary: bool,
+        // Where this constraint treats each NULL value as distinct; only available on `UNIQUE`
+        // constraints.
+        nulls_not_distinct: bool,
     },
     /// A referential integrity constraint (`[ CONSTRAINT <name> ] FOREIGN KEY (<columns>)
     /// REFERENCES <foreign_table> (<referred_columns>)`)
     ForeignKey {
         name: Option<Ident>,
         columns: Vec<Ident>,
-        foreign_table: UnresolvedObjectName,
+        foreign_table: T::ItemName,
         referred_columns: Vec<Ident>,
     },
     /// `[ CONSTRAINT <name> ] CHECK (<expr>)`
@@ -752,12 +1473,16 @@ impl<T: AstInfo> AstDisplay for TableConstraint<T> {
                 name,
                 columns,
                 is_primary,
+                nulls_not_distinct,
             } => {
                 f.write_node(&display_constraint_name(name));
                 if *is_primary {
                     f.write_str("PRIMARY KEY ");
                 } else {
                     f.write_str("UNIQUE ");
+                    if *nulls_not_distinct {
+                        f.write_str("NULLS NOT DISTINCT ");
+                    }
                 }
                 f.write_str("(");
                 f.write_node(&display::comma_separated(columns));
@@ -811,12 +1536,52 @@ impl AstDisplay for KeyConstraint {
 }
 impl_display!(KeyConstraint);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CreateSourceOptionName {
+    TimestampInterval,
+    RetainHistory,
+}
+
+impl AstDisplay for CreateSourceOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            CreateSourceOptionName::TimestampInterval => "TIMESTAMP INTERVAL",
+            CreateSourceOptionName::RetainHistory => "RETAIN HISTORY",
+        })
+    }
+}
+impl_display!(CreateSourceOptionName);
+
+impl WithOptionName for CreateSourceOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            CreateSourceOptionName::TimestampInterval | CreateSourceOptionName::RetainHistory => {
+                false
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in a `CREATE SOURCE...` statement.
+pub struct CreateSourceOption<T: AstInfo> {
+    pub name: CreateSourceOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(CreateSourceOption);
+impl_display_t!(CreateSourceOption);
+
 /// SQL column definition
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnDef<T: AstInfo> {
     pub name: Ident,
-    pub data_type: DataType<T>,
-    pub collation: Option<UnresolvedObjectName>,
+    pub data_type: T::DataType,
+    pub collation: Option<UnresolvedItemName>,
     pub options: Vec<ColumnOptionDef<T>>,
 }
 
@@ -825,6 +1590,10 @@ impl<T: AstInfo> AstDisplay for ColumnDef<T> {
         f.write_node(&self.name);
         f.write_str(" ");
         f.write_node(&self.data_type);
+        if let Some(collation) = &self.collation {
+            f.write_str(" COLLATE ");
+            f.write_node(collation);
+        }
         for option in &self.options {
             f.write_str(" ");
             f.write_node(option);
@@ -874,17 +1643,20 @@ pub enum ColumnOption<T: AstInfo> {
     /// `DEFAULT <restricted-expr>`
     Default(Expr<T>),
     /// `{ PRIMARY KEY | UNIQUE }`
-    Unique {
-        is_primary: bool,
-    },
+    Unique { is_primary: bool },
     /// A referential integrity constraint (`[FOREIGN KEY REFERENCES
     /// <foreign_table> (<referred_columns>)`).
     ForeignKey {
-        foreign_table: UnresolvedObjectName,
+        foreign_table: UnresolvedItemName,
         referred_columns: Vec<Ident>,
     },
-    // `CHECK (<expr>)`
+    /// `CHECK (<expr>)`
     Check(Expr<T>),
+    /// `VERSION <action> <version>`
+    Versioned {
+        action: ColumnVersioned,
+        version: Version,
+    },
 }
 
 impl<T: AstInfo> AstDisplay for ColumnOption<T> {
@@ -919,10 +1691,34 @@ impl<T: AstInfo> AstDisplay for ColumnOption<T> {
                 f.write_node(expr);
                 f.write_str(")");
             }
+            Versioned { action, version } => {
+                f.write_str("VERSION ");
+                f.write_node(action);
+                f.write_str(" ");
+                f.write_node(version);
+            }
         }
     }
 }
 impl_display_t!(ColumnOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ColumnVersioned {
+    Added,
+}
+
+impl AstDisplay for ColumnVersioned {
+    fn fmt<W>(&self, f: &mut AstFormatter<W>)
+    where
+        W: fmt::Write,
+    {
+        match self {
+            // TODO(alter_table): Support dropped columns.
+            ColumnVersioned::Added => f.write_str("ADDED"),
+        }
+    }
+}
+impl_display!(ColumnVersioned);
 
 fn display_constraint_name<'a>(name: &'a Option<Ident>) -> impl AstDisplay + 'a {
     struct ConstraintName<'a>(&'a Option<Ident>);

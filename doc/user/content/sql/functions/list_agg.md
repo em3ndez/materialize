@@ -1,12 +1,12 @@
 ---
-title: "list_agg Function"
+title: "list_agg function"
 description: "Concatenates input values (including nulls) into a string."
 menu:
   main:
     parent: 'sql-functions'
 ---
 
-The `list_agg(value, delimiter)` aggregate function concatenates
+The `list_agg(value)` aggregate function concatenates
 input values (including nulls) into a [`list`](/sql/types/list).
 The input values to the aggregate can be [filtered](../filters).
 
@@ -40,14 +40,14 @@ Instead, we recommend that you materialize all components required for the
 `list_agg` function call and create a non-materialized view using `list_agg`
 on top of that. That pattern is illustrated in the following statements:
 
-```sql
+```mzsql
 CREATE MATERIALIZED VIEW foo_view AS SELECT * FROM foo;
 CREATE VIEW bar AS SELECT list_agg(foo_view.bar) FROM foo_view;
 ```
 
 ## Examples
 
-```sql
+```mzsql
 SELECT
     title,
     LIST_AGG (

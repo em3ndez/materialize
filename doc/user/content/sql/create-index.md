@@ -1,103 +1,108 @@
 ---
 title: "CREATE INDEX"
-description: "`CREATE INDEX` creates an in-memory index on a source or view."
+description: "`CREATE INDEX` creates an in-memory index on a source, view, or materialized view."
 menu:
+  # This should also have a "non-content entry" under Reference, which is
+  # configured in doc/user/config.toml
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
 
-{{< warning >}} This is an advanced feature of Materialized; most users will not
-need to manually create indexes to maximize the value Materialize offers, as
-running `CREATE MATERIALIZED SOURCE` or `CREATE MATERIALIZED VIEW` automatically
-creates an index which will eagerly materialize that source or view. {{< /warning >}}
+`CREATE INDEX` creates an in-memory [index](/concepts/indexes/) on a source, view, or materialized
+view.
 
-`CREATE INDEX` creates an in-memory index on a source or view.
+In Materialize, indexes store query results in memory within a [cluster](https://materialize.com/docs/concepts/clusters/),
+and keep these results incrementally updated as new data arrives. By making
+up-to-date results available in memory, indexes can help [optimize query
+performance](https://materialize.com/docs/transform-data/optimization/),
+both when serving results and maintaining resource-heavy operations like joins.
 
-- For materialized views, this creates additional indexes.
-- For non-materialized views, it converts them into materialized views.
+### Usage patterns
 
-## Conceptual framework
+#### Indexes on views vs. materialized views
 
-Indexes assemble and maintain in memory a query's results, which can
-provide future queries the data they need pre-arranged in a format they can immediately use.
-In particular, this can be very helpful for the [`JOIN`](../join) operator which needs
-to build and maintain the appropriate indexes if they do not otherwise exist.
-For more information, see [API Components: Indexes](/overview/api-components#indexes).
+{{% views-indexes/table-usage-pattern-intro %}}
+{{% views-indexes/table-usage-pattern %}}
 
-### When to create indexes
+#### Indexes and query optimizations
 
 You might want to create indexes when...
 
-- You want to use non-primary keys (e.g. foreign keys) as a join condition.
-  In this case, you could create an index on the columns in the join condition.
-- You want to convert a non-materialized view or source to a materialized view or source.
+-   You want to use non-primary keys (e.g. foreign keys) as a join condition. In
+    this case, you could create an index on the columns in the join condition.
+-   You want to speed up searches filtering by literal values or expressions.
+
+{{% views-indexes/index-query-optimization-specific-instances %}}
+
+#### Best practices
+
+{{% views-indexes/index-best-practices %}}
 
 ## Syntax
 
 {{< diagram "create-index.svg" >}}
 
+### `with_options`
+
+{{< diagram "with-options-retain-history.svg" >}}
+
 Field | Use
 ------|-----
-**DEFAULT** | Creates a default index with the same structure as the index automatically created with [**CREATE MATERIALIZED VIEW**](/sql/create-materialized-view) or [**CREATE MATERIALIZED SOURCE**](/sql/create-source). This provides a simple method to convert a non-materialized object to a materialized one.
+**DEFAULT** | Creates a default index using a set of columns that uniquely identify each row. If this set of columns can't be inferred, all columns are used.
 _index&lowbar;name_ | A name for the index.
-_obj&lowbar;name_ | The name of the source or view on which you want to create an index.
-_col&lowbar;ref_**...** | The columns to use as the key into the index.
-_field_ | The name of an index parameter to set to _val_. See [`ALTER INDEX`](/sql/alter-index) for available parameters.
-
-{{< version-changed v0.7.1 >}}
-The `WITH (field = val, ...)` clause was added to allow setting index parameters
-when creating the index.
-{{</ version-changed >}}
+_obj&lowbar;name_ | The name of the source, view, or materialized view on which you want to create an index.
+_cluster_name_ | The [cluster](/sql/create-cluster) to maintain this index. If not specified, defaults to the active cluster.
+_method_ | The name of the index method to use. The only supported method is [`arrangement`](/overview/arrangements).
+_col&lowbar;expr_**...** | The expressions to use as the key for the index.
+_retention_period_ | ***Private preview.** This option has known performance or stability issues and is under active development.* <br>Duration for which Materialize retains historical data, which is useful to implement [durable subscriptions](/transform-data/patterns/durable-subscriptions/#history-retention-period). **Note:** Configuring indexes to retain history is not recommended. As an alternative, consider creating a materialized view for your subscription query and configuring the history retention period on the view instead. See [durable subscriptions](/transform-data/patterns/durable-subscriptions/#history-retention-period). <br>Accepts positive [interval](/sql/types/interval/) values (e.g. `'1hr'`). <br>Default: `1s`.
 
 ## Details
 
 ### Restrictions
 
-- You can only index some subset of columns from the view's embedded `SELECT`
-  statement's returned columns. For example, if your view embedded `SELECT a, b,
-  c...`, you can only index `{a, b, c}`, even if the source you're reading from
-  contains additional columns.
+-   You can only reference the columns available in the `SELECT` list of the query
+    that defines the view. For example, if your view was defined as `SELECT a, b FROM src`, you can only reference columns `a` and `b`, even if `src` contains
+    additional columns.
 
-- You cannot exclude any columns from being in the index's "value" set. For
-  example, if your view embedded `SELECT a, b, c...`, all indexes will contain
-  `{a, b, c}` as their values.
+-   You cannot exclude any columns from being in the index's "value" set. For
+    example, if your view is defined as `SELECT a, b FROM ...`, all indexes will
+    contain `{a, b}` as their values.
 
     If you want to create an index that only stores a subset of these columns,
-    consider creating another materialized view that uses `SELECT some_subset
-    FROM this_view...`.
+    consider creating another materialized view that uses `SELECT some_subset FROM this_view...`.
 
 ### Structure
 
-Indexes in Materialize have the following structure for each unique row.
+Indexes in Materialize have the following structure for each unique row:
 
 ```nofmt
-((tuple of indexed columns), (tuple of the row, i.e. stored columns))
+((tuple of indexed expressions), (tuple of the row, i.e. stored columns))
 ```
 
-#### Indexed columns vs. stored columns
+#### Indexed expressions vs. stored columns
 
-Automatically created indexes will use all columns as key columns for the index,
-unless Materialize is provided or can infer a unique key for the source or view.
+Automatically created indexes will use all columns as key expressions for the
+index, unless Materialize is provided or can infer a unique key for the source
+or view.
 
 For instance, unique keys can be...
 
-- **Provided** by the schema provided for the source, e.g. through the Confluent
-  Schema Registry.
-- **Inferred** when the query...
-  - Concludes with a `GROUP BY`.
-  - Uses sources or views that have a unique key without damaging this property.
-    For example, joining a view with unique keys against a second, where the join
-    constraint uses foreign keys.
+-   **Provided** by the schema provided for the source, e.g. through the Confluent
+    Schema Registry.
+-   **Inferred** when the query...
+    -   Concludes with a `GROUP BY`.
+    -   Uses sources or views that have a unique key without damaging this property.
+        For example, joining a view with unique keys against a second, where the join
+        constraint uses foreign keys.
 
-When creating your own indexes, you can choose the indexed columns.
+When creating your own indexes, you can choose the indexed expressions.
 
 ### Memory footprint
 
 The in-memory sizes of indexes are proportional to the current size of the source
 or view they represent. The actual amount of memory required depends on several
 details related to the rate of compaction and the representation of the types of
-data in the source or view. We are working on [a feature to let you see the size
-each index consumes](https://github.com/MaterializeInc/materialize/issues/1532).
+data in the source or view.
 
 Creating an index may also force the first materialization of a view, which may
 cause Materialize to install a dataflow to determine and maintain the results of
@@ -108,10 +113,10 @@ of the index.
 
 ### Optimizing joins with indexes
 
-We can optimize the performance of `JOIN` on two relations by ensuring their
+You can optimize the performance of `JOIN` on two relations by ensuring their
 join keys are the key columns in an index.
 
-```sql
+```mzsql
 CREATE MATERIALIZED VIEW active_customers AS
     SELECT guid, geo_id, last_active_on
     FROM customer_source
@@ -128,37 +133,57 @@ CREATE MATERIALIZED VIEW active_customer_per_geo AS
 
 In the above example, the index `active_customers_geo_idx`...
 
-- Helps us because it contains a key that the view `active_customer_per_geo` can
-  use to look up values for the join condition (`active_customers.geo_id`).
+-   Helps us because it contains a key that the view `active_customer_per_geo` can
+    use to look up values for the join condition (`active_customers.geo_id`).
 
     Because this index is exactly what the query requires, the Materialize
     optimizer will choose to use `active_customers_geo_idx` rather than build
     and maintain a private copy of the index just for this query.
 
-- Obeys our restrictions by containing only a subset of columns in the result
-  set.
+-   Obeys our restrictions by containing only a subset of columns in the result
+    set.
 
-### Materializing views
+### Speed up filtering with indexes
 
-You can convert a non-materialized view into a materialized view by adding an
-index to it.
+If you commonly filter by a certain column being equal to a literal value, you can set up an index over that column to speed up your queries:
 
-```sql
-CREATE VIEW active_customers AS
+```mzsql
+CREATE MATERIALIZED VIEW active_customers AS
     SELECT guid, geo_id, last_active_on
     FROM customer_source
-    WHERE last_active_on > now() - INTERVAL '30' DAYS;
+    GROUP BY geo_id;
 
-CREATE INDEX active_customers_primary_idx ON active_customers (guid);
+CREATE INDEX active_customers_idx ON active_customers (guid);
+
+-- This should now be very fast!
+SELECT * FROM active_customers WHERE guid = 'd868a5bf-2430-461d-a665-40418b1125e7';
+
+-- Using indexed expressions:
+CREATE INDEX active_customers_exp_idx ON active_customers (upper(guid));
+SELECT * FROM active_customers WHERE upper(guid) = 'D868A5BF-2430-461D-A665-40418B1125E7';
+
+-- Filter using an expression in one field and a literal in another field:
+CREATE INDEX active_customers_exp_field_idx ON active_customers (upper(guid), geo_id);
+SELECT * FROM active_customers WHERE upper(guid) = 'D868A5BF-2430-461D-A665-40418B1125E7' and geo_id = 'ID_8482';
 ```
 
-Note that this index is different than the primary index that Materialize would
-automatically create if you had used `CREATE MATERIALIZED VIEW`. Indexes that
-are automatically created contain an index of all columns in the result set,
-unless they contain a unique key. (Remember that indexes store a copy of a
-row's indexed columns _and_ a copy of the entire row.)
+Create an index with an expression to improve query performance over a frequently used expression, and
+avoid building downstream views to apply the function like the one used in the example: `upper()`.
+Take into account that aggregations like `count()` cannot be used as indexed expressions.
+
+For more details on using indexes to optimize queries, see [Optimization](../../ops/optimization/).
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of `obj_name`.
+- `CREATE` privileges on the containing schema.
+- `CREATE` privileges on the containing cluster.
+- `USAGE` privileges on all types used in the index definition.
+- `USAGE` privileges on the schemas that all types in the statement are contained in.
 
 ## Related pages
 
-- [`SHOW INDEX`](../show-index)
-- [`DROP INDEX`](../drop-index)
+-   [`SHOW INDEXES`](../show-indexes)
+-   [`DROP INDEX`](../drop-index)

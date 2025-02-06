@@ -102,7 +102,7 @@ pub struct QueryOutput<'a> {
     pub types: Vec<Type>,
     pub sort: Sort,
     pub label: Option<&'a str>,
-    pub column_names: Option<Vec<repr::ColumnName>>,
+    pub column_names: Option<Vec<mz_repr::ColumnName>>,
     pub mode: Mode,
     pub output: Output,
     pub output_str: &'a str,
@@ -128,6 +128,7 @@ pub enum Record<'a> {
     Simple {
         location: Location,
         conn: Option<&'a str>,
+        user: Option<&'a str>,
         sql: &'a str,
         output: Output,
         output_str: &'a str,
@@ -136,6 +137,13 @@ pub enum Record<'a> {
     HashThreshold { threshold: u64 },
     /// A `halt` directive.
     Halt,
+    /// A `copy` directive.
+    Copy {
+        table_name: &'a str,
+        tsv_path: &'a str,
+    },
+    /// A `reset-server` directive
+    ResetServer,
 }
 
 /// Specifies the dialect of a sqllogictest file. Different sqllogictest runners

@@ -1,0 +1,289 @@
+Manually parsing JSON-formatted data in SQL can be tedious. 🫠 You can use the
+widget below to <b>automatically</b> turn a sample JSON payload into a parsing
+view with the individual fields mapped to columns.
+
+<div class="json_widget">
+    <div class="json">
+        <textarea title="JSON sample" id="json_sample" placeholder="JSON sample">
+            { "payload": "materialize", "event": { "kind": 1, "success": true, "createdAt": "2023-02-01T17:00:00.000Z" }, "ts": "2023-02-01T17:00:00.000Z" }
+        </textarea>
+        <div id="error_span" class="error">
+            <p id="error_text"></p>
+        </div>
+    </div>
+    <span class="input_container">
+        <span class="input_container-text">
+            <input title="View Name" id="view_name" placeholder="View Name" value="my_view">
+            <input title="Relation Name" id="source_name" placeholder="Relation Name" value="my_source">
+            <input title="JSON Column Name" id="column_name" placeholder="JSON Column Name" value="json_column">
+        </span>
+    <fieldset title="Target object type" class="input_container-radio">
+        <legend>Target object type</legend>
+        <span>
+            <input type="radio" id="view" name="type_view" value="view" checked/>
+            <label for="view">View</label>
+        </span>
+        <span>
+            <input type="radio" id="materialized-view" name="type_view" value="materialized-view"/>
+            <label for="materialized-view">Materialized view</label>
+        </span>
+    </fieldset>
+    </span>
+    <pre title="Generated SQL" class="sql_output chroma"><code id="output" class="sql_output-code language-sql" data-lang="sql"></code></pre>
+</div>
+
+<script>
+
+/* Helper Methods */
+
+function escapeString(s) {
+    return s.replace(/'/g, `''`);
+}
+
+function escapeIdent(s) {
+    return `"${s.replace(/"/g, `""`)}"`;
+}
+
+function replaceSpecialChar(s) {
+    return s.replace(/[^a-zA-Z0-9 _]/g, "_")
+}
+
+function isDate(value) {
+    var dateParsed = new Date(Date.parse(value));
+    if (isNaN(dateParsed.getTime())) {
+        return false;
+    }
+    var isoString = dateParsed.toISOString();
+    return isoString === value;
+}
+
+/* JSON Parsing and SQL conversion */
+
+const errorSpan = document.getElementById("error_span");
+const errorText = document.getElementById("error_text");
+
+const jsonInput = document.getElementById("json_sample");
+const sqlOutput = document.getElementById("output");
+
+/// Flattens a JSON objects into a list of fields, and their chain of parents.
+function handleJson(source, sample, columnName) {
+    if (!columnName) {
+        columnName = "body"
+    }
+
+    let selectItems = [];
+    const jsonObject = JSON.parse(sample);
+
+    // Format the JSON for the user.
+    const prettyJson = JSON.stringify(jsonObject, null, 2);
+    jsonInput.value = prettyJson;
+
+    expandObject(jsonObject, [columnName], selectItems);
+
+    return selectItems;
+}
+
+/// Recursively iterates through the provided object, tracking the chain
+/// of parent fields for later use in naming and desctructuring.
+function expandObject(object, parents, columns) {
+    if (Array.isArray(object)) {
+        handleArray(object, parents, columns);
+    } else if (isObject(object)) {
+        handleObject(object, parents, columns);
+    } else {
+        handlePrimitive(object, parents, columns);
+    }
+}
+
+/// Handles arrays within the JSON structure, including empty arrays.
+function handleArray(array, parents, columns) {
+    if (array.length === 0) {
+        // Specifically handles empty arrays to add placeholder values rather than skipping them.
+        handleEmptyArray(parents, columns);
+    } else {
+        // For non-empty arrays, iterate over each item, expanding it.
+        array.forEach((item, index) => {
+            const newParents = parents.concat(index.toString());
+            expandObject(item, newParents, columns);
+        });
+    }
+}
+
+/// Handles objects by iterating over each property and recursively expanding it.
+function handleObject(obj, parents, columns) {
+    Object.entries(obj).forEach(([key, value]) => {
+        const newParents = parents.concat(key);
+        expandObject(value, newParents, columns);
+    });
+}
+
+// Handles primitive values by determining their SQL data type and adding them to the columns list.
+function handlePrimitive(value, parents, columns) {
+    // Determine the appropriate SQL cast and function wrapper for the value.
+    const { cast, wrapping_function, isNull } = determineCast(value);
+    // Uses the last part of the path as the column name.
+    const columnName = parents.slice(-1)[0];
+    // Generate an alias for the column based on its path, excluding the root.
+    const columnAlias = parents.slice(1).join("_");
+    // Add the column definition to the list of columns.
+    columns.push([columnName, wrapping_function, cast, parents, isNull, value]);
+}
+
+/// Handles the specific case of an empty array by adding a placeholder column definition.
+function handleEmptyArray(parents, columns) {
+    // Generates a column name and alias based on the path to the empty array.
+    const columnName = parents.join("_");
+    const columnAlias = parents.slice(1).join("_");
+    // Adds a placeholder column for the empty array.
+    columns.push([columnAlias, "", "text", parents, true, "''"]);
+}
+
+/// Utility function to check if a given value is an object.
+function isObject(value) {
+    // Returns true if the value is an object and not null.
+    return typeof value === 'object' && value !== null;
+}
+
+function formSql(selectItems, viewName, sourceName, objectType, columnName) {
+    if (!viewName) {
+        viewName = "my_view";
+    }
+    if (!sourceName) {
+        sourceName = "my_source";
+    }
+
+    let type = "VIEW";
+    if (objectType === "materialized-view") {
+        type = "MATERIALIZED VIEW";
+    }
+
+    // Map all of our field into a column reference and alias.
+    const rawSqlParts = selectItems.map(([name, wrapping_function, cast, parents, isNull, value]) => {
+        let path = columnName || "body";
+
+        // Iterate over parents to build the path, skipping the columnName/base if it's included
+        parents.slice(columnName ? 1 : 0, parents.length - 1).forEach(parent => {
+            path += isNaN(parent) ? `->'${parent}'` : `->${parent}`;
+        });
+
+        // Determine the final part of the path
+        let finalPart = path + (isNaN(name) ? `->>'${name}'` : `->${name}`);
+
+        // Wrap the final part in parentheses if casting is applied
+        let sqlItem = cast ? `(${finalPart})::${cast}` : finalPart;
+        if (wrapping_function) {
+            sqlItem = `${wrapping_function}(${sqlItem})`;
+        }
+
+        // Construct column alias without redundant name appending
+        let columnAliasParts = parents.slice(columnName ? 1 : 0);
+        let columnAlias = replaceSpecialChar(columnAliasParts.join("_"));
+
+        return [sqlItem, columnAlias];
+    });
+
+    // De-dupe column aliases by optionally appending a suffix.
+    const nextSuffixes = new Map();
+    const sqlParts = rawSqlParts.map(([sqlItem, columnAlias]) => {
+        const suffix = nextSuffixes.get(columnAlias);
+
+        // If we haven't seen this column alias before, no need to add a suffix.
+        if (suffix === undefined) {
+            nextSuffixes.set(columnAlias, 1);
+        } else {
+            nextSuffixes.set(columnAlias, suffix + 1);
+            columnAlias = `${columnAlias}${suffix}`;
+        }
+
+        return `${sqlItem} AS ${columnAlias}`;
+    })
+    .join(",\n    ");
+
+    return `CREATE ${type} ${viewName} AS SELECT\n    ${sqlParts}\nFROM ${sourceName};`;
+}
+
+/// Helper to determine cast and wrapping function based on value type
+function determineCast(value) {
+    let cast = "";
+    let wrapping_function = "";
+    let isNull = value === null;
+
+    if (!isNull) {
+        if (typeof value === "boolean") {
+            cast = "bool";
+        } else if (typeof value === "number") {
+            cast = "numeric";
+        } else if (typeof value === "string") {
+            if (isDate(value)) {
+                // If the string is a valid ISO8601 date, cast it to a timestamp
+                // TODO: This could be improved to handle other date formats
+                wrapping_function = "try_parse_monotonic_iso8601_timestamp";
+            }
+        }
+    }
+    return { cast, wrapping_function, isNull };
+}
+
+function errorClear() {
+    errorSpan.className = 'error error-hidden';
+}
+
+function errorSet(e) {
+    errorText.textContent = e.message;
+    errorSpan.className = 'error error-visible';
+}
+
+function sqlSet(sql) {
+    sqlOutput.textContent = sql.trim();
+}
+
+function sqlClear() {
+    sqlOutput.textContent = "";
+}
+
+
+function render() {
+    errorClear();
+    sqlClear();
+
+    const viewName = document.getElementById("view_name").value;
+    const sourceName = document.getElementById("source_name").value;
+    const columnName = document.getElementById("column_name").value;
+    const objectType = document.querySelector("input[name='type_view']:checked").value;
+
+    const jsonSample = jsonInput.value;
+
+    try {
+        const items = handleJson(sourceName, jsonSample, columnName);
+        const sql = formSql(items, viewName, sourceName, objectType, columnName);
+        sqlSet(sql);
+        errorClear();
+    } catch (e) {
+        if (jsonSample) {
+            console.error(e);
+            errorSet(e);
+        } else {
+            errorClear();
+        }
+    }
+}
+
+render();
+
+// Event listeners for input and change events
+document.getElementById("view_name").addEventListener("input", render);
+document.getElementById("source_name").addEventListener("input", render);
+document.getElementById("column_name").addEventListener("input", render);
+document.querySelectorAll("input[name='type_view']").forEach(element => {
+    element.addEventListener("change", render);
+});
+
+let debounceTimer;
+document.getElementById("json_sample").addEventListener("input", function(event) {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        render();
+    }, 600);
+});
+
+</script>

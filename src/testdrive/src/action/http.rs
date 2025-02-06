@@ -7,61 +7,49 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use async_trait::async_trait;
-use ore::result::ResultExt;
+use anyhow::bail;
+use mz_ore::collections::HashSet;
+use reqwest::header::CONTENT_TYPE;
+use reqwest::Method;
 
-use crate::action::{Action, State};
+use crate::action::{ControlFlow, State};
 use crate::parser::BuiltinCommand;
 
-use reqwest::header::CONTENT_TYPE;
+pub async fn run_request(
+    mut cmd: BuiltinCommand,
+    _: &mut State,
+) -> Result<ControlFlow, anyhow::Error> {
+    let url = cmd.args.string("url")?;
+    let method: Method = cmd.args.parse("method")?;
+    let content_type = cmd.args.opt_string("content-type");
+    let further_accepted_status_codes = match cmd.args.opt_string("accept-additional-status-codes")
+    {
+        Some(s) => s
+            .split(',')
+            .map(|s| s.parse::<u16>().unwrap())
+            .collect::<HashSet<u16>>(),
+        None => HashSet::new(),
+    };
+    let body = cmd.input.join("\n");
 
-pub struct RequestAction {
-    url: String,
-    method: String,
-    content_type: Option<String>,
-    body: String,
-}
+    println!("$ http-request {} {}\n{}", method, url, body);
 
-pub fn build_request(mut cmd: BuiltinCommand) -> Result<RequestAction, String> {
-    Ok(RequestAction {
-        url: cmd.args.string("url")?,
-        method: cmd.args.string("method")?.to_ascii_uppercase(),
-        content_type: cmd.args.opt_parse("content-type")?,
-        body: cmd.input.join("\n"),
-    })
-}
+    let client = reqwest::Client::new();
 
-#[async_trait]
-impl Action for RequestAction {
-    async fn undo(&self, _: &mut State) -> Result<(), String> {
-        Ok(())
+    let mut request = client.request(method, &url).body(body);
+
+    if let Some(value) = &content_type {
+        request = request.header(CONTENT_TYPE, value);
     }
 
-    async fn redo(&self, _: &mut State) -> Result<(), String> {
-        println!("$ http-request {} {}\n{}", self.method, self.url, self.body);
+    let response = request.send().await?;
+    let status = response.status();
 
-        let client = reqwest::Client::new();
+    println!("{}\n{}", status, response.text().await?);
 
-        let method = self
-            .method
-            .parse()
-            .or_else(|_| Err(format!("Unknown http method type: {}", self.method)))?;
-
-        let mut request = client.request(method, &self.url).body(self.body.clone());
-
-        if let Some(value) = &self.content_type {
-            request = request.header(CONTENT_TYPE, value);
-        }
-
-        let response = request.send().await.map_err_to_string()?;
-        let status = response.status();
-
-        println!("{}\n{}", status, response.text().await.map_err_to_string()?);
-
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(format!("http-request returned code: {}", status))
-        }
+    if status.is_success() || further_accepted_status_codes.contains(&status.as_u16()) {
+        Ok(ControlFlow::Continue)
+    } else {
+        bail!("http request returned failing status: {}", status)
     }
 }

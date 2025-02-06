@@ -3,29 +3,30 @@
     <thead>
       <th>Version</th>
       <th>Release date</th>
-      <th>Binary tarball links</th>
-      <th>Supported</th>
+      <th>Details</th>
     </thead>
 
     <tbody>
-      {{range $i, $version := .Site.Params.Versions}}
+      {{range $i, $page := .Page.Pages.ByDate.Reverse }}
         <tr>
           <td>
-            <strong><a href="../release-notes/#{{$version.name}}">{{$version.name}}</a></strong>
-          </td>
-          <td>{{$version.date}}</td>
-          <td>
-            {{range $j, $target := $version.targets}}
-              {{if gt $j 0}}/{{end}}
-              <a href="https://binaries.materialize.com/materialized-{{$version.name}}-{{$target}}.tar.gz">
-                {{if eq $target "x86_64-unknown-linux-gnu"}}Linux Intel{{end}}
-                {{if eq $target "aarch64-unknown-linux-gnu"}}Linux ARM{{end}}
-                {{if eq $target "x86_64-apple-darwin"}}macOS Intel{{end}}
-                {{if eq $target "aarch64-apple-darwin"}}macOS ARM{{end}}
-              </a>
+            {{if $page.RelPermalink}}
+              <a href="{{.Page.RelPermalink}}">{{$page.File.ContentBaseName}}</a>
+            {{else}}
+            {{$page.File.ContentBaseName}}
             {{end}}
           </td>
-          <td><span class="symbol">{{if lt $i 2}}✓{{end}}</span></td>
+          <td>
+            {{$page.Date.Format "January 2, 2006"}}
+          </td>
+          <td>
+            {{if not $page.Params.released}}
+              <em>Not yet released.</em>
+            {{else if not $page.RelPermalink}}
+              See the <a href="https://materialize.com/changelog">Changelog</a> for any significant user-facing changes.
+            {{end}}
+          </td>
+        </tr>
       {{end}}
     </tbody>
   </table>

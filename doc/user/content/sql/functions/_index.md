@@ -1,30 +1,59 @@
 ---
-title: "Functions + Operators"
-description: "Find all of the great SQL functions you know and love..."
+title: "SQL functions & operators"
+description: "Learn more about the SQL functions and operators supported in Materialize"
 menu:
   main:
     identifier: sql-functions
-    parent: sql
-    weight: 20
+    parent: reference
+    weight: 100
 disable_list: true
-disable_toc: true
 ---
 
 This page details Materialize's supported SQL [functions](#functions) and [operators](#operators).
 
 ## Functions
 
-{{< fnlist >}}
+### Unmaterializable functions
+
+Several functions in Materialize are **unmaterializable** because their output
+depends upon state besides their input parameters, like the value of a session
+parameter or the timestamp of the current transaction. You cannot create an
+[index](/sql/create-index) or materialized view that depends on an
+unmaterializable function, but you can use them in non-materialized views and
+one-off [`SELECT`](/sql/select) statements.
+
+Unmaterializable functions are marked as such in the table below.
+
+### Side-effecting functions
+
+Several functions in Materialize are **side-effecting** because their evaluation
+changes system state. For example, the `pg_cancel_backend` function allows
+canceling a query running on another connection.
+
+Materialize offers only limited support for these functions. They may be called
+only at the top level of a `SELECT` statement, like so:
+
+```mzsql
+SELECT side_effecting_function(arg, ...);
+```
+
+You cannot manipulate or alias the function call expression, call multiple
+side-effecting functions in the same `SELECT` statement, nor add any additional
+clauses to the `SELECT` statement (e.g., `FROM`, `WHERE`).
+
+Side-effecting functions are marked as such in the table below.
+
+{{% fnlist %}}
 
 ## Operators
 
-### Generic
+### Generic operators
 
 Operator | Computes
 ---------|---------
 `val::type` | Cast of `val` as `type` ([docs](cast))
 
-### Boolean
+### Boolean operators
 
 Operator | Computes
 ---------|---------
@@ -48,10 +77,10 @@ Operator | Computes
 `a IS NOT FALSE` | `a` is not false, requiring `a` to be a boolean
 `a IS UNKNOWN` | `a = NULL`, requiring `a` to be a boolean
 `a IS NOT UNKNOWN` | `a != NULL`, requiring `a` to be a boolean
-`a LIKE match_expr` | `a` matches `match_expr`, using [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
-`a ILIKE match_expr` | `a` matches `match_expr`, using case-insensitive [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
+`a LIKE match_expr [ ESCAPE escape_char ]` | `a` matches `match_expr`, using [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
+`a ILIKE match_expr [ ESCAPE escape_char ]` | `a` matches `match_expr`, using case-insensitive [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
 
-### Numbers
+### Numbers operators
 
 Operator | Computes
 ---------|---------
@@ -61,21 +90,25 @@ Operator | Computes
 `/` | Division
 `%` | Modulo
 `&` | Bitwise AND
-`|` | Bitwise OR
+<code>&vert;</code> | Bitwise OR
 `#` | Bitwise XOR
 `~` | Bitwise NOT
 `<<`| Bitwise left shift
 `>>`| Bitwise right shift
 
-### String
+### String operators
 
 Operator | Computes
 ---------|---------
 <code>&vert;&vert;</code> | Concatenation
+`~~` | Matches LIKE pattern case sensitively, see [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
+`~~*` | Matches LIKE pattern case insensitively (ILIKE), see [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
+`!~~` | Matches NOT LIKE pattern (case sensitive), see [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
+`!~~*` | Matches NOT ILIKE pattern (case insensitive), see [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
 `~` | Matches regular expression, case sensitive
 `~*` | Matches regular expression, case insensitive
-`!~` | Does not match regular expression, case insensitive
-`!~*` | Does not match regular expression, case insensitive
+`!~` | Matches regular expression case sensitively, and inverts the match
+`!~*` | Match regular expression case insensitively, and inverts the match
 
 The regular expression syntax supported by Materialize is documented by the
 [Rust `regex` crate](https://docs.rs/regex/*/#syntax).
@@ -85,7 +118,7 @@ Materialize regular expressions are similar to, but not identical to, PostgreSQL
 regular expressions.
 {{< /warning >}}
 
-### Time-like
+### Time-like operators
 
 Operation | Computes
 ----------|------------
@@ -100,15 +133,15 @@ Operation | Computes
 [`time`](../types/time) `-` [`interval`](../types/interval) | `time`
 [`time`](../types/time) `-` [`time`](../types/time) | [`interval`](../types/interval)
 
-### JSON
+### JSON operators
 
 {{% json-operators %}}
 
-### Map
+### Map operators
 
 {{% map-operators %}}
 
-### List
+### List operators
 
 List operators are [polymorphic](../types/list/#polymorphism).
 

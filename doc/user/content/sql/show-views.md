@@ -1,90 +1,51 @@
 ---
 title: "SHOW VIEWS"
-description: "`SHOW VIEWS` returns a list of views in your Materialize instances."
+description: "`SHOW VIEWS` returns a list of views in Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 ---
 
-`SHOW VIEWS` returns a list of views in your Materialize instances.
+`SHOW VIEWS` returns a list of views in Materialize.
 
 ## Syntax
 
-{{< diagram "show-views.svg" >}}
+```mzsql
+SHOW VIEWS [FROM <schema_name>]
+```
 
-Field | Use
-------|-----
-_schema&lowbar;name_ | The schema to show views from. Defaults to `public` in the current database. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
-**MATERIALIZED** | Only return materialized views, i.e. those with [indexes](../create-index). Without specifying this option, this command returns all views, including non-materialized views.
-**FULL** | Return details about your views.
+Option                  | Description
+------------------------|------------
+**FROM** <schema_name>  | If specified, only show views from the specified schema. Defaults to first resolvable schema in the search path. For available schemas, see [`SHOW SCHEMAS`](../show-schemas).
 
 ## Details
 
-### Output format for `SHOW FULL VIEWS`
+### Output format for `SHOW VIEWS`
 
-`SHOW FULL VIEWS`'s output is a table, with this structure:
+`SHOW VIEWS`'s output is a table, with this structure:
 
 ```nofmt
- name  | type | materialized | volatility
--------+------+--------------+-----------
- ...   | ...  | ...          | ...
+ name
+-------
+ ...
 ```
 
 Field | Meaning
 ------|--------
-**name** | The name of the view
-**type** | Whether the view was created by the `user` or the `system`
-**materialized** | Does the view have an in-memory index? For more details, see [`CREATE INDEX`](../create-index)
-**volatility** | Whether the view is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
-
-{{< version-changed v0.5.0 >}}
-The `Name`, `Type`, and `Materialized` columns are renamed to lowercase, i.e.,
-`name`, `type`, and `materialized`, respectively.
-{{< /version-changed >}}
-
-{{< version-added v0.7.2 >}}
-The `volatile` column.
-{{< /version-added >}}
+**name** | The name of the view.
 
 ## Examples
 
-### Default behavior
-
-```sql
+```mzsql
 SHOW VIEWS;
 ```
 ```nofmt
-         name
--------------------------
- my_nonmaterialized_view
- my_materialized_view
-```
-
-### Only show materialized views
-
-```sql
-SHOW MATERIALIZED VIEWS;
-```
-```nofmt
-        name
-----------------------
- my_materialized_view
-```
-
-### Show details about views
-
-```sql
-SHOW FULL VIEWS
-```
-```nofmt
-          name           | type | materialized
--------------------------+------+--------------
- my_nonmaterialized_view | user | f
- my_materialized_view    | user | t
+  name
+---------
+ my_view
 ```
 
 ## Related pages
 
 - [`SHOW CREATE VIEW`](../show-create-view)
-- [`SHOW INDEX`](../show-index)
 - [`CREATE VIEW`](../create-view)

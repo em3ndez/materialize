@@ -7,12 +7,10 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-#![warn(missing_docs)]
-
 //! Utilities for working with Kafka.
 
-mod addr;
+#![warn(missing_docs)]
 
 pub mod admin;
-
-pub use addr::{KafkaAddrs, KafkaAddrsParseError};
+pub mod aws;
+pub mod client;

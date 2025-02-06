@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-arg-default single-replica-cluster=quickstart
+
 #
 # Make sure that compatible writer and reader enums work
 #
@@ -16,25 +18,35 @@ $ set enum-writer={"type": "record", "name": "schema_enum", "fields": [ {"name":
 
 $ kafka-create-topic topic=resolution-enums
 
-$ kafka-ingest format=avro topic=resolution-enums schema=${enum-reader} publish=true timestamp=1
+$ kafka-ingest format=avro topic=resolution-enums schema=${enum-reader} timestamp=1
 {"f1": "E1" }
 
-> CREATE MATERIALIZED SOURCE resolution_enums
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-resolution-enums-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+> CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
+    URL '${testdrive.schema-registry-url}'
+  );
+
+> CREATE CONNECTION kafka_conn
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+> CREATE SOURCE resolution_enums
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-resolution-enums-${testdrive.seed}')
+
+> CREATE TABLE resolution_enums_tbl FROM SOURCE resolution_enums (REFERENCE "testdrive-resolution-enums-${testdrive.seed}")
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE NONE
 
 # E5 will be recorded as E_DEFAULT
-$ kafka-ingest format=avro topic=resolution-enums schema=${enum-writer} publish=true timestamp=2
+$ kafka-ingest format=avro topic=resolution-enums schema=${enum-writer} timestamp=2
 {"f1": "E5" }
 
-$ kafka-ingest format=avro topic=resolution-enums schema=${enum-reader} publish=true timestamp=1
+$ kafka-ingest format=avro topic=resolution-enums schema=${enum-reader} timestamp=1
 {"f1": "E1" }
 
-> SHOW COLUMNS FROM resolution_enums
-f1 false text
+> SHOW COLUMNS FROM resolution_enums_tbl
+f1 false text ""
 
-> SELECT f1 FROM resolution_enums
+> SELECT f1 FROM resolution_enums_tbl
 E1
 E1
 E_DEFAULT

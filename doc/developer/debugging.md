@@ -107,7 +107,7 @@ We are finally ready to start debugging!
 ### Using rust-{gdb,lldb}
 
 First, we need to see what binaries need to be debugged. Adding `-v` to Cargo
-commands should give the neccessary info. After running for example
+commands should give the necessary info. After running for example
 `cargo test -v`
 
 ```shell
@@ -151,10 +151,54 @@ commands from one debugger to another. At this point, we are free to do all
 sorts of things with our debugger - set breakpoints, inspect memory, and step
 through code execution to name just a few examples.
 
+### Debugging forked child processes with gdb
+GDB does not automatically attach to forked child processes, which can make
+debugging Materialize more difficult. In order to attach to child processes
+you first need to tell GDB to attach to both processes on fork:
+```gdb
+(gdb) set detach-on-fork off
+```
+Then you need to tell GDB to follow the child process on fork:
+```gdb
+(gdb) set follow-fork-mode child
+```
+These commands can be saved in a [`.gdbinit`](https://sourceware.org/gdb/onlinedocs/gdb.html#Initialization-Files)
+file for convenience.
+
+When a child process exits, you will need to manually switch back to the parent
+process to resume execution. You should see an output that looks like this:
+```gdb
+[Inferior 3 (process 615551) exited with code 01]
+```
+Inferior number and process number will likely be different. GDB calls any
+program it executes an inferior.
+
+To see all the current inferiors, run:
+```gdb
+(gdb) info inferiors
+  Num  Description       Executable
+  1    process 615534    /home/user/materialize/target/debug/materialized
+  2    process 615550    /usr/bin/python3.8
+* 3    <null>            /usr/bin/dpkg-query
+```
+Your output will likely vary, but the current dead process will be prefixed with `*` and have a description of `<null>`.
+
+To continue debugging you will need to switch to the parent process and continue execution:
+```gdb
+(gdb) inferior 2
+[Switching to inferior 2 [process 615550] (/usr/bin/python3.8)]
+[Switching to thread 2.1 (Thread 0x7ffff7bf2740 (LWP 615550))]
+#0  arch_fork (ctid=0x7ffff7bf2a10) at ../sysdeps/unix/sysv/linux/arch-fork.h:49
+49      ../sysdeps/unix/sysv/linux/arch-fork.h: No such file or directory.
+(gdb) continue
+Continuing.
+```
+Again, your inferior number and output will likely be different.
+
 ### Further information
 
 The rustc
-[guide](https://rust-lang.github.io/rustc-guide/debugging-support-in-rustc.html)
+[guide](https://rustc-dev-guide.rust-lang.org/debugging-support-in-rustc.html)
 has a page detailing the state of debugger support in Rust. There's plenty of
 guides for how to use GDB/LLDB online but most of them focus on C/C++ programs.
 [Beej's Quick Guide to GDB](https://beej.us/guide/bggdb/) is a good starting

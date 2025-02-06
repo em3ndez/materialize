@@ -7,92 +7,64 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use async_trait::async_trait;
 use std::cmp;
 use std::time::Duration;
-use tokio_postgres::NoTls;
 
-use ore::retry::Retry;
+use anyhow::{bail, Context};
+use mz_ore::retry::Retry;
 
-use crate::action::{Action, State};
+use crate::action::{ControlFlow, State};
 use crate::parser::BuiltinCommand;
+use crate::util::postgres::postgres_client;
 
-pub struct VerifySlotAction {
-    connection: String,
-    slot: String,
-    active: bool,
-}
-
-pub fn build_verify_slot(mut cmd: BuiltinCommand) -> Result<VerifySlotAction, String> {
+pub async fn run_verify_slot(
+    mut cmd: BuiltinCommand,
+    state: &State,
+) -> Result<ControlFlow, anyhow::Error> {
     let connection = cmd.args.string("connection")?;
     let slot = cmd.args.string("slot")?;
-    let active: bool = cmd.args.parse("active")?;
+    let expect_active: bool = cmd.args.parse("active")?;
     cmd.args.done()?;
-    Ok(VerifySlotAction {
-        connection,
-        slot,
-        active,
-    })
-}
 
-#[async_trait]
-impl Action for VerifySlotAction {
-    async fn undo(&self, _: &mut State) -> Result<(), String> {
-        Ok(())
-    }
+    let (client, conn_handle) = postgres_client(&connection, state.default_timeout).await?;
 
-    async fn redo(&self, state: &mut State) -> Result<(), String> {
-        let (client, conn) = tokio_postgres::connect(&self.connection, NoTls)
-            .await
-            .map_err(|e| format!("connecting to postgres: {}", e))?;
-        println!(
-            "Executing queries against PostgreSQL server at {}...",
-            self.connection
-        );
-        let conn_handle = tokio::spawn(conn);
+    Retry::default()
+        .initial_backoff(Duration::from_millis(50))
+        .max_duration(cmp::max(state.default_timeout, Duration::from_secs(60)))
+        .retry_async_canceling(|_| async {
+            println!(">> checking for postgres replication slot {}", &slot);
+            let rows = client
+                .query(
+                    "SELECT active_pid FROM pg_replication_slots WHERE slot_name LIKE $1::TEXT",
+                    &[&slot],
+                )
+                .await
+                .context("querying postgres for replication slot")?;
 
-        Retry::default()
-            .initial_backoff(Duration::from_millis(50))
-            .max_duration(cmp::max(state.default_timeout, Duration::from_secs(3)))
-            .retry_async(|_| async {
-                println!(">> checking for postgres replication slot {}", &self.slot);
-                let rows = client
-                    .query(
-                        "SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1::TEXT",
-                        &[&self.slot],
-                    )
-                    .await
-                    .map_err(|e| format!("querying postgres for replication slot: {}", e))?;
-
-                if self.active {
-                    if rows.len() != 1 {
-                        return Err(format!(
-                            "expected entry for slot {} in pg_replication slots, found {}",
-                            &self.slot,
-                            rows.len()
-                        ));
-                    }
-                    let active_pid: Option<i32> = rows[0].get(0);
-                    if active_pid.is_none() {
-                        return Err(format!(
-                            "expected slot {} to be active, is inactive",
-                            &self.slot
-                        ));
-                    }
-                } else if rows.len() != 0 {
-                    return Err(format!(
-                        "expected slot {} to be inactive, is active",
-                        &self.slot
-                    ));
+            if rows.len() != 1 {
+                bail!(
+                    "expected entry for slot {} in pg_replication slots, found {}",
+                    &slot,
+                    rows.len()
+                );
+            }
+            let active_pid: Option<i32> = rows[0].get(0);
+            match (expect_active, active_pid) {
+                (true, None) => bail!("expected slot {slot} to be active, is inactive"),
+                (false, Some(pid)) => {
+                    bail!("expected slot {slot} to be inactive, is active for pid {pid}")
                 }
-                Ok(())
-            })
-            .await?;
+                _ => {}
+            };
+            Ok(())
+        })
+        .await?;
 
-        drop(client);
-        conn_handle
-            .await
-            .unwrap()
-            .map_err(|e| format!("postgres connection error: {}", e))
-    }
+    drop(client);
+    conn_handle
+        .await
+        .unwrap()
+        .context("postgres connection error")?;
+
+    Ok(ControlFlow::Continue)
 }

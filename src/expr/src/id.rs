@@ -8,22 +8,37 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt;
-use std::str::FromStr;
 
-use anyhow::{anyhow, Error};
+use mz_lowertest::MzReflect;
+use mz_proto::{ProtoType, RustType, TryFromProtoError};
+use mz_repr::GlobalId;
+use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
+
+include!(concat!(env!("OUT_DIR"), "/mz_expr.id.rs"));
 
 /// An opaque identifier for a dataflow component. In other words, identifies
 /// the target of a [`MirRelationExpr::Get`](crate::MirRelationExpr::Get).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(
+    Arbitrary,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Serialize,
+    Deserialize,
+    MzReflect,
+)]
 pub enum Id {
     /// An identifier that refers to a local component of a dataflow.
     Local(LocalId),
     /// An identifier that refers to a global dataflow.
+    #[proptest(value = "Id::Global(GlobalId::System(2))")]
     Global(GlobalId),
-    /// Used to refer to a bare source within the RelationExpr defining the transformation of that source (before an ID has been
-    /// allocated for the bare source).
-    LocalBareSource,
 }
 
 impl fmt::Display for Id {
@@ -31,14 +46,45 @@ impl fmt::Display for Id {
         match self {
             Id::Local(id) => id.fmt(f),
             Id::Global(id) => id.fmt(f),
-            Id::LocalBareSource => write!(f, "(bare source for this source)"),
+        }
+    }
+}
+
+impl RustType<ProtoId> for Id {
+    fn into_proto(&self) -> ProtoId {
+        ProtoId {
+            kind: Some(match self {
+                Id::Global(g) => proto_id::Kind::Global(g.into_proto()),
+                Id::Local(l) => proto_id::Kind::Local(l.into_proto()),
+            }),
+        }
+    }
+
+    fn from_proto(proto: ProtoId) -> Result<Self, TryFromProtoError> {
+        match proto.kind {
+            Some(proto_id::Kind::Global(x)) => Ok(Id::Global(x.into_rust()?)),
+            Some(proto_id::Kind::Local(x)) => Ok(Id::Local(x.into_rust()?)),
+            None => Err(TryFromProtoError::missing_field("ProtoId::kind")),
         }
     }
 }
 
 /// The identifier for a local component of a dataflow.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct LocalId(u64);
+#[derive(
+    Arbitrary,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Serialize,
+    Deserialize,
+    MzReflect,
+)]
+pub struct LocalId(pub(crate) u64);
 
 impl LocalId {
     /// Constructs a new local identifier. It is the caller's responsibility
@@ -48,67 +94,25 @@ impl LocalId {
     }
 }
 
+impl From<&LocalId> for u64 {
+    fn from(id: &LocalId) -> Self {
+        id.0
+    }
+}
+
 impl fmt::Display for LocalId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "l{}", self.0)
     }
 }
 
-/// The identifier for a global dataflow.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum GlobalId {
-    /// System namespace.
-    System(u64),
-    /// User namespace.
-    User(u64),
-    /// Transient namespace.
-    Transient(u64),
-    /// Dummy id for query being explained
-    Explain,
-}
-
-impl GlobalId {
-    /// Reports whether this ID is in the system namespace.
-    pub fn is_system(&self) -> bool {
-        matches!(self, GlobalId::System(_))
+impl RustType<ProtoLocalId> for LocalId {
+    fn into_proto(&self) -> ProtoLocalId {
+        ProtoLocalId { value: self.0 }
     }
 
-    /// Reports whether this ID is in the user namespace.
-    pub fn is_user(&self) -> bool {
-        matches!(self, GlobalId::User(_))
-    }
-
-    /// Reports whether this ID is in the transient namespace.
-    pub fn is_transient(&self) -> bool {
-        matches!(self, GlobalId::Transient(_))
-    }
-}
-
-impl FromStr for GlobalId {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() < 2 {
-            return Err(anyhow!("couldn't parse id {}", s));
-        }
-        let val: u64 = s[1..].parse()?;
-        match s.chars().next().unwrap() {
-            's' => Ok(GlobalId::System(val)),
-            'u' => Ok(GlobalId::User(val)),
-            't' => Ok(GlobalId::Transient(val)),
-            _ => Err(anyhow!("couldn't parse id {}", s)),
-        }
-    }
-}
-
-impl fmt::Display for GlobalId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            GlobalId::System(id) => write!(f, "s{}", id),
-            GlobalId::User(id) => write!(f, "u{}", id),
-            GlobalId::Transient(id) => write!(f, "t{}", id),
-            GlobalId::Explain => write!(f, "Explained Query"),
-        }
+    fn from_proto(proto: ProtoLocalId) -> Result<Self, TryFromProtoError> {
+        Ok(LocalId::new(proto.value))
     }
 }
 
@@ -128,43 +132,20 @@ impl fmt::Display for SourceInstanceId {
     }
 }
 
-/// Unique identifier for each part of a whole source.
-///     Kafka -> partition
-///     None -> sources that have no notion of partitioning (e.g file sources)
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub enum PartitionId {
-    Kafka(i32),
-    None,
-}
+#[cfg(test)]
+mod tests {
+    use mz_ore::assert_ok;
+    use mz_proto::protobuf_roundtrip;
+    use proptest::prelude::*;
 
-impl fmt::Display for PartitionId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            PartitionId::Kafka(id) => write!(f, "{}", id.to_string()),
-            PartitionId::None => write!(f, "none"),
-        }
-    }
-}
+    use super::*;
 
-impl From<&PartitionId> for Option<String> {
-    fn from(pid: &PartitionId) -> Option<String> {
-        match pid {
-            PartitionId::None => None,
-            _ => Some(pid.to_string()),
-        }
-    }
-}
-
-impl FromStr for PartitionId {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "none" => Ok(PartitionId::None),
-            s => {
-                let val: i32 = s.parse()?;
-                Ok(PartitionId::Kafka(val))
-            }
+    proptest! {
+        #[mz_ore::test]
+        fn id_protobuf_roundtrip(expect in any::<Id>()) {
+            let actual = protobuf_roundtrip::<_, ProtoId>(&expect);
+            assert_ok!(actual);
+            assert_eq!(actual.unwrap(), expect);
         }
     }
 }

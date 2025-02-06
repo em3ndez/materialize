@@ -11,35 +11,17 @@
 
 set -euo pipefail
 
+. misc/shlib/shlib.bash
+
 mzcompose() {
-    bin/ci-builder run stable bin/mzcompose --find "$BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION" "$@"
+    stdbuf --output=L --error=L bin/ci-builder run stable bin/mzcompose --find "$BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION" "$@"
 }
 
-# read_list PREFIX
-#
-# Appends the environment variables `PREFIX_0`, `PREFIX_1`, ... `PREFIX_N` to
-# the `result` global variable, stopping when `PREFIX_N` is an empty string.
-read_list() {
-    result=()
-
-    local i=0
-    local param="${1}_${i}"
-
-    if [[ "${!1:-}" ]]; then
-        echo "error: mzcompose command must be an array, not a string" >&2
-        exit 1
-    fi
-
-    while [[ "${!param:-}" ]]; do
-        result+=("${!param}")
-        i=$((i+1))
-        param="${1}_${i}"
-    done
-
-    [[ ${#result[@]} -gt 0 ]] || return 1
+faketty() {
+    script -qfc "$(printf "%q " "$@")" /dev/null
 }
 
-service=$BUILDKITE_PLUGIN_MZCOMPOSE_RUN
+service=${BUILDKITE_PLUGIN_MZCOMPOSE_RUN:-default}
 run_args=("$service")
 if read_list BUILDKITE_PLUGIN_MZCOMPOSE_ARGS; then
     for arg in "${result[@]}"; do
@@ -47,28 +29,93 @@ if read_list BUILDKITE_PLUGIN_MZCOMPOSE_ARGS; then
     done
 fi
 
+date +"%Y-%m-%d %H:%M:%S" > step_start_timestamp
+
 # Sometimes build cancellations prevent us from properly cleaning up the last
 # Docker Compose run, which can leave old containers or volumes around that will
 # interfere with this build.
-echo "--- :docker: Purging containers and volumes from previous builds"
+ci_collapsed_heading ":docker: Purging containers and volumes from previous builds"
+sudo systemctl restart docker
+# First time we are using ci-builder, allow retrying a few times in case dockerhub has network problems
+mzcompose --mz-quiet kill || mzcompose --mz-quiet kill || mzcompose --mz-quiet kill
+mzcompose --mz-quiet rm --force -v
 mzcompose --mz-quiet down --volumes
+killall -9 clusterd || true # There might be remaining processes from a previous cargo-test run
+if [ -n "${CI_COVERAGE_ENABLED:-}" ]; then
+  find . -name '*.profraw' -delete # Remove remaining profraw files from coverage runs
+fi
 
-echo "--- :docker: Rebuilding non-mzbuild containers"
+ci_collapsed_heading ":docker: Purging all existing docker containers and volumes, regardless of origin"
+docker ps --all --quiet | xargs --no-run-if-empty docker rm --force --volumes
+rm -f services.log
+
+ci_collapsed_heading ":docker: Rebuilding non-mzbuild containers"
 mzcompose --mz-quiet build
+
+# Clean up cores here so that just killed processes' core files are ignored
+cores="$HOME"/cores
+rm -rf "$cores" parallel-workload-queries.log parallel-workload-queries.log.zst
+mkdir -m 777 "$cores"
+# Max 128 characters, so don't use $PWD which will make it too long
+# Ignore SIGABRT
+sudo sysctl -w kernel.core_pattern="|/usr/bin/ci-filter-core.sh %s $cores/core.%E.%t"
 
 # Start dependencies under a different heading so that the main heading is less
 # noisy. But not if the service is actually a workflow, in which case it will
 # do its own dependency management.
-if ! mzcompose --mz-quiet list-workflows | grep -q "$service"; then
-    echo "--- :docker: Starting dependencies" >&2
+
+# Don't use `grep -q`! It will stop the `grep` process before mzcompose might
+# be finished, thus mzcompose can fail with `write /dev/stdout: broken pipe`.
+# Since we have `pipefail` set in this script, this would lead to a failure and
+# we would attempt to bring up the workflow, which will fail with `no such
+# service: default`.
+if ! mzcompose --mz-quiet list-workflows | grep "$service" > /dev/null; then
+    ci_collapsed_heading ":docker: Starting dependencies"
     mzcompose up -d --scale "$service=0" "$service"
 fi
 
-echo "+++ :docker: Running \`mzcompose run ${run_args[*]}\`" >&2
-
-if ! mzcompose --mz-quiet run "${run_args[@]}"; then
-    echo "Command failed! Uploading logs for debugging." >&2
-    mzcompose --mz-quiet logs --no-color > services.log
-    buildkite-agent artifact upload services.log
-    exit 1
+if [ -n "${CI_COVERAGE_ENABLED:-}" ]; then
+    ci_uncollapsed_heading ":docker: Fetching binaries for coverage"
+    mzcompose create
+    mkdir -p coverage/
+    chmod 777 coverage/
+    # Not all tests contain all of these containers:
+    mzcompose --mz-quiet cp sqllogictest:/usr/local/bin/sqllogictest coverage/ || true
+    mzcompose --mz-quiet cp sqllogictest:/usr/local/bin/clusterd coverage/ || true
+    mzcompose --mz-quiet cp materialized:/usr/local/bin/environmentd coverage/ || true
+    mzcompose --mz-quiet cp materialized:/usr/local/bin/clusterd coverage/ || true
+    mzcompose --mz-quiet cp testdrive:/usr/local/bin/testdrive coverage/ || true
+    mzcompose --mz-quiet cp balancerd:/usr/local/bin/balancerd coverage/ || true
 fi
+
+if is_truthy "${CI_HEAP_PROFILES:-}"; then
+    (while true; do
+        sleep 5
+        # faketty because otherwise docker will complain about not being inside
+        # of a TTY when run in a background job
+        faketty bin/ci-builder run stable bin/ci-upload-heap-profiles "$BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION"
+    done
+    ) &
+fi
+
+EXTRA_ARGS=$(echo "${CI_EXTRA_ARGS:-}" | jq -r ".[\"$BUILDKITE_STEP_KEY\"] // \"\"")
+
+if [ "${BUILDKITE_PARALLEL_JOB_COUNT:-1}" -gt 1 ]; then
+    TEST_CMD="BUILDKITE_PARALLEL_JOB=$BUILDKITE_PARALLEL_JOB BUILDKITE_PARALLEL_JOB_COUNT=$BUILDKITE_PARALLEL_JOB_COUNT bin/mzcompose --find $BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION run ${run_args[*]} $EXTRA_ARGS"
+else
+    TEST_CMD="bin/mzcompose --find $BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION run ${run_args[*]} $EXTRA_ARGS"
+fi
+echo "$TEST_CMD" > test_cmd
+TEST_DESC="$(mzcompose description)"
+echo "$TEST_DESC" > test_desc
+
+ci_uncollapsed_heading ":docker: Running \`$TEST_CMD\`"
+echo "$TEST_DESC"
+
+mzcompose run "${run_args[@]}" |& tee run.log
+RESULT=$?
+if [ "$RESULT" != "0" ]; then
+    # Give the logs some time to log panics, otherwise they might be missing later
+    sleep 10
+fi
+exit $RESULT

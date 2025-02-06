@@ -212,6 +212,9 @@ SELECT 'Infinity'::numeric
 query error invalid input syntax for type numeric: "-Infinity"
 SELECT '-Infinity'::numeric
 
+query error invalid input syntax for type numeric: "sNaN"
+SELECT 'sNaN'::numeric
+
 # Casts
 
 ## int4 to numeric
@@ -249,10 +252,10 @@ SELECT 0::numeric::int, '-0'::numeric::int
 ----
 0  0
 
-query error integer out of range
+query error "2147483648" integer out of range
 SELECT '2147483648'::numeric::int4
 
-query error integer out of range
+query error "-2147483649" integer out of range
 SELECT '-2147483649'::numeric::int4
 
 ## int8 to numeric
@@ -290,10 +293,10 @@ SELECT 0::numeric::int8, -0::numeric::int8
 ----
 0  0
 
-query error integer out of range
+query error "9223372036854775808" integer out of range
 SELECT '9223372036854775808'::numeric::int4
 
-query error integer out of range
+query error "-9223372036854775809" integer out of range
 SELECT '-9223372036854775809'::numeric::int4
 
 # numeric to float4
@@ -808,13 +811,13 @@ SELECT 'NaN'::numeric(39,1);
 ----
 NaN
 
-query error precision for type numeric must be within \[1-39\], have 40
+query error precision for type numeric must be between 1 and 39
 SELECT 0.2::numeric(40,1);
 
-query error scale for type numeric must be within \[0-39\], have 40
+query error scale for type numeric must be between 0 and precision 39
 SELECT 0.2::numeric(39,40);
 
-query error numeric scale 39 must be between 0 and precision 1
+query error scale for type numeric must be between 0 and precision 1
 SELECT 0.2::numeric(1,39);
 
 query error numeric field overflow
@@ -854,7 +857,7 @@ SELECT (999999999999999999999999999999999999.123 + 1::numeric)::numeric(39,3);
 
 # Successive operations
 
-## regression test for #6858
+## regression test for database-issues#2137
 query R
 SELECT -0.0 - 1::numeric  * '-0.0 '::numeric;
 ----
@@ -1041,6 +1044,18 @@ query RRR
 SELECT floor(1.234), floor(-1.234), floor('NaN'::numeric)
 ----
 1  -2  NaN
+
+#trunc
+
+query RRR
+SELECT trunc(1.234), trunc(-1.234), trunc('NaN'::numeric)
+----
+1  -1  NaN
+
+query RR
+SELECT trunc(0.6), trunc(-0.6)
+----
+0  0
 
 # Exponential calculations
 
@@ -2163,7 +2178,7 @@ select min(a) from (select a from unnest(ARRAY[]::numeric[]) a);
 NULL
 
 # Distinct, except
-# regression tests for #6877 #6912
+# regression tests for database-issues#2145 database-issues#2152
 
 query R
 SELECT DISTINCT column1 FROM (
@@ -2188,7 +2203,7 @@ SELECT column1 FROM (
 )
 ----
 
-# regression test for https://github.com/MaterializeInc/materialize/issues/7361
+# regression test for https://github.com/MaterializeInc/database-issues/issues/2298
 statement ok
 CREATE TABLE A (f1 DECIMAL);
 
@@ -2199,3 +2214,42 @@ query R
 SELECT sum(f1) FROM A;
 ----
 -Infinity
+
+# sqllogictest rounding/truncation behavior.
+#
+# Note: this behavior is called out in the developer docs, so if it ever changes be sure to update
+# those docs.
+
+query I
+SELECT '1.9'::numeric
+----
+2
+
+query I
+SELECT '1.5'::numeric
+----
+2
+
+query I
+SELECT '1.1'::numeric
+----
+1
+
+mode standard
+
+# For SQLite compatibility, we truncate Numerics when interpreting as an Int.
+
+query I
+SELECT '1.9'::numeric
+----
+1
+
+query I
+SELECT '1.5'::numeric
+----
+1
+
+query I
+SELECT '1.1'::numeric
+----
+1

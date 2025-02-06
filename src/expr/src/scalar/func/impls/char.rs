@@ -9,11 +9,11 @@
 
 use std::fmt;
 
+use mz_lowertest::MzReflect;
+use mz_repr::adt::char::{format_str_pad, Char, CharLength};
+use mz_repr::{ColumnType, ScalarType};
+use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-
-use lowertest::MzStructReflect;
-use repr::adt::char::{format_str_pad, Char};
-use repr::{ColumnType, ScalarType};
 
 use crate::scalar::func::EagerUnaryFunc;
 
@@ -21,10 +21,10 @@ use crate::scalar::func::EagerUnaryFunc;
 /// (i.e. trimmed), so this function provides a means of restoring any
 /// removed padding.
 #[derive(
-    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+    Arbitrary, Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect,
 )]
 pub struct PadChar {
-    pub length: Option<usize>,
+    pub length: Option<CharLength>,
 }
 
 impl<'a> EagerUnaryFunc<'a> for PadChar {
@@ -49,10 +49,15 @@ impl fmt::Display for PadChar {
     }
 }
 
-// This function simply allows the expression of changing a's type from varchar to string
+// This function simply allows the expression of changing a's type from char to
+// string
 sqlfunc!(
-    #[sqlname = "chartostr"]
+    #[sqlname = "char_to_text"]
     #[preserves_uniqueness = true]
+    #[inverse = to_unary!(super::CastStringToChar{
+        length: None,
+        fail_on_len: false,
+    })]
     fn cast_char_to_string<'a>(a: Char<&'a str>) -> &'a str {
         a.0
     }

@@ -1,22 +1,27 @@
 ---
 title: "SHOW COLUMNS"
-description: "`SHOW COLUMNS` lists the columns available from an item."
+description: "`SHOW COLUMNS` lists the columns available for an object."
 menu:
   main:
-    parent: 'sql'
+    parent: commands
 aliases:
     - /sql/show-column
 ---
 
-`SHOW COLUMNS` lists the columns available from an item&mdash;either sources, materialized views, or non-materialized views.
+`SHOW COLUMNS` lists the columns available for an object. This can be a source,
+subsource, materialized view, view, or table.
 
 ## Syntax
 
-{{< diagram "show-columns.svg" >}}
+```sql
+SHOW COLUMNS FROM <object_name>
+[LIKE <pattern> | WHERE <condition(s)>]
+```
 
-Field | Use
-------|-----
-_item&lowbar;ref_ | The name of the item whose columns you want to view. These can be [sources](../create-source) or views (either [materialized](../create-materialized-view) or [non-materialized](../create-view)).
+Option                        | Description
+------------------------------|------------
+**LIKE** \<pattern\>          | If specified, only show columns that match the pattern.
+**WHERE** <condition(s)>      | If specified, only show columns that match the condition(s).
 
 ## Details
 
@@ -38,20 +43,12 @@ Field | Meaning
 **nullable** | Does the column accept `null` values?
 **type** | The column's [type](../types)
 
-
-{{< version-changed v0.4.2 >}}
 Rows are sorted by the order in which the fields are defined in the targeted
-source, view, or table. Prior versions did not guarantee any particular ordering.
-{{< /version-changed >}}
-
-{{< version-changed v0.5.0 >}}
-The `name`, `nullable`, and `type` columns are renamed to `name`, `nullable`,
-and `type`, respectively.
-{{< /version-changed >}}
+object.
 
 ## Examples
 
-```sql
+```mzsql
 SHOW SOURCES;
 ```
 ```nofmt
@@ -59,15 +56,21 @@ SHOW SOURCES;
 ----------
 my_sources
 ```
-```sql
+```mzsql
 SHOW COLUMNS FROM my_source;
 ```
 ```nofmt
   name  | nullable | type
 ---------+----------+------
- column1 | NO       | int4
- column2 | YES      | text
+ column1 | f       | int4
+ column2 | f       | text
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `USAGE` privileges on the schema containing `item_ref`.
 
 ## Related pages
 

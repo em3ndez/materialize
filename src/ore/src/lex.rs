@@ -70,10 +70,23 @@ impl<'a> LexBuf<'a> {
     /// Advances the internal cursor past the next character in the buffer if
     /// the character is `ch`.
     ///
-    /// Returns whether the cursor was advanced.
+    /// Returns whether the cursor advanced.
     pub fn consume(&mut self, ch: char) -> bool {
         if self.peek() == Some(ch) {
             self.next();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advances the internal cursor past `s` if it exactly matches the next
+    /// characters in the buffer.
+    ///
+    /// Returns whether the cursor advanced.
+    pub fn consume_str(&mut self, s: &str) -> bool {
+        if self.buf[self.pos..].starts_with(s) {
+            self.pos += s.len();
             true
         } else {
             false
@@ -128,7 +141,7 @@ impl<'a> LexBuf<'a> {
     /// Note that the entire string is returned, regardless of the position of
     /// the buffer's internal cursor.
     pub fn inner(&self) -> &'a str {
-        &self.buf
+        self.buf
     }
 }
 

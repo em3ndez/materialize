@@ -1,17 +1,27 @@
 [package]
-name = "repr_test_util"
+name = "mz-repr-test-util"
 description = "Utilities for creating objects in the repr crate for testing"
 version = "0.0.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
-chrono = { version = "0.4.0", default-features = false, features = ["serde", "std"] }
-lazy_static = "1.4.0"
-lowertest = {path = "../lowertest"}
-ore = {path = "../ore"}
-repr = {path = "../repr"}
-proc-macro2 = "1.0.36"
+chrono = { version = "0.4.35", default-features = false, features = ["serde", "std"] }
+mz-lowertest = { path = "../lowertest" }
+mz-ore = { path = "../ore" }
+mz-repr = { path = "../repr" }
+proc-macro2 = "1.0.60"
+workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }
 
 [dev-dependencies]
-datadriven = "0.6.0"
+datadriven = "0.8.0"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["workspace-hack"]
+
+[features]
+default = ["workspace-hack"]

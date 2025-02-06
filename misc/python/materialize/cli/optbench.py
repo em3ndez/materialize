@@ -8,13 +8,15 @@
 # by the Apache License, Version 2.0.
 
 import csv
+import re
 import tempfile
+from contextlib import closing
 from pathlib import Path
 from typing import cast
 
 import click
 import numpy as np
-import pandas as pd  # type: ignore
+import pandas as pd
 
 from ..optbench import Scenario, scenarios, sql, util
 
@@ -80,36 +82,80 @@ class Opt:
 
     print_results = dict(default=False, help="Print the experiment results.")
 
-    db_port = dict(default=6875, help="DB connection port.")
+    no_indexes = dict(default=False, help="Skip CREATE [DEFAULT]/DROP INDEX DDL.")
 
-    db_host = dict(default="localhost", help="DB connection host.")
+    db_port = dict(default=6875, help="DB connection port.", envvar="PGPORT")
 
-    db_user = dict(default="materialize", help="DB connection user.")
+    db_host = dict(default="localhost", help="DB connection host.", envvar="PGHOST")
+
+    db_user = dict(default="materialize", help="DB connection user.", envvar="PGUSER")
+
+    db_pass = dict(default=None, help="DB connection password.", envvar="PGPASSWORD")
+
+    db_require_ssl = dict(
+        is_flag=True,
+        help="DB connection requires SSL.",
+        envvar="PGREQUIRESSL",
+    )
 
 
 @app.command()
 @click.argument("scenario", **Arg.scenario)
+@click.option("--no-indexes", **Opt.no_indexes)
 @click.option("--db-port", **Opt.db_port)
 @click.option("--db-host", **Opt.db_host)
 @click.option("--db-user", **Opt.db_user)
+@click.option("--db-pass", **Opt.db_pass)
+@click.option("--db-require-ssl", **Opt.db_require_ssl)
 def init(
     scenario: Scenario,
+    no_indexes: bool,
     db_port: int,
     db_host: str,
     db_user: str,
+    db_pass: str | None,
+    db_require_ssl: bool,
 ) -> None:
     """Initialize the DB under test for the given scenario."""
 
     info(f'Initializing "{scenario}" as the DB under test')
 
     try:
-        db = sql.Database(port=db_port, host=db_host, user=db_user)
+        # connect to the default database in order to re-create the
+        # database for the selected scenario
+        with closing(
+            sql.Database(
+                port=db_port,
+                host=db_host,
+                user=db_user,
+                database=None,
+                password=db_pass,
+                require_ssl=db_require_ssl,
+            )
+        ) as db:
+            db.drop_database(scenario)
+            db.create_database(scenario)
 
-        db.drop_database(scenario)
-        db.create_database(scenario)
-
-        db.set_database(scenario)
-        db.execute_all(statements=sql.parse_from_file(scenario.schema_path()))
+        # re-connect to the database for the selected scenario
+        with closing(
+            sql.Database(
+                port=db_port,
+                host=db_host,
+                user=db_user,
+                database=str(scenario),
+                password=db_pass,
+                require_ssl=db_require_ssl,
+            )
+        ) as db:
+            statements = sql.parse_from_file(scenario.schema_path())
+            if no_indexes:
+                idx_re = re.compile(r"(create|create\s+default|drop)\s+index\s+")
+                statements = [
+                    statement
+                    for statement in statements
+                    if not idx_re.match(statement.lower())
+                ]
+            db.execute_all(statements)
     except Exception as e:
         raise click.ClickException(f"init command failed: {e}")
 
@@ -122,6 +168,8 @@ def init(
 @click.option("--db-port", **Opt.db_port)
 @click.option("--db-host", **Opt.db_host)
 @click.option("--db-user", **Opt.db_user)
+@click.option("--db-pass", **Opt.db_pass)
+@click.option("--db-require-ssl", **Opt.db_require_ssl)
 def run(
     scenario: Scenario,
     samples: int,
@@ -130,37 +178,48 @@ def run(
     db_port: int,
     db_host: str,
     db_user: str,
+    db_pass: str | None,
+    db_require_ssl: bool,
 ) -> None:
     """Run benchmark in the DB under test for a given scenario."""
 
     info(f'Running "{scenario}" scenario')
 
     try:
-        db = sql.Database(port=db_port, host=db_host, user=db_user)
-        db.set_database(scenario)
-
-        df = pd.DataFrame(
-            data={
-                query.name(): np.array(
-                    [
+        with closing(
+            sql.Database(
+                port=db_port,
+                host=db_host,
+                user=db_user,
+                database=str(scenario),
+                password=db_pass,
+                require_ssl=db_require_ssl,
+            )
+        ) as db:
+            db_version = db.mz_version() or db.version()
+            df = pd.DataFrame.from_records(
+                [
+                    (
+                        query.name(),
+                        sample,
                         cast(
                             np.timedelta64,
                             db.explain(query, timing=True).optimization_time(),
-                        ).astype(int)
-                        for _ in range(samples)
+                        ).astype(int),
+                    )
+                    for sample in range(samples)
+                    for query in [
+                        sql.Query(query)
+                        for query in sql.parse_from_file(scenario.workload_path())
                     ]
-                )
-                for query in [
-                    sql.Query(query)
-                    for query in sql.parse_from_file(scenario.workload_path())
-                ]
-            }
-        )
+                ],
+                columns=["query", "sample", "data"],
+            ).pivot(index="sample", columns="query", values="data")
 
-        if print_results:
-            print(df.to_string())
+            if print_results:
+                print(df.to_string())
 
-        results_path = util.results_path(repository, scenario, db.mz_version())
+        results_path = util.results_path(repository, scenario, db_version)
         info(f'Writing results to "{results_path}"')
         df.to_csv(results_path, index=False, quoting=csv.QUOTE_MINIMAL)
     except Exception as e:
@@ -180,11 +239,11 @@ def compare(
 
     try:
         base_df = pd.read_csv(base, quoting=csv.QUOTE_MINIMAL).agg(
-            [np.min, np.median, np.max]
+            ["min", "median", "max"]
         )
 
         diff_df = pd.read_csv(diff, quoting=csv.QUOTE_MINIMAL).agg(
-            [np.min, np.median, np.max]
+            ["min", "median", "max"]
         )
 
         # compute diff/base quotient for all (metric, query) pairs

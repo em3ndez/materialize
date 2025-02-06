@@ -11,6 +11,14 @@
 # Test the temporal data types with time zone
 #
 
+> CREATE SECRET pgpass AS 'postgres'
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass
+  )
+
 # Insert data pre-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 ALTER USER postgres WITH replication;
@@ -24,21 +32,22 @@ INSERT INTO time_table VALUES ('11:11:11.123456-09');
 INSERT INTO time_table VALUES ('11:11:11.123456+09');
 ALTER TABLE time_table REPLICA IDENTITY FULL;
 
-CREATE TABLE timestamp_table (f1 TIMESTAMP WITH TIME ZONE);
+CREATE TABLE timestamp_table (f1 TIMESTAMPTZ);
 INSERT INTO timestamp_table VALUES ('2011-11-11 11:11:11.123456-09');
 INSERT INTO timestamp_table VALUES ('2011-11-11 11:11:11.123456+09');
 ALTER TABLE timestamp_table REPLICA IDENTITY FULL;
 
-CREATE PUBLICATION mz_source FOR ALL TABLES;
+CREATE PUBLICATION mz_source_time FOR TABLE time_table;
 
-> CREATE MATERIALIZED SOURCE mz_source
-  FROM POSTGRES CONNECTION 'host=postgres port=5432 user=postgres password=postgres sslmode=require dbname=postgres'
-  PUBLICATION 'mz_source';
+CREATE PUBLICATION mz_source_timestamp FOR TABLE timestamp_table;
 
-> SELECT COUNT(*) > 0 FROM mz_source;
+> CREATE SOURCE mz_source_timestamp
+  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source_timestamp');
+
+> CREATE TABLE timestamp_table FROM SOURCE mz_source_timestamp (REFERENCE timestamp_table);
+
+> SELECT COUNT(*) > 0 FROM timestamp_table;
 true
-
-> CREATE VIEWS FROM SOURCE mz_source (timestamp_table);
 
 # Insert the same data post-snapshot
 $ postgres-execute connection=postgres://postgres:postgres@postgres
@@ -54,6 +63,11 @@ INSERT INTO timestamp_table SELECT * FROM timestamp_table;
 "2011-11-11 20:11:11.123456 UTC"
 "2011-11-11 20:11:11.123456 UTC"
 
+> DROP SOURCE mz_source_timestamp CASCADE;
+
+> CREATE SOURCE mz_source
+  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source_time');
+
 # Mz does not support TIME WITH TIME ZOINE
-! CREATE VIEWS FROM SOURCE mz_source (time_table);
-unknown catalog item 'timetz'
+! CREATE TABLE timestamp_table FROM SOURCE mz_source (REFERENCE time_table);
+contains:type "pg_catalog.timetz" does not exist

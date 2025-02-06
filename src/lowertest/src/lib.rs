@@ -11,53 +11,53 @@
 //!
 //! See [README.md].
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
+pub use mz_lowertest_derive::MzReflect;
+use mz_ore::result::ResultExt;
+use mz_ore::str::{separated, StrExt};
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use ore::{result::ResultExt, str::separated, str::StrExt};
+/* #region Parts of the public interface related to collecting information
+about the fields of structs and enums. */
 
-pub use lowertest_derive::{gen_reflect_info_func, MzEnumReflect, MzStructReflect};
-
-/// A trait for listing the variants of an enum and the fields of each variant.
-///
-/// The information listed about the fields help build a JSON string that can
-/// be correctly deserialized into the enum.
-pub trait MzEnumReflect {
-    /// Returns a mapping of the variants of an enum to its fields.
+/// For [`to_json`] to create deserializable JSON for an instance of an type,
+/// the type must derive this trait.
+pub trait MzReflect {
+    /// Adds names and types of the fields of the struct or enum to `rti`.
     ///
-    /// The first vector comprises the names of the variant's fields. It is
-    /// empty if the variant has no fields or if the variant's fields are
-    /// unnamed.
-    ///
-    /// The second vector comprises the types of the variant's fields. It is
-    /// empty if the variant has no fields.
-    fn mz_enum_reflect() -> HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>;
+    /// The corresponding implementation of this method will be recursively
+    /// called for each type referenced by the struct or enum.
+    /// Check out the crate README for more details.
+    fn add_to_reflected_type_info(rti: &mut ReflectedTypeInfo);
 }
 
-/// A trait for listing the fields of a struct.
-///
-/// The information listed about the fields help build a JSON string that can
-/// be correctly deserialized into the struct.
-pub trait MzStructReflect {
-    /// Returns the fields of a struct.
-    ///
-    /// The first vector comprises the names of the struct's fields. It is
-    /// empty if the struct has no fields or if the struct's fields are
-    /// unnamed.
-    ///
-    /// The second vector comprises the types of the struct's fields. It is
-    /// empty if the struct has no fields.
-    fn mz_struct_reflect() -> (Vec<&'static str>, Vec<&'static str>);
+impl<T: MzReflect> MzReflect for Vec<T> {
+    fn add_to_reflected_type_info(rti: &mut ReflectedTypeInfo) {
+        T::add_to_reflected_type_info(rti);
+    }
 }
 
-/* #region Utilities */
+/// Info that must be combined with a spec to form deserializable JSON.
+///
+/// To add information required to construct a struct or enum,
+/// call `Type::add_to_reflected_type_info(enum_dict, struct_dict)`
+#[derive(Debug, Default)]
+pub struct ReflectedTypeInfo {
+    pub enum_dict:
+        BTreeMap<&'static str, BTreeMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>>,
+    pub struct_dict: BTreeMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>,
+}
+
+/* #endregion */
+
+/* #region Public Utilities */
 
 /// Converts `s` into a [proc_macro2::TokenStream]
 pub fn tokenize(s: &str) -> Result<TokenStream, String> {
-    s.parse::<TokenStream>().map_err_to_string()
+    s.parse::<TokenStream>().map_err_to_string_with_causes()
 }
 
 /// Changes `"\"foo\""` to `"foo"`
@@ -71,6 +71,22 @@ pub fn unquote(s: &str) -> String {
 
 /* #endregion */
 
+/// Simpler interface for [deserialize_optional] when no syntax overrides or extensions are needed.
+pub fn deserialize_optional_generic<D, I>(
+    stream_iter: &mut I,
+    type_name: &'static str,
+) -> Result<Option<D>, String>
+where
+    D: DeserializeOwned + MzReflect,
+    I: Iterator<Item = TokenTree>,
+{
+    deserialize_optional(
+        stream_iter,
+        type_name,
+        &mut GenericTestDeserializeContext::default(),
+    )
+}
+
 /// If the `stream_iter` is not empty, deserialize the next `TokenTree` into a `D`.
 ///
 /// See [`to_json`] for the object spec syntax.
@@ -81,20 +97,34 @@ pub fn unquote(s: &str) -> String {
 pub fn deserialize_optional<D, I, C>(
     stream_iter: &mut I,
     type_name: &'static str,
-    rti: &ReflectedTypeInfo,
     ctx: &mut C,
 ) -> Result<Option<D>, String>
 where
     C: TestDeserializeContext,
-    D: DeserializeOwned,
+    D: DeserializeOwned + MzReflect,
     I: Iterator<Item = TokenTree>,
 {
-    match to_json(stream_iter, type_name, rti, ctx)? {
+    let mut rti = ReflectedTypeInfo::default();
+    D::add_to_reflected_type_info(&mut rti);
+    match to_json(stream_iter, type_name, &rti, ctx)? {
         Some(j) => Ok(Some(serde_json::from_str::<D>(&j).map_err(|e| {
             format!("String while serializing: {}\nOriginal JSON: {}", e, j)
         })?)),
         None => Ok(None),
     }
+}
+
+/// Simpler interface for [deserialize] when no syntax overrides or extensions are needed.
+pub fn deserialize_generic<D, I>(stream_iter: &mut I, type_name: &'static str) -> Result<D, String>
+where
+    D: DeserializeOwned + MzReflect,
+    I: Iterator<Item = TokenTree>,
+{
+    deserialize(
+        stream_iter,
+        type_name,
+        &mut GenericTestDeserializeContext::default(),
+    )
 }
 
 /// Deserialize the next `TokenTree` into a `D` object.
@@ -107,15 +137,14 @@ where
 pub fn deserialize<D, I, C>(
     stream_iter: &mut I,
     type_name: &'static str,
-    rti: &ReflectedTypeInfo,
     ctx: &mut C,
 ) -> Result<D, String>
 where
     C: TestDeserializeContext,
-    D: DeserializeOwned,
+    D: DeserializeOwned + MzReflect,
     I: Iterator<Item = TokenTree>,
 {
-    deserialize_optional(stream_iter, type_name, rti, ctx)?
+    deserialize_optional(stream_iter, type_name, ctx)?
         .ok_or_else(|| format!("Empty spec for type {}", type_name))
 }
 
@@ -156,13 +185,26 @@ where
     C: TestDeserializeContext,
     I: Iterator<Item = TokenTree>,
 {
-    let type_name = &normalize_type_name(type_name);
+    let (type_name, option_found) = normalize_type_name(type_name);
+
+    // If the type is an zero-argument struct, resolve without reading from the stream.
     if let Some((_, f_types)) = rti.struct_dict.get(&type_name[..]) {
         if f_types.is_empty() {
             return Ok(Some("null".to_string()));
         }
     }
+
     if let Some(first_arg) = stream_iter.next() {
+        // If type is `Option<T>`, convert the token to None if it is null,
+        // otherwise, try to convert it to an instance of `T`.
+        if option_found {
+            if let TokenTree::Ident(ident) = &first_arg {
+                if *ident == "null" {
+                    return Ok(Some("null".to_string()));
+                }
+            }
+        }
+
         // If the type refers to an enum or struct defined by us, go to a
         // special branch that allows reuse of code paths for the
         // `(<arg1>..<argn>)` syntax as well as the `<only_arg>` syntax.
@@ -174,9 +216,7 @@ where
             return Ok(Some(result));
         }
         // Resolving types that are not enums or structs defined by us.
-        if let Some(result) =
-            ctx.override_syntax(first_arg.clone(), stream_iter, &type_name, rti)?
-        {
+        if let Some(result) = ctx.override_syntax(first_arg.clone(), stream_iter, &type_name)? {
             return Ok(Some(result));
         }
         match first_arg {
@@ -186,36 +226,33 @@ where
                     Delimiter::Bracket => {
                         if type_name.starts_with("Vec<") && type_name.ends_with('>') {
                             // This is a Vec<type_name>.
-                            Ok(Some(format!(
-                                "[{}]",
-                                separated(
-                                    ",",
-                                    parse_as_vec(
-                                        &mut inner_iter,
-                                        &type_name[4..(type_name.len() - 1)],
-                                        rti,
-                                        ctx
-                                    )?
-                                    .iter()
-                                )
-                            )))
+                            let vec = parse_as_vec(
+                                &mut inner_iter,
+                                &type_name[4..(type_name.len() - 1)],
+                                rti,
+                                ctx,
+                            )?;
+                            Ok(Some(format!("[{}]", separated(",", vec.iter()))))
+                        } else if type_name.starts_with("[") && type_name.ends_with(']') {
+                            // This is a [type_name].
+                            let vec = parse_as_vec(
+                                &mut inner_iter,
+                                &type_name[1..(type_name.len() - 1)],
+                                rti,
+                                ctx,
+                            )?;
+                            Ok(Some(format!("[{}]", separated(",", vec.iter()))))
                         } else if type_name.starts_with('(') && type_name.ends_with(')') {
-                            Ok(Some(format!(
-                                "[{}]",
-                                separated(
-                                    ",",
-                                    parse_as_tuple(
-                                        &mut inner_iter,
-                                        &type_name[1..(type_name.len() - 1)],
-                                        rti,
-                                        ctx
-                                    )?
-                                    .iter()
-                                )
-                            )))
+                            let vec = parse_as_tuple(
+                                &mut inner_iter,
+                                &type_name[1..(type_name.len() - 1)],
+                                rti,
+                                ctx,
+                            )?;
+                            Ok(Some(format!("[{}]", separated(",", vec.iter()))))
                         } else {
                             Err(format!(
-                                "Object specified with brackets {:?} has unsupported type {}",
+                                "Object specified with brackets {:?} has unsupported type `{}`",
                                 inner_iter.collect::<Vec<_>>(),
                                 type_name
                             ))
@@ -233,11 +270,11 @@ where
                 match punct.as_char() {
                     // Pretend the comma does not exist and process the
                     // next `TokenTree`
-                    ',' => to_json(stream_iter, type_name, rti, ctx),
+                    ',' => to_json(stream_iter, &type_name, rti, ctx),
                     // Process the next `TokenTree` and prepend the
                     // punctuation. This enables support for negative
                     // numbers.
-                    other => match to_json(stream_iter, type_name, rti, ctx)? {
+                    other => match to_json(stream_iter, &type_name, rti, ctx)? {
                         Some(result) => Ok(Some(format!("{}{}", other, result))),
                         None => Ok(Some(other.to_string())),
                     },
@@ -258,19 +295,6 @@ where
     } else {
         Ok(None)
     }
-}
-
-/// Info that must be combined with a spec to form deserializable JSON.
-///
-/// To add information about an enum, call
-/// `enum_dict.insert("EnumType", EnumType::mz_enum_reflect())`
-/// To add information about a struct, call
-/// `struct_dict.insert("StructType", StructType::mz_struct_reflect())`
-#[derive(Debug)]
-pub struct ReflectedTypeInfo {
-    pub enum_dict:
-        HashMap<&'static str, HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>>,
-    pub struct_dict: HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>,
 }
 
 /// A trait for extending and/or overriding the default test case syntax.
@@ -295,29 +319,23 @@ pub trait TestDeserializeContext {
         first_arg: TokenTree,
         rest_of_stream: &mut I,
         type_name: &str,
-        rti: &ReflectedTypeInfo,
     ) -> Result<Option<String>, String>
     where
         I: Iterator<Item = TokenTree>;
 
     /// Converts `json` back to the extended syntax specified by
-    /// [TestDeserializeContext::override_syntax<I>].
+    /// [TestDeserializeContext::override_syntax].
     ///
     /// Returns `Some(value)` if `json` has been resolved.
     /// Returns `None` is `json` should be resolved in the default manner.
-    fn reverse_syntax_override(
-        &mut self,
-        json: &Value,
-        type_name: &str,
-        rti: &ReflectedTypeInfo,
-    ) -> Option<String>;
+    fn reverse_syntax_override(&mut self, json: &Value, type_name: &str) -> Option<String>;
 }
 
 /// Default `TestDeserializeContext`.
 ///
 /// Does not override or extend any of the default syntax.
 #[derive(Default)]
-pub struct GenericTestDeserializeContext;
+struct GenericTestDeserializeContext;
 
 impl TestDeserializeContext for GenericTestDeserializeContext {
     fn override_syntax<I>(
@@ -325,7 +343,6 @@ impl TestDeserializeContext for GenericTestDeserializeContext {
         _first_arg: TokenTree,
         _rest_of_stream: &mut I,
         _type_name: &str,
-        _rti: &ReflectedTypeInfo,
     ) -> Result<Option<String>, String>
     where
         I: Iterator<Item = TokenTree>,
@@ -333,12 +350,7 @@ impl TestDeserializeContext for GenericTestDeserializeContext {
         Ok(None)
     }
 
-    fn reverse_syntax_override(
-        &mut self,
-        _: &Value,
-        _: &str,
-        _: &ReflectedTypeInfo,
-    ) -> Option<String> {
+    fn reverse_syntax_override(&mut self, _: &Value, _: &str) -> Option<String> {
         None
     }
 }
@@ -479,7 +491,7 @@ where
     C: TestDeserializeContext,
     I: Iterator<Item = TokenTree>,
 {
-    if let Some(result) = ctx.override_syntax(first_arg.clone(), rest_of_stream, type_name, rti)? {
+    if let Some(result) = ctx.override_syntax(first_arg.clone(), rest_of_stream, type_name)? {
         Ok(Some(result))
     } else if let Some((f_names, f_types)) = rti.struct_dict.get(type_name).map(|r| r.clone()) {
         Ok(Some(to_json_fields(
@@ -602,12 +614,9 @@ where
         // `[<val1>, ..]}`, unless it has only one field,
         // in which case the JSON is `<val1>`
         if f_types.len() == 1 {
-            Ok(format!(
-                "{}",
-                f_values
-                    .pop()
-                    .ok_or_else(|| { format!("Cannot use default value for {}", debug_name) })?
-            ))
+            Ok(f_values
+                .pop()
+                .ok_or_else(|| format!("Cannot use default value for {}", debug_name))?)
         } else {
             Ok(format!("[{}]", separated(",", f_values.into_iter())))
         }
@@ -615,6 +624,31 @@ where
 }
 
 /* #endregion */
+
+/// Simpler interface for [serialize] when no syntax overrides or extensions are needed.
+pub fn serialize_generic<M>(json: &Value, type_name: &str) -> String
+where
+    M: MzReflect,
+{
+    let mut rti = ReflectedTypeInfo::default();
+    M::add_to_reflected_type_info(&mut rti);
+    from_json(
+        json,
+        type_name,
+        &rti,
+        &mut GenericTestDeserializeContext::default(),
+    )
+}
+
+pub fn serialize<M, C>(json: &Value, type_name: &str, ctx: &mut C) -> String
+where
+    C: TestDeserializeContext,
+    M: MzReflect,
+{
+    let mut rti = ReflectedTypeInfo::default();
+    M::add_to_reflected_type_info(&mut rti);
+    from_json(json, type_name, &rti, ctx)
+}
 
 /// Converts serialized JSON to the syntax that [to_json] handles.
 ///
@@ -626,8 +660,16 @@ pub fn from_json<C>(json: &Value, type_name: &str, rti: &ReflectedTypeInfo, ctx:
 where
     C: TestDeserializeContext,
 {
-    let type_name = normalize_type_name(type_name);
-    if let Some(result) = ctx.reverse_syntax_override(json, &type_name, rti) {
+    let (type_name, option_found) = normalize_type_name(type_name);
+    // If type is `Option<T>`, convert the value to "null" if it is null,
+    // otherwise, try to convert it to a spec corresponding to an object of
+    // type `T`.
+    if option_found {
+        if let Value::Null = json {
+            return "null".to_string();
+        }
+    }
+    if let Some(result) = ctx.reverse_syntax_override(json, &type_name) {
         return result;
     }
     if let Some((names, types)) = rti.struct_dict.get(&type_name[..]) {
@@ -655,7 +697,7 @@ where
                     if let Some((names, types)) = enum_dict.get(&variant[..]) {
                         return format!(
                             "({} {})",
-                            variant.to_string(),
+                            variant,
                             from_json_fields(data, names, types, rti, ctx)
                         );
                     }
@@ -747,20 +789,28 @@ where
 /* #region Helper functions common to both spec-to-JSON and the JSON-to-spec
 transformations. */
 
-fn normalize_type_name(type_name: &str) -> String {
+fn normalize_type_name(type_name: &str) -> (String, bool) {
     // Normalize the type name by stripping whitespace.
-    let type_name = type_name.replace(" ", "");
-    // Eliminate outer `Option<>` and `Box<>` from type names because they are
-    // inconsequential when it comes to creating a correctly deserializable JSON
-    // string.
-    let type_name = if type_name.starts_with("Option<") && type_name.ends_with('>') {
-        &type_name[7..(type_name.len() - 1)]
-    } else if type_name.starts_with("Box<") && type_name.ends_with('>') {
-        &type_name[4..(type_name.len() - 1)]
-    } else {
-        &type_name
-    };
-    type_name.to_string()
+    let mut type_name = &type_name.replace([' ', '\n'], "")[..];
+    let mut option_found = false;
+    // Eliminate outer `Box<>` from type names because they are inconsequential
+    // when it comes to creating a correctly deserializable JSON string.
+    // The presence of an `Option<>` is consequential, but `serde_json` cannot
+    // distinguish between `None`, `Some(None)`, `Some(Some(None))`, etc., so
+    // we strip out all `Option<>`s and return whether we have seen at least one
+    // option.
+    loop {
+        if type_name.starts_with("Option<") && type_name.ends_with('>') {
+            option_found = true;
+            type_name = &type_name[7..(type_name.len() - 1)]
+        } else if type_name.starts_with("Box<") && type_name.ends_with('>') {
+            type_name = &type_name[4..(type_name.len() - 1)]
+        } else {
+            break;
+        }
+    }
+
+    (type_name.to_string(), option_found)
 }
 
 fn find_next_type_in_tuple(type_name: &str, prev_elem_end: usize) -> Option<(usize, usize)> {
@@ -776,25 +826,28 @@ fn find_next_type_in_tuple(type_name: &str, prev_elem_end: usize) -> Option<(usi
     // The elements of the tuple can be a plain type, a nested tuple, or a
     // Box/Vec/Option with the argument being nested tuple.
     // `type1, (type2, type3), Vec<(type4, type5)>`
-    // Thus, the type of the next element is whatever comes before the
-    // next comma. Unless... a '(' comes from before the next comma, which
-    // means it is a nested tuple, and the type of the next element is
-    // whatever comes before the comma after the last ')'.
-    let mut current_elem_end = type_name[current_elem_begin..]
-        .find(',')
-        .unwrap_or_else(|| type_name.len());
-    if let Some(l_paren_pos) = type_name[current_elem_begin..].find('(') {
-        if l_paren_pos < current_elem_end {
-            if let Some(r_paren_pos) = type_name[current_elem_begin..].rfind(')') {
-                current_elem_end = current_elem_begin
-                    + r_paren_pos
-                    + type_name[(current_elem_begin + r_paren_pos)..]
-                        .find(',')
-                        .unwrap_or_else(|| type_name.len());
-            }
+    let mut i = current_elem_begin;
+    let mut it = type_name.chars().skip(current_elem_begin).peekable();
+    let mut paren_level = 0;
+    let mut bracket_level = 0;
+    while i < type_name.len()
+        && !(paren_level == 0 && bracket_level == 0 && *it.peek().unwrap() == ',')
+    {
+        if *it.peek().unwrap() == '(' {
+            paren_level += 1;
+        } else if *it.peek().unwrap() == ')' {
+            paren_level -= 1;
         }
-    };
-    return Some((current_elem_begin, current_elem_end));
+        if *it.peek().unwrap() == '<' {
+            bracket_level += 1;
+        } else if *it.peek().unwrap() == '>' {
+            bracket_level -= 1;
+        }
+        i += 1;
+        it.next();
+    }
+
+    Some((current_elem_begin, i))
 }
 
 /* #endregion */

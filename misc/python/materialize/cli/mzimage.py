@@ -13,13 +13,13 @@ import argparse
 import sys
 from typing import Any
 
-from materialize import ROOT, mzbuild, ui
+from materialize import MZ_ROOT, mzbuild, ui
 
 
 def main() -> int:
     args = _parse_args()
     ui.Verbosity.init_from_env(explicit=None)
-    repo = mzbuild.Repository.from_arguments(ROOT, args)
+    repo = mzbuild.Repository.from_arguments(MZ_ROOT, args)
 
     if args.command == "list":
         for image in repo:
@@ -30,13 +30,13 @@ def main() -> int:
             return 1
         deps = repo.resolve_dependencies([repo.images[args.image]])
         rimage = deps[args.image]
-        if args.command == "build":
-            deps.acquire(force_build=True)
-        elif args.command == "run":
+        if args.command == "run":
             deps.acquire()
             rimage.run(args.image_args)
         elif args.command == "acquire":
             deps.acquire()
+        elif args.command == "ensure":
+            deps.ensure()
         elif args.command == "fingerprint":
             print(rimage.fingerprint())
         elif args.command == "spec":
@@ -92,11 +92,12 @@ def _parse_args() -> argparse.Namespace:
     )
 
     add_image_subcommand(
-        "build", description="Unconditionally build an image.", help="build an image"
-    )
-
-    add_image_subcommand(
         "acquire", description="Download or build an image.", help="acquire an image"
+    )
+    add_image_subcommand(
+        "ensure",
+        description="Ensure an image exists in the remote registry.",
+        help="ensure an image",
     )
 
     run_parser = add_image_subcommand(

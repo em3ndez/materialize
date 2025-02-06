@@ -1,12 +1,10 @@
 ---
-title: "record Data Type"
+title: "record type"
 description: "A tuple with arbitrary contents"
 menu:
   main:
     parent: sql-types
 ---
-
-{{< version-added v0.4.0 />}}
 
 A `record` is a tuple that can contain an arbitrary number of elements of any
 type.
@@ -33,7 +31,7 @@ operator, rather than part of a database- or schema-qualified table name.
 ### Catalog name
 
 `record` is a named type in PostgreSQL (`pg_catalog.record`), but is
-currently an [unnameable](../#catalog-name) type in Materalize.
+currently an [unnameable](../#catalog-name) type in Materialize.
 
 ### Valid casts
 
@@ -43,7 +41,7 @@ You cannot cast from any other types to `record`.
 
 ## Examples
 
-```sql
+```mzsql
 SELECT ROW(1, 2) AS record;
 ```
 ```nofmt
@@ -54,7 +52,7 @@ SELECT ROW(1, 2) AS record;
 
 <hr>
 
-```sql
+```mzsql
 SELECT record, (record).f2 FROM (SELECT ROW(1, 2) AS record);
 ```
 ```nofmt
@@ -68,7 +66,7 @@ record | f2
 Forgetting to parenthesize the record expression in a field selection operation
 will result in errors like the following
 
-```sql
+```mzsql
 SELECT record.f2 FROM (SELECT ROW(1, 2) AS record);
 ```
 ```nofmt

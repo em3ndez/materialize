@@ -1,12 +1,12 @@
 ---
 title: "DROP DATABASE"
-description: "`DROP DATABASE` removes a database from your Materialize instances."
+description: "`DROP DATABASE` removes a database from Materialize."
 menu:
   main:
-    parent: 'sql'
+    parent: 'commands'
 ---
 
-`DROP DATABASE` removes a database from your Materialize instances.
+`DROP DATABASE` removes a database from Materialize.
 
 {{< warning >}} `DROP DATABASE` immediately removes all objects within the
 database without confirmation. Use with care! {{< /warning >}}
@@ -27,19 +27,29 @@ _database&lowbar;name_ | The database you want to drop. For available databases,
 ### Remove a database containing schemas
 You can use either of the following commands:
 
-- ```sql
+- ```mzsql
   DROP DATABASE my_db;
   ```
-- ```sql
+- ```mzsql
   DROP DATABASE my_db CASCADE;
   ```
 
 ### Remove a database only if it contains no schemas
-```sql
+```mzsql
 DROP DATABASE my_db RESTRICT;
 ```
 
 ### Do not issue an error if attempting to remove a nonexistent database
-```sql
+```mzsql
 DROP DATABASE IF EXISTS my_db;
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Ownership of the dropped database.
+
+## Related pages
+
+- [DROP OWNED](../drop-owned)

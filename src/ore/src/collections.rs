@@ -15,7 +15,14 @@
 
 //! Collection utilities.
 
-use std::fmt::Display;
+use std::collections::btree_map::Entry as BEntry;
+use std::collections::hash_map::Entry as HEntry;
+use std::collections::BTreeMap;
+use std::fmt::{Debug, Display};
+
+mod hash;
+
+pub use crate::collections::hash::{HashMap, HashSet};
 
 /// Extension methods for collections.
 pub trait CollectionExt<T>: Sized
@@ -36,13 +43,14 @@ where
     ///
     /// This method panics if the collection does not have exactly one element.
     fn into_element(self) -> T::Item {
-        self.expect_element("into_element called on collection with more than one element")
+        self.expect_element(|| "into_element called on collection without exactly one element")
     }
 
     /// Consumes the collection and returns its only element.
     ///
-    /// This method panics with the given error message if the collection does not have exactly one element.
-    fn expect_element<Err: Display>(self, msg: Err) -> T::Item;
+    /// This method panics with the given error function's return value if the collection does not
+    /// have exactly one element.
+    fn expect_element<Err: Display>(self, msg_fn: impl FnOnce() -> Err) -> T::Item;
 }
 
 impl<T> CollectionExt<T> for T
@@ -57,11 +65,98 @@ where
         self.into_iter().last().unwrap()
     }
 
-    fn expect_element<Err: Display>(self, msg: Err) -> T::Item {
+    fn expect_element<Err: Display>(self, msg_fn: impl FnOnce() -> Err) -> T::Item {
         let mut iter = self.into_iter();
         match (iter.next(), iter.next()) {
             (Some(el), None) => el,
-            _ => panic!("{}", msg),
+            _ => panic!("{}", msg_fn()),
+        }
+    }
+}
+
+/// Extension methods for associative collections.
+pub trait AssociativeExt<K, V> {
+    /// Inserts a key and value, panicking with
+    /// a given message if a true
+    /// insert (as opposed to an update) cannot be done
+    /// because the key already existed in the collection.
+    fn expect_insert(&mut self, k: K, v: V, msg: &str);
+    /// Inserts a key and value, panicking if a true
+    /// insert (as opposed to an update) cannot be done
+    /// because the key already existed in the collection.
+    fn unwrap_insert(&mut self, k: K, v: V) {
+        self.expect_insert(k, v, "called `unwrap_insert` for an already-existing key")
+    }
+
+    /// Removes a key, panicking with
+    /// a given message if a true
+    /// removal (as opposed to a no-op) cannot be done
+    /// because the key does not exist in the collection.
+    fn expect_remove(&mut self, k: &K, msg: &str) -> V;
+    /// Removes a key, panicking if a true
+    /// removal (as opposed to a no-op) cannot be done
+    /// because the key does not exist in the collection.
+    fn unwrap_remove(&mut self, k: &K) -> V {
+        self.expect_remove(k, "called `unwrap_remove` for a non-existing key")
+    }
+}
+
+impl<K, V> AssociativeExt<K, V> for HashMap<K, V>
+where
+    K: Eq + std::hash::Hash + Debug,
+    V: Debug,
+{
+    fn expect_insert(&mut self, k: K, v: V, msg: &str) {
+        match self.entry(k) {
+            HEntry::Vacant(e) => {
+                e.insert(v);
+            }
+            HEntry::Occupied(e) => {
+                panic!(
+                    "{} (key: {:?}, old value: {:?}, new value: {:?})",
+                    msg,
+                    e.key(),
+                    e.get(),
+                    v
+                )
+            }
+        }
+    }
+
+    fn expect_remove(&mut self, k: &K, msg: &str) -> V {
+        match self.remove(k) {
+            Some(v) => v,
+            None => panic!("{} (key: {:?})", msg, k),
+        }
+    }
+}
+
+impl<K, V> AssociativeExt<K, V> for BTreeMap<K, V>
+where
+    K: Ord + Debug,
+    V: Debug,
+{
+    fn expect_insert(&mut self, k: K, v: V, msg: &str) {
+        match self.entry(k) {
+            BEntry::Vacant(e) => {
+                e.insert(v);
+            }
+            BEntry::Occupied(e) => {
+                panic!(
+                    "{} (key: {:?}, old value: {:?}, new value: {:?})",
+                    msg,
+                    e.key(),
+                    e.get(),
+                    v
+                )
+            }
+        }
+    }
+
+    fn expect_remove(&mut self, k: &K, msg: &str) -> V {
+        match self.remove(k) {
+            Some(v) => v,
+            None => panic!("{} (key: {:?})", msg, k),
         }
     }
 }

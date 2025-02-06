@@ -11,6 +11,8 @@
 # Ingest some more data and read it back
 #
 
+
+
 $ set schema={"type": "record", "name": "schema", "fields": [ {"name": "f1", "type": "string" } ] }
 
 $ kafka-ingest format=avro topic=kafka-multi-broker schema=${schema} timestamp=21
@@ -22,7 +24,7 @@ $ kafka-ingest format=avro topic=kafka-multi-broker schema=${schema} timestamp=2
 $ kafka-ingest format=avro topic=kafka-multi-broker schema=${schema} timestamp=23
 {"f1": "04-03" }
 
-> SELECT f1 FROM kafka_multi_broker
+> SELECT f1 FROM kafka_multi_broker_tbl
 01-01
 01-02
 01-03
@@ -36,7 +38,7 @@ $ kafka-ingest format=avro topic=kafka-multi-broker schema=${schema} timestamp=2
 04-02
 04-03
 
-$ kafka-verify format=avro sink=materialize.public.multi_broker_sink sort-messages=true
+$ kafka-verify-data format=avro sink=materialize.public.multi_broker_sink sort-messages=true
 {"before": null, "after": {"row": {"f1": "01-01" }}}
 {"before": null, "after": {"row": {"f1": "01-02" }}}
 {"before": null, "after": {"row": {"f1": "01-03" }}}

@@ -7,11 +7,13 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-MZFROM ubuntu-base
+MZFROM materialized-base
 
-# We install sqlite3 to allow debugging of the catalog file, if necessary.
-RUN apt-get update && apt-get -qy install ca-certificates curl sqlite3 tini
+COPY materialized entrypoint.sh /usr/local/bin/
 
-COPY kdestroy kinit materialized /usr/local/bin/
+USER root
+RUN ln -s /usr/local/bin/materialized /usr/local/bin/environmentd \
+  && ln -s /usr/local/bin/materialized /usr/local/bin/clusterd
+USER materialize
 
-ENTRYPOINT ["tini", "--", "materialized", "--log-file=stderr"]
+ENTRYPOINT ["tini", "--", "entrypoint.sh"]

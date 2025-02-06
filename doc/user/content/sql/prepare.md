@@ -3,10 +3,8 @@ title: "PREPARE"
 description: "`PREPARE` creates a prepared statement."
 menu:
   main:
-    parent: "sql"
+    parent: commands
 ---
-
-{{< version-added v0.9.7 />}}
 
 `PREPARE` creates a prepared statement by parsing the initial `SELECT`, `INSERT`, `UPDATE`, or `DELETE` statement. A subsequent [`EXECUTE`] statement then plans and executes the statement.
 
@@ -29,19 +27,19 @@ Prepared statements only last for the duration of the current database session. 
 
 ### Create a prepared statement
 
-```sql
+```mzsql
 PREPARE a AS SELECT 1 + $1;
 ```
 
 ### Execute a prepared statement
 
-```sql
+```mzsql
 EXECUTE a ('a', 'b', 1 + 2)
 ```
 
 ### Deallocate a prepared statement
 
-```sql
+```mzsql
 DEALLOCATE a;
 ```
 

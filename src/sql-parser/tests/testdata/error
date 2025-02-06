@@ -21,9 +21,9 @@
 parse-statement
 SELECT 1, 2, FROM a
 ----
-error: expected expression, but found reserved keyword
+error: invalid trailing comma in SELECT list
 SELECT 1, 2, FROM a
-             ^
+           ^
 
 parse-statement
 UPDATE t WHERE 1
@@ -49,7 +49,7 @@ SELECT ALL DISTINCT name FROM customer
 parse-statement
 INSERT public.customer (id, name, active) VALUES (1, 2, 3)
 ----
-error: Expected INTO, found identifier "public"
+error: Expected INTO, found PUBLIC
 INSERT public.customer (id, name, active) VALUES (1, 2, 3)
        ^
 
@@ -91,7 +91,7 @@ SELECT 1 WHERE 1 < ANY SELECT 2
 parse-statement
 SELECT 1 WHERE 1 < NONE (SELECT 2)
 ----
-error: expected expression, but found reserved keyword
+error: expected expression, but found reserved keyword: SELECT
 SELECT 1 WHERE 1 < NONE (SELECT 2)
                          ^
 
@@ -105,9 +105,9 @@ SELECT 1 WHERE 1 < ANY (SELECT 2
 parse-statement
 SELECT 1 WHERE 1 + ANY (SELECT 2)
 ----
-SELECT 1 WHERE 1 +ANY (SELECT 2)
+SELECT 1 WHERE 1 + ANY (SELECT 2)
 =>
-Select(SelectStatement { query: Query { ctes: [], body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("1")), alias: None }], from: [], selection: Some(AnySubquery { left: Value(Number("1")), op: Bare("+"), right: Query { ctes: [], body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("2")), alias: None }], from: [], selection: None, group_by: [], having: None, options: [] }), order_by: [], limit: None, offset: None } }), group_by: [], having: None, options: [] }), order_by: [], limit: None, offset: None }, as_of: None })
+Select(SelectStatement { query: Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("1")), alias: None }], from: [], selection: Some(AnySubquery { left: Value(Number("1")), op: Op { namespace: None, op: "+" }, right: Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("2")), alias: None }], from: [], selection: None, group_by: [], having: None, qualify: None, options: [] }), order_by: [], limit: None, offset: None } }), group_by: [], having: None, qualify: None, options: [] }), order_by: [], limit: None, offset: None }, as_of: None })
 
 parse-statement
 SELECT EXISTS (NULL)
@@ -201,9 +201,9 @@ SELECT E'\u&&&&'
 parse-statement
 SELECT [1, 2]
 ----
-error: Expected an expression, found left square bracket
+error: expected id
 SELECT [1, 2]
-       ^
+        ^
 
 # Subscripts must have values
 parse-statement
@@ -213,34 +213,14 @@ error: Expected an expression, found right square bracket
 SELECT LIST[1][]
                ^
 
-# Multi-dimensional subscripts must all be slices
+# Prevously supported experimental array-like slice subscripting for lists
 parse-statement
-SELECT LIST[1][1:2, 1]
-----
-error: Expected colon, found right square bracket
-SELECT LIST[1][1:2, 1]
-                     ^
-
-parse-statement
-SELECT LIST[1][1, 1]
+SELECT LIST[1][1:1,1:1]
 ----
 error: Expected right square bracket, found comma
-SELECT LIST[1][1, 1]
-                ^
+SELECT LIST[1][1:1,1:1]
+                  ^
 
-parse-statement
-SELECT LIST[1][1, 1:1]
-----
-error: Expected right square bracket, found comma
-SELECT LIST[1][1, 1:1]
-                ^
-
-parse-statement
-SELECT LIST[1][1:1, ]
-----
-error: Expected an expression, found right square bracket
-SELECT LIST[1][1:1, ]
-                    ^
 
 parse-scalar
 ARRAY[]::int[1 + 1]
@@ -248,3 +228,10 @@ ARRAY[]::int[1 + 1]
 error: Expected right square bracket, found operator "+"
 ARRAY[]::int[1 + 1]
                ^
+
+parse-statement
+CREATE MATERIAL VIEW in_a_material_world AS SELECT 1
+----
+error: Expected DATABASE, SCHEMA, ROLE, TYPE, INDEX, SINK, SOURCE, [TEMPORARY] TABLE, SECRET, [OR REPLACE] [TEMPORARY] VIEW, or [OR REPLACE] MATERIALIZED VIEW after CREATE, found identifier "material"
+CREATE MATERIAL VIEW in_a_material_world AS SELECT 1
+       ^

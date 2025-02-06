@@ -1,0 +1,97 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+# Test the mz_timestamp type.
+
+query TT
+SELECT pg_typeof(mz_now()), pg_typeof(1::mz_timestamp)
+----
+mz_timestamp
+mz_timestamp
+
+query B
+SELECT mz_now() = mz_now()
+----
+true
+
+query T multiline
+EXPLAIN WITH(arity, join implementations) SELECT 1::mz_timestamp = mz_now()
+----
+Explained Query:
+  Map ((1 = mz_now())) // { arity: 1 }
+    Constant // { arity: 0 }
+      - ()
+
+Target cluster: quickstart
+
+EOF
+
+query B
+SELECT 0::mz_timestamp <= mz_now()
+----
+true
+
+statement ok
+CREATE VIEW intervals (a, b) AS VALUES (1, 10), (1, 2), (2, 13), (3, 1), (-3, 10), (5, 18446744073709551616)
+
+statement ok
+CREATE MATERIALIZED VIEW valid AS
+SELECT *
+FROM intervals
+WHERE mz_now() BETWEEN a AND b;
+
+query TTBBBB
+SELECT
+  '1702129950259'::mz_timestamp::text,
+  '1990-01-04 11:00'::mz_timestamp::text,
+  greatest('1990-01-04 11:00', mz_now()) > '1990-01-04 11:00'::mz_timestamp,
+     least('1990-01-04 11:00', mz_now()) > '1990-01-04 11:00'::mz_timestamp,
+  greatest(mz_now(), '1990-01-04 11:00') > '3000-01-04 11:00'::mz_timestamp,
+  '1990-01-04 11:00+08'::mz_timestamp < '1990-01-04 11:00+06'::mz_timestamp;
+----
+1702129950259
+631450800000
+true
+false
+false
+true
+
+# Bad timestamp string
+query error invalid input syntax for type mz_timestamp: could not parse mz_timestamp: could not parse as number of milliseconds since epoch; could not parse as date and time: invalid input syntax for type timestamp with time zone: YEAR, MONTH, DAY are all required: "1990\-01": "1990\-01"
+SELECT '1990-01'::mz_timestamp;
+
+# This would be negative milliseconds since the Unix epoch
+query error invalid input syntax for type mz_timestamp: could not parse mz_timestamp: out of range for mz_timestamp: "1960\-01\-01 11:00"
+SELECT '1960-01-01 11:00'::mz_timestamp;
+
+query T
+SELECT 1::mz_catalog.mz_timestamp
+----
+1
+
+query T
+SELECT '1970-01-02'::date::mz_timestamp
+----
+86400000
+
+# Casts to timestamp[tz]. 8210266815600000 is roughly `HIGH_DATE` for `CheckedTimestamp`.
+query T
+SELECT 8210266815600000::mz_timestamp::timestamptz
+----
+262142-12-31 07:00:00+00
+
+# Roughly `HIGH_DATE` + 1 day.
+query error timestamp out of range
+SELECT 8210266898400000::mz_timestamp::timestamp
+
+query error timestamp out of range
+SELECT 18446744073709551615::mz_timestamp::timestamp
+
+query error timestamp out of range
+SELECT 8210266898400000::mz_timestamp::timestamptz

@@ -7,19 +7,22 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-MZFROM ubuntu-base
+MZFROM testdrive-base
 
-RUN apt-get update && apt-get -qy install \
-    ca-certificates \
-    postgresql-client \
-    wait-for-it
+COPY testdrive /usr/local/bin/
 
-COPY kdestroy kinit testdrive /usr/local/bin/
+# Install the Protobuf compiler from protobuf-src.
+COPY protobuf-bin /usr/local/bin
+COPY protobuf-include /usr/local/include
+RUN chmod +x /usr/local/bin/protoc
+
+ENV PROTOC /usr/local/bin/protoc
+ENV PROTOC_INCLUDE /usr/local/include
 
 WORKDIR /workdir
 
 RUN mkdir -p /share/tmp && chmod 777 /share/tmp
-RUN mkdir -p /share/mzdata && chmod 777 /share/mzdata
+RUN mkdir -p /mzdata && chmod 777 /mzdata
 
 VOLUME /share/tmp
-VOLUME /share/mzdata
+VOLUME /mzdata

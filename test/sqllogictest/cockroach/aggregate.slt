@@ -21,6 +21,11 @@ mode cockroach
 
 subtest other
 
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET unsafe_enable_table_keys = true
+----
+COMPLETE 0
+
 statement ok
 CREATE TABLE kv (
   k INT PRIMARY KEY,
@@ -35,7 +40,7 @@ SELECT min(1), max(1), count(1), avg(1), sum(1), stddev(1), variance(1) FROM kv
 ----
 NULL NULL 0 NULL NULL NULL NULL
 
-# Regression test for #29695
+# Regression test for materialize#29695
 query T
 SELECT min(NULL)
 ----
@@ -47,7 +52,7 @@ SELECT array_agg(1) FROM kv
 ----
 NULL
 
-statement error supported
+statement error db error: ERROR: function "json_agg" does not exist
 SELECT json_agg(1) FROM kv
 ----
 NULL
@@ -62,12 +67,12 @@ SELECT min(v), max(v), count(v), avg(v), sum(v), stddev(v), variance(v) FROM kv
 ----
 NULL NULL 0 NULL NULL NULL NULL
 
-statement error supported
+query B
 SELECT bool_and(v = 1) FROM kv
 ----
 NULL
 
-statement error supported
+query B
 SELECT bool_or(v = 1) FROM kv
 ----
 NULL
@@ -77,7 +82,7 @@ SELECT array_agg(v) FROM kv
 ----
 NULL
 
-statement error supported
+statement error db error: ERROR: function "json_agg" does not exist
 SELECT json_agg(v) FROM kv
 ----
 NULL
@@ -99,7 +104,7 @@ SELECT array_agg(1)
 ----
 {1}
 
-statement error supported
+statement error db error: ERROR: function "json_agg" does not exist
 SELECT json_agg(1)
 
 query T
@@ -114,7 +119,7 @@ SELECT count(NULL)
 ----
 0
 
-statement error supported
+statement error db error: ERROR: function "json_agg" does not exist
 SELECT json_agg(NULL)
 
 query T
@@ -122,9 +127,7 @@ SELECT jsonb_agg(NULL)
 ----
 [null]
 
-# This should ideally return {NULL}, but this is a pathological case, and
-# Postgres has the same behavior, so it's sufficient for now.
-statement error arguments cannot be implicitly cast
+query error db error: ERROR: function array_agg\(unknown\) is not unique
 SELECT array_agg(NULL)
 
 # With an explicit cast, this works as expected.
@@ -133,7 +136,7 @@ SELECT array_agg(NULL::TEXT)
 ----
 {NULL}
 
-# Regression test for #25724 (problem with typed NULLs and distsql planning).
+# Regression test for materialize#25724 (problem with typed NULLs and distsql planning).
 # The previous query doesn't run under distsql.
 query T
 SELECT array_agg(NULL::TEXT) FROM (VALUES (1)) AS t(x)
@@ -161,7 +164,7 @@ SELECT count(*), COALESCE(max(k), 1) FROM kv
 ----
 0 1
 
-# Same, using a subquery. (#12705)
+# Same, using a subquery. (materialize#12705)
 query I
 SELECT (SELECT COALESCE(max(1), 0) FROM generate_series(1,0))
 ----
@@ -188,7 +191,7 @@ SELECT array_agg(1) FROM kv
 ----
 {1,1,1,1,1,1}
 
-statement error supported
+statement error db error: ERROR: function "json_agg" does not exist
 SELECT json_agg(1) FROM kv
 
 query T
@@ -213,7 +216,7 @@ SELECT 3 FROM kv HAVING TRUE
 query error column "kv.k" must appear in the GROUP BY clause or be used in an aggregate function
 SELECT count(*), k FROM kv
 
-# #3164
+# database-issues#1036
 # query error unsupported comparison operator: <string> < <int>
 # SELECT count(*) FROM kv GROUP BY s < 5
 
@@ -244,10 +247,10 @@ SELECT * FROM kv GROUP BY v, count(DISTINCT w)
 query error aggregate functions are not allowed in GROUP BY
 SELECT count(DISTINCT w) FROM kv GROUP BY 1
 
-query error Expected end of statement, found identifier
+query error aggregate functions are not allowed in RETURNING clause \(function pg_catalog.sum\)
 INSERT INTO kv (k, v) VALUES (99, 100) RETURNING sum(v)
 
-query error LIMIT must be an integer constant
+query error aggregate functions are not allowed in LIMIT \(function pg_catalog.sum\)
 SELECT sum(v) FROM kv GROUP BY k LIMIT sum(v)
 
 query error OFFSET must be an integer constant
@@ -388,7 +391,7 @@ SELECT k FROM kv WHERE avg(k) > 1
 query error nested aggregate functions are not allowed
 SELECT max(avg(k)) FROM kv
 
-# Test case from #2761.
+# Test case from materialize#2761.
 query II rowsort
 SELECT count(kv.k) AS count_1, kv.v + kv.w AS lx FROM kv GROUP BY kv.v + kv.w
 ----
@@ -463,7 +466,7 @@ SELECT count(1) from kv
 ----
 6
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function count\(integer, integer\) does not exist
 SELECT count(k, v) FROM kv
 
 # Note: Result differs from Cockroach but matches Postgres.
@@ -528,7 +531,7 @@ SELECT length(s), count(DISTINCT k), count(DISTINCT v), count(DISTINCT (v)) FROM
 1    5 2 2
 NULL 1 0 0
 
-# #1195
+# database-issues#414
 # query I
 # SELECT count((k, v)) FROM kv
 # ----
@@ -588,9 +591,9 @@ NULL NULL NULL NULL
 query TT
 SELECT array_agg(k), array_agg(s) FROM (SELECT k, s FROM kv ORDER BY k)
 ----
-{1,3,5,6,7,8} {NULL,A,a,a,b,b}
+{1,3,5,6,7,8}  {A,a,a,b,b,NULL}
 
-query error arguments cannot be implicitly cast
+query error db error: ERROR: operator does not exist: integer\[\] \|\| integer
 SELECT array_agg(k) || 1 FROM (SELECT k FROM kv ORDER BY k)
 
 query T
@@ -598,7 +601,7 @@ SELECT array_agg(s) FROM kv WHERE s IS NULL
 ----
 {NULL}
 
-query error supported
+query error db error: ERROR: function "json_agg" does not exist
 SELECT json_agg(s) FROM kv WHERE s IS NULL
 
 query T
@@ -695,22 +698,22 @@ SELECT avg(b), sum(b) FROM abc
 # ----
 # 3 years 5 mons 7 days 00:00:19
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function sum\(character varying\) does not exist
 SELECT avg(a) FROM abc
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function sum\(boolean\) does not exist
 SELECT avg(c) FROM abc
 
-query error unable to determine which implementation to use
+query error db error: ERROR: function sum\(record\(f1: character varying,f2: boolean\?\)\) does not exist
 SELECT avg((a,c)) FROM abc
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function sum\(character varying\) does not exist
 SELECT sum(a) FROM abc
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error db error: ERROR: function sum\(boolean\) does not exist
 SELECT sum(c) FROM abc
 
-query error unable to determine which implementation to use
+query error db error: ERROR: function sum\(record\(f1: character varying,f2: boolean\?\)\) does not exist
 SELECT sum((a,c)) FROM abc
 
 statement ok
@@ -769,7 +772,7 @@ SELECT max(y) FROM xyz WHERE x = 7
 ----
 NULL
 
-# #1195
+# database-issues#414
 # query I
 # SELECT min(x) FROM xyz WHERE (y, z) = (2, 3.0)
 # ----
@@ -873,42 +876,49 @@ true
 statement ok
 CREATE TABLE bools (b BOOL)
 
-query error supported
+query BB
 SELECT bool_and(b), bool_or(b) FROM bools
+----
+NULL NULL
 
 statement OK
 INSERT INTO bools VALUES (true), (true), (true)
 
-query error supported
+query BB
 SELECT bool_and(b), bool_or(b) FROM bools
+----
+true true
 
 statement OK
 INSERT INTO bools VALUES (false), (false)
 
-query error supported
+query BB
 SELECT bool_and(b), bool_or(b) FROM bools
+----
+false true
 
-# not supported yet
-# statement OK
-# DELETE FROM bools WHERE b
-#
-# query BB
-# SELECT bool_and(b), bool_or(b) FROM bools
-# ----
-# false false
+statement OK
+DELETE FROM bools WHERE b
+
+query BB
+SELECT bool_and(b), bool_or(b) FROM bools
+----
+false false
 
 query error concat_agg not yet supported
 SELECT concat_agg(s) FROM (SELECT s FROM kv ORDER BY k)
 
-query error json_agg not yet supported
+query error db error: ERROR: function "json_agg" does not exist
 SELECT json_agg(s) FROM (SELECT s FROM kv ORDER BY k)
 
-# This is arguably wrong--we don't respect the inner ORDER BY--because we don't
-# support ordered aggregates. See #2415.
+# This ORDER BY doesn't have to be respected, because the relation returned by a subquery is an inherently unordered
+# thing. Postgres docs: https://www.postgresql.org/docs/13/functions-aggregate.html
+# which says that "supplying the input values from a sorted subquery will usually work", which sounds like this is
+# indeed not mandated.
 query T
 SELECT jsonb_agg(s) FROM (SELECT s FROM kv ORDER BY k)
 ----
-[null,"A","a","a","b","b"]
+["A","a","a","b","b",null]
 
 # Verify that FILTER works.
 
@@ -997,7 +1007,7 @@ CREATE TABLE xy(x TEXT, y TEXT);
 statement ok
 INSERT INTO xy(x, y) VALUES ('a', 'b'), ('c', 'd')
 
-# #1195
+# database-issues#414
 # query T rowsort
 # SELECT (b, a) FROM ab GROUP BY (b, a)
 # ----
@@ -1078,7 +1088,7 @@ SELECT z, x, max(y) FROM group_ord GROUP BY x, z ORDER BY x
 2  7  2
 2  8  4
 
-# Regression test for #25533 (crash when propagating filter through GROUP BY).
+# Regression test for materialize#25533 (crash when propagating filter through GROUP BY).
 query I
 SELECT 1 FROM kv GROUP BY v, w::DECIMAL HAVING w::DECIMAL > 1
 ----
@@ -1089,7 +1099,7 @@ SELECT 1 FROM kv GROUP BY v, w::DECIMAL HAVING w::DECIMAL > 1
 1
 
 # Regression test for distsql aggregator crash when using hash aggregation.
-query error arguments cannot be implicitly cast
+query error db error: ERROR: function array_agg\(unknown\) is not unique
 SELECT v, array_agg('a') FROM kv GROUP BY v
 
 query I
@@ -1165,7 +1175,7 @@ ORDER BY company_id;
 3  C
 4  D
 
-query error unknown catalog item 'b'
+query error type "b" does not exist
 SELECT company_id, string_agg(employee::BYTEA, b',')
 FROM string_agg_test
 GROUP BY company_id
@@ -1182,7 +1192,7 @@ ORDER BY company_id;
 3  CCC
 4  DDDD
 
-query error unknown catalog item 'b'
+query error type "b" does not exist
 SELECT company_id, string_agg(employee::BYTEA, b'')
 FROM string_agg_test
 GROUP BY company_id
@@ -1252,103 +1262,202 @@ ORDER BY company_id;
 
 # Now test the window function version of string_agg.
 
-query error supported
+query IT
 SELECT company_id, string_agg(employee, ',')
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  A
+2  B
+2  B,B
+3  C
+3  C,C
+3  C,C,C
+4  D
+4  D,D
+4  D,D,D
+4  D,D,D,D
 
-query error unknown catalog item 'b'
+query error type "b" does not exist
 SELECT company_id, string_agg(employee::BYTEA, b',')
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
-query error supported
+query IT
 SELECT company_id, string_agg(employee, '')
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  A
+2  B
+2  BB
+3  C
+3  CC
+3  CCC
+4  D
+4  DD
+4  DDD
+4  DDDD
 
-query error unknown catalog item 'b'
+query error type "b" does not exist
 SELECT company_id, string_agg(employee::BYTEA, b'')
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
-query error supported
+query IT
 SELECT company_id, string_agg(employee, NULL)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  A
+2  B
+2  BB
+3  C
+3  CC
+3  CCC
+4  D
+4  DD
+4  DDD
+4  DDDD
 
-query error supported
+query error string_agg on BYTEA not yet supported
 SELECT company_id, string_agg(employee::BYTEA, NULL)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
-query error supported
+query IT
 SELECT company_id, string_agg(NULL::TEXT, employee)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  NULL
+2  NULL
+2  NULL
+3  NULL
+3  NULL
+3  NULL
+4  NULL
+4  NULL
+4  NULL
+4  NULL
 
-query error supported
+query error string_agg on BYTEA not yet supported
 SELECT company_id, string_agg(NULL::BYTEA, employee::BYTEA)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
-query error supported
+query IT
 SELECT company_id, string_agg(NULL::TEXT, NULL)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  NULL
+2  NULL
+2  NULL
+3  NULL
+3  NULL
+3  NULL
+4  NULL
+4  NULL
+4  NULL
+4  NULL
 
-query error supported
+query error string_agg on BYTEA not yet supported
 SELECT company_id, string_agg(NULL::BYTEA, NULL)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
-query error supported
+query IT
 SELECT company_id, string_agg(NULL, NULL::TEXT)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  NULL
+2  NULL
+2  NULL
+3  NULL
+3  NULL
+3  NULL
+4  NULL
+4  NULL
+4  NULL
+4  NULL
 
-query error supported
+query error string_agg on BYTEA not yet supported
 SELECT company_id, string_agg(NULL, NULL::BYTEA)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
-query error supported
+query IT
 SELECT company_id, string_agg(NULL, NULL)
 OVER (PARTITION BY company_id ORDER BY id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  NULL
+2  NULL
+2  NULL
+3  NULL
+3  NULL
+3  NULL
+4  NULL
+4  NULL
+4  NULL
+4  NULL
 
-query error supported
+query IT
 SELECT company_id, string_agg(employee, lower(employee))
 OVER (PARTITION BY company_id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  A
+2  BbB
+2  BbB
+3  CcCcC
+3  CcCcC
+3  CcCcC
+4  DdDdDdD
+4  DdDdDdD
+4  DdDdDdD
+4  DdDdDdD
 
-query error supported
+query IT
 SELECT company_id, string_agg(lower(employee), employee)
 OVER (PARTITION BY company_id)
 FROM string_agg_test
 ORDER BY company_id, id;
+----
+1  a
+2  bBb
+2  bBb
+3  cCcCc
+3  cCcCc
+3  cCcCc
+4  dDdDdDd
+4  dDdDdDd
+4  dDdDdDd
+4  dDdDdDd
 
-query error supported
+query error db error: ERROR: function string_agg\(text, text, text\) does not exist
 SELECT company_id, string_agg(employee, employee, employee)
 OVER (PARTITION BY company_id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
-query error supported
+query error db error: ERROR: function string_agg\(text\) does not exist
 SELECT company_id, string_agg(employee)
 OVER (PARTITION BY company_id)
 FROM string_agg_test
@@ -1380,7 +1489,7 @@ ORDER BY e.company_id;
 ----
 1  A,␠B,␠C,␠D
 
-query error unknown catalog item 'b'
+query error type "b" does not exist
 SELECT e.company_id, string_agg(e.employee, b', ')
 FROM (
   SELECT employee::BYTEA, company_id
@@ -1390,7 +1499,7 @@ FROM (
 GROUP BY e.company_id
 ORDER BY e.company_id;
 
-# This will differ from PG until we close https://github.com/MaterializeInc/materialize/issues/2415
+# This will differ from PG until we close https://github.com/MaterializeInc/database-issues/issues/843
 query TT
 SELECT e.company_id, string_agg(e.employee, ', ')
 FROM (
@@ -1403,7 +1512,7 @@ ORDER BY e.company_id;
 ----
 1  A,␠B,␠C,␠D
 
-query error unknown catalog item 'b'
+query error type "b" does not exist
 SELECT e.company_id, string_agg(e.employee, b', ')
 FROM (
   SELECT employee::BYTEA, company_id
@@ -1413,7 +1522,7 @@ FROM (
 GROUP BY e.company_id
 ORDER BY e.company_id;
 
-# This will differ from PG until we close https://github.com/MaterializeInc/materialize/issues/2415
+# This will differ from PG until we close https://github.com/MaterializeInc/database-issues/issues/843
 query TT
 SELECT e.company_id, string_agg(e.employee, NULL)
 FROM (
@@ -1439,7 +1548,7 @@ ORDER BY e.company_id;
 statement OK
 DROP TABLE string_agg_test2
 
-# Regression test for #28836.
+# Regression test for materialize#28836.
 
 query error supported
 SELECT string_agg('foo', CAST ((SELECT NULL) AS BYTEA)) OVER ();
@@ -1447,7 +1556,7 @@ SELECT string_agg('foo', CAST ((SELECT NULL) AS BYTEA)) OVER ();
 query error table functions are not allowed in aggregate function calls
 SELECT array_agg(generate_series(1, 2))
 
-# Regression test for #31882.
+# Regression test for cockroach#31882.
 
 statement ok
 CREATE TABLE uvw (u INT, v INT, w INT)
@@ -1461,7 +1570,7 @@ SELECT u, v, array_agg(w) AS s FROM (SELECT * FROM uvw ORDER BY w) GROUP BY u, v
 1 2 {3,3}
 3 2 {1,3}
 
-# Regression test for #36433: don't panic with count_agg if a post-render produces an error.
+# Regression test for cockroach#36433: don't panic with count_agg if a post-render produces an error.
 
 query error lpad
 SELECT count(*)::TEXT||lpad('foo', 23984729388383834723984) FROM (VALUES(1));
